@@ -451,24 +451,31 @@ def _get_module_exports(
         RelevantContext with all functions/classes from the module
     """
     ext_map = {
-        "python": ".py",
-        "typescript": ".ts",
-        "go": ".go",
-        "rust": ".rs"
+        "python": [".py"],
+        "typescript": [".ts", ".tsx"],
+        "javascript": [".js", ".jsx"],
+        "go": [".go"],
+        "rust": [".rs"],
     }
-    ext = ext_map.get(language, ".py")
+    extensions = ext_map.get(language, [".py"])
 
     # Try to find the module file
     # module_path "providers/anthropic" -> providers/anthropic.py
-    module_file = project / f"{module_path}{ext}"
+    module_file = None
+    for ext in extensions:
+        candidate = project / f"{module_path}{ext}"
+        if candidate.exists():
+            module_file = candidate
+            break
 
-    if not module_file.exists():
+    if module_file is None:
         # Try as directory with __init__.py (Python package)
         init_file = project / module_path / "__init__.py"
         if init_file.exists():
             module_file = init_file
         else:
-            raise ValueError(f"Module not found: {module_path} (tried {module_file} and {init_file})")
+            tried = ", ".join(str(project / f"{module_path}{e}") for e in extensions)
+            raise ValueError(f"Module not found: {module_path} (tried {tried} and {init_file})")
 
     # Extract all functions and classes from the module
     extractor = HybridExtractor()
