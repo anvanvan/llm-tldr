@@ -2036,9 +2036,7 @@ def build_function_index(
 
         if language == "python":
             _index_python_file(src_path, rel_path, module_name, simple_module, index)
-        elif language == "typescript":
-            _index_typescript_file(src_path, rel_path, module_name, simple_module, index, language=language)
-        elif language == "javascript":
+        elif language in ("typescript", "javascript"):
             _index_typescript_file(src_path, rel_path, module_name, simple_module, index, language=language)
         elif language == "go":
             _index_go_file(src_path, rel_path, module_name, simple_module, index)
@@ -2233,6 +2231,30 @@ def _extract_commonjs_object_export_names(object_node, source: bytes) -> list[st
                 export_names.append(key_name)
 
     return export_names
+
+
+def _extract_commonjs_file_exports(file_path: Path, language: str = "javascript") -> set[str]:
+    """Extract CommonJS exported names for a file."""
+    if not TREE_SITTER_AVAILABLE:
+        return set()
+
+    try:
+        source = file_path.read_bytes()
+        parser = _get_ts_parser(language)
+        tree = parser.parse(source)
+    except (FileNotFoundError, Exception):
+        return set()
+
+    exports = set()
+
+    def walk_tree(node):
+        if node.type == "assignment_expression":
+            exports.update(_get_commonjs_export_names(node, source))
+        for child in node.children:
+            walk_tree(child)
+
+    walk_tree(tree.root_node)
+    return exports
 
 
 def _index_go_file(src_path: Path, rel_path: Path, module_name: str, simple_module: str, index: dict):
@@ -3516,9 +3538,7 @@ def build_project_call_graph(
 
     if language == "python":
         _build_python_call_graph(root, graph, func_index, workspace_config)
-    elif language == "typescript":
-        _build_typescript_call_graph(root, graph, func_index, workspace_config, language=language)
-    elif language == "javascript":
+    elif language in ("typescript", "javascript"):
         _build_typescript_call_graph(root, graph, func_index, workspace_config, language=language)
     elif language == "go":
         _build_go_call_graph(root, graph, func_index, workspace_config)
@@ -3616,6 +3636,8 @@ def _build_typescript_call_graph(
     language: str = "typescript",
 ):
     """Build call graph for TypeScript/JavaScript files."""
+    commonjs_exports_cache = {}
+
     for ts_file in scan_project(root, language, workspace_config):
         ts_path = Path(ts_file)
         rel_path = str(ts_path.relative_to(root))
@@ -3682,17 +3704,15 @@ def _build_typescript_call_graph(
                             default_key = (simple_module, "default")
                             if default_key in func_index:
                                 dst_file = func_index[default_key]
-                                named_candidates = {
-                                    index_key[1]
-                                    for index_key, index_path in func_index.items()
-                                    if (
-                                        isinstance(index_key, tuple)
-                                        and len(index_key) == 2
-                                        and index_key[0] == simple_module
-                                        and index_path == dst_file
-                                        and index_key[1] not in {"default", call_target}
+                                if dst_file not in commonjs_exports_cache:
+                                    commonjs_exports_cache[dst_file] = _extract_commonjs_file_exports(
+                                        root / dst_file,
+                                        language=language,
                                     )
-                                }
+                                named_candidates = (
+                                    commonjs_exports_cache[dst_file]
+                                    - {"default", call_target}
+                                )
                                 resolved_target = next(iter(named_candidates)) if len(named_candidates) == 1 else "default"
                                 graph.add_edge(rel_path, caller_func, dst_file, resolved_target)
 

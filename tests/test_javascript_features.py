@@ -142,6 +142,36 @@ function run() {
     assert ("main.js", "run", "main.js", "work") not in graph.edges
 
 
+@pytest.mark.parametrize("module_ext", [".js", ".cjs"])
+def test_calls_commonjs_default_export_does_not_resolve_to_local_symbol(tmp_path: Path, module_ext: str) -> None:
+    _write(
+        tmp_path / f"worker{module_ext}",
+        """
+function internal(input) {
+  return input + "-i";
+}
+
+module.exports = function (input) {
+  return internal(input);
+};
+""".strip(),
+    )
+    _write(
+        tmp_path / "main.js",
+        """
+const work = require("./worker");
+
+function run() {
+  return work("job");
+}
+""".strip(),
+    )
+
+    graph = build_project_call_graph(tmp_path, language="javascript", use_workspace_config=False)
+    assert ("main.js", "run", f"worker{module_ext}", "default") in graph.edges
+    assert ("main.js", "run", f"worker{module_ext}", "internal") not in graph.edges
+
+
 def test_context_includes_javascript_callee_and_cfg_metrics(tmp_path: Path) -> None:
     _write(
         tmp_path / "helper.js",
