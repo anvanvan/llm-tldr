@@ -154,12 +154,16 @@ class ProjectCallGraph:
         return edge in self._edges
 
 
-def _get_ts_parser():
-    """Get or create a tree-sitter TypeScript parser."""
+def _get_ts_parser(language: str = "typescript"):
+    """Get or create a tree-sitter TypeScript-family parser."""
     if not TREE_SITTER_AVAILABLE:
         raise RuntimeError("tree-sitter-typescript not available")
 
-    ts_lang = tree_sitter.Language(tree_sitter_typescript.language_typescript())
+    # JavaScript frequently includes JSX; use TSX grammar for that branch.
+    if language == "javascript":
+        ts_lang = tree_sitter.Language(tree_sitter_typescript.language_tsx())
+    else:
+        ts_lang = tree_sitter.Language(tree_sitter_typescript.language_typescript())
     parser = tree_sitter.Parser(ts_lang)
     return parser
 
@@ -418,12 +422,13 @@ def parse_imports(file_path: str | Path) -> list[dict]:
     return imports
 
 
-def parse_ts_imports(file_path: str | Path) -> list[dict]:
+def parse_ts_imports(file_path: str | Path, language: str = "typescript") -> list[dict]:
     """
-    Extract import statements from a TypeScript file.
+    Extract import statements from a TypeScript/JavaScript file.
 
     Args:
-        file_path: Path to TypeScript file
+        file_path: Path to TypeScript/JavaScript file
+        language: "typescript" or "javascript"
 
     Returns:
         List of import info dicts with keys: module, names, is_default, aliases
@@ -434,18 +439,35 @@ def parse_ts_imports(file_path: str | Path) -> list[dict]:
     file_path = Path(file_path)
     try:
         source = file_path.read_bytes()
-        parser = _get_ts_parser()
+        parser = _get_ts_parser(language)
         tree = parser.parse(source)
     except (FileNotFoundError, Exception):
         return []
 
     imports = []
+    seen_imports = set()
+
+    def add_import(import_info: dict):
+        if not import_info:
+            return
+        key = (
+            import_info.get("module"),
+            tuple(import_info.get("names", [])),
+            import_info.get("default"),
+            tuple(sorted(import_info.get("aliases", {}).items())),
+        )
+        if key in seen_imports:
+            return
+        seen_imports.add(key)
+        imports.append(import_info)
 
     def walk_tree(node):
         if node.type == "import_statement":
             import_info = _parse_ts_import_node(node, source)
-            if import_info:
-                imports.append(import_info)
+            add_import(import_info)
+        elif node.type == "variable_declarator":
+            for import_info in _parse_ts_require_declarator(node, source):
+                add_import(import_info)
         for child in node.children:
             walk_tree(child)
 
@@ -499,6 +521,99 @@ def _parse_ts_import_node(node, source: bytes) -> dict | None:
             'default': default_name,
             'aliases': aliases,
         }
+    return None
+
+
+def _parse_ts_require_declarator(node, source: bytes) -> list[dict]:
+    """Parse `const x = require('...')` and `const {x} = require('...')` forms."""
+    if node.type != "variable_declarator":
+        return []
+
+    lhs = None
+    rhs_call = None
+    for child in node.children:
+        if child.type in ("identifier", "object_pattern"):
+            lhs = child
+        elif child.type == "call_expression":
+            rhs_call = child
+
+    if lhs is None or rhs_call is None:
+        return []
+
+    module = _extract_require_module_from_call(rhs_call, source)
+    if not module:
+        return []
+
+    if lhs.type == "identifier":
+        local_name = source[lhs.start_byte:lhs.end_byte].decode("utf-8")
+        return [{
+            "module": module,
+            "names": [],
+            "default": local_name,
+            "aliases": {local_name: "*"},
+        }]
+
+    imports = []
+    if lhs.type == "object_pattern":
+        names = []
+        aliases = {}
+        for child in lhs.children:
+            if child.type == "shorthand_property_identifier_pattern":
+                name = source[child.start_byte:child.end_byte].decode("utf-8")
+                names.append(name)
+            elif child.type == "pair_pattern":
+                orig_name = None
+                alias_name = None
+                for pair_child in child.children:
+                    if pair_child.type in (
+                        "identifier",
+                        "property_identifier",
+                        "shorthand_property_identifier_pattern",
+                    ):
+                        name = source[pair_child.start_byte:pair_child.end_byte].decode("utf-8")
+                        if orig_name is None:
+                            orig_name = name
+                        else:
+                            alias_name = name
+                if orig_name:
+                    names.append(orig_name)
+                    if alias_name and alias_name != orig_name:
+                        aliases[alias_name] = orig_name
+
+        if names:
+            imports.append({
+                "module": module,
+                "names": names,
+                "default": None,
+                "aliases": aliases,
+            })
+
+    return imports
+
+
+def _extract_require_module_from_call(call_node, source: bytes) -> str | None:
+    """Extract module path from `require('module')` call expressions."""
+    if call_node.type != "call_expression":
+        return None
+
+    is_require = False
+    args_node = None
+
+    for child in call_node.children:
+        if child.type == "identifier":
+            fn_name = source[child.start_byte:child.end_byte].decode("utf-8")
+            if fn_name == "require":
+                is_require = True
+        elif child.type == "arguments":
+            args_node = child
+
+    if not is_require or args_node is None:
+        return None
+
+    for child in args_node.children:
+        if child.type == "string":
+            return source[child.start_byte:child.end_byte].decode("utf-8").strip("'\"")
+
     return None
 
 
@@ -1914,7 +2029,7 @@ def build_function_index(
         # Derive module name from file path
         # e.g., pkg/core.py -> pkg.core, utils.ts -> utils
         module_parts = list(rel_path.parts[:-1]) + [rel_path.stem]
-        module_name = '/'.join(module_parts) if language == "typescript" else '.'.join(module_parts)
+        module_name = '/'.join(module_parts) if language in ("typescript", "javascript") else '.'.join(module_parts)
 
         # Also track the simple module name (last component)
         simple_module = rel_path.stem
@@ -1922,7 +2037,9 @@ def build_function_index(
         if language == "python":
             _index_python_file(src_path, rel_path, module_name, simple_module, index)
         elif language == "typescript":
-            _index_typescript_file(src_path, rel_path, module_name, simple_module, index)
+            _index_typescript_file(src_path, rel_path, module_name, simple_module, index, language=language)
+        elif language == "javascript":
+            _index_typescript_file(src_path, rel_path, module_name, simple_module, index, language=language)
         elif language == "go":
             _index_go_file(src_path, rel_path, module_name, simple_module, index)
         elif language == "rust":
@@ -1961,14 +2078,21 @@ def _index_python_file(src_path: Path, rel_path: Path, module_name: str, simple_
             index[f"{simple_module}.{node.name}"] = str(rel_path)
 
 
-def _index_typescript_file(src_path: Path, rel_path: Path, module_name: str, simple_module: str, index: dict):
-    """Index functions and classes from a TypeScript file."""
+def _index_typescript_file(
+    src_path: Path,
+    rel_path: Path,
+    module_name: str,
+    simple_module: str,
+    index: dict,
+    language: str = "typescript",
+):
+    """Index functions and classes from a TypeScript/JavaScript file."""
     if not TREE_SITTER_AVAILABLE:
         return
 
     try:
         source = src_path.read_bytes()
-        parser = _get_ts_parser()
+        parser = _get_ts_parser(language)
         tree = parser.parse(source)
     except (FileNotFoundError, Exception):
         return
@@ -2013,6 +2137,14 @@ def _index_typescript_file(src_path: Path, rel_path: Path, module_name: str, sim
             if name:
                 add_to_index(name)
 
+        # CommonJS exports:
+        #   exports.foo = function() {}
+        #   module.exports.foo = helper
+        #   module.exports = { foo, bar: baz }
+        elif node.type == "assignment_expression":
+            for export_name in _get_commonjs_export_names(node, source):
+                add_to_index(export_name)
+
         for child in node.children:
             walk_tree(child)
 
@@ -2025,6 +2157,62 @@ def _get_ts_node_name(node, source: bytes) -> str | None:
         if child.type in ("identifier", "property_identifier", "type_identifier"):
             return source[child.start_byte:child.end_byte].decode("utf-8")
     return None
+
+
+def _get_commonjs_export_names(assign_node, source: bytes) -> list[str]:
+    """Extract exported symbol names from CommonJS assignment expressions."""
+    if assign_node.type != "assignment_expression" or len(assign_node.children) < 3:
+        return []
+
+    lhs = assign_node.children[0]
+    rhs = assign_node.children[-1]
+
+    lhs_text = source[lhs.start_byte:lhs.end_byte].decode("utf-8").replace(" ", "")
+    function_like_rhs = {
+        "function_expression",
+        "arrow_function",
+        "identifier",
+        "member_expression",
+        "class",
+        "class_declaration",
+    }
+
+    if lhs_text.startswith("exports.") and rhs.type in function_like_rhs:
+        export_name = lhs_text.split("exports.", 1)[1]
+        return [export_name] if export_name.isidentifier() else []
+
+    if lhs_text.startswith("module.exports.") and rhs.type in function_like_rhs:
+        export_name = lhs_text.split("module.exports.", 1)[1]
+        return [export_name] if export_name.isidentifier() else []
+
+    if lhs_text == "module.exports" and rhs.type == "object":
+        return _extract_commonjs_object_export_names(rhs, source)
+
+    return []
+
+
+def _extract_commonjs_object_export_names(object_node, source: bytes) -> list[str]:
+    """Extract export names from `module.exports = { ... }` object literals."""
+    export_names = []
+
+    for child in object_node.children:
+        if child.type == "shorthand_property_identifier":
+            name = source[child.start_byte:child.end_byte].decode("utf-8")
+            if name.isidentifier():
+                export_names.append(name)
+        elif child.type == "pair":
+            key_name = None
+            for pair_child in child.children:
+                if pair_child.type in ("identifier", "property_identifier"):
+                    key_name = source[pair_child.start_byte:pair_child.end_byte].decode("utf-8")
+                    break
+                if pair_child.type == "string":
+                    key_name = source[pair_child.start_byte:pair_child.end_byte].decode("utf-8").strip("'\"")
+                    break
+            if key_name and key_name.isidentifier():
+                export_names.append(key_name)
+
+    return export_names
 
 
 def _index_go_file(src_path: Path, rel_path: Path, module_name: str, simple_module: str, index: dict):
@@ -2547,7 +2735,11 @@ def _extract_file_calls(file_path: Path, root: Path) -> dict[str, list[tuple[str
     return calls_by_func
 
 
-def _extract_ts_file_calls(file_path: Path, root: Path) -> dict[str, list[tuple[str, str]]]:
+def _extract_ts_file_calls(
+    file_path: Path,
+    root: Path,
+    language: str = "typescript",
+) -> dict[str, list[tuple[str, str]]]:
     """
     Extract all function calls from a TypeScript file, grouped by caller function.
 
@@ -2560,7 +2752,7 @@ def _extract_ts_file_calls(file_path: Path, root: Path) -> dict[str, list[tuple[
 
     try:
         source = file_path.read_bytes()
-        parser = _get_ts_parser()
+        parser = _get_ts_parser(language)
         tree = parser.parse(source)
     except (FileNotFoundError, Exception):
         return {}
@@ -3300,7 +3492,9 @@ def build_project_call_graph(
     if language == "python":
         _build_python_call_graph(root, graph, func_index, workspace_config)
     elif language == "typescript":
-        _build_typescript_call_graph(root, graph, func_index, workspace_config)
+        _build_typescript_call_graph(root, graph, func_index, workspace_config, language=language)
+    elif language == "javascript":
+        _build_typescript_call_graph(root, graph, func_index, workspace_config, language=language)
     elif language == "go":
         _build_go_call_graph(root, graph, func_index, workspace_config)
     elif language == "rust":
@@ -3393,15 +3587,16 @@ def _build_typescript_call_graph(
     root: Path,
     graph: ProjectCallGraph,
     func_index: dict,
-    workspace_config: Optional[WorkspaceConfig] = None
+    workspace_config: Optional[WorkspaceConfig] = None,
+    language: str = "typescript",
 ):
-    """Build call graph for TypeScript files."""
-    for ts_file in scan_project(root, "typescript", workspace_config):
+    """Build call graph for TypeScript/JavaScript files."""
+    for ts_file in scan_project(root, language, workspace_config):
         ts_path = Path(ts_file)
         rel_path = str(ts_path.relative_to(root))
 
         # Get imports for this file
-        imports = parse_ts_imports(ts_path)
+        imports = parse_ts_imports(ts_path, language=language)
 
         # Build import resolution map
         # For TypeScript, imports are relative paths or package names
@@ -3434,7 +3629,7 @@ def _build_typescript_call_graph(
                 default_imports[imp['default']] = module_path
 
         # Get calls from this file
-        calls_by_func = _extract_ts_file_calls(ts_path, root)
+        calls_by_func = _extract_ts_file_calls(ts_path, root, language=language)
 
         for caller_func, calls in calls_by_func.items():
             for call_type, call_target in calls:

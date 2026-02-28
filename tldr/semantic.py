@@ -885,6 +885,8 @@ def _detect_project_languages(project_path: Path, respect_ignore: bool = True) -
         '.tsx': 'typescript',
         '.js': 'javascript',
         '.jsx': 'javascript',
+        '.mjs': 'javascript',
+        '.cjs': 'javascript',
         '.go': 'go',
         '.rs': 'rust',
         '.c': 'c',

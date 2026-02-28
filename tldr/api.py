@@ -451,24 +451,33 @@ def _get_module_exports(
         RelevantContext with all functions/classes from the module
     """
     ext_map = {
-        "python": ".py",
-        "typescript": ".ts",
-        "go": ".go",
-        "rust": ".rs"
+        "python": [".py"],
+        "typescript": [".ts", ".tsx"],
+        "javascript": [".js", ".jsx", ".mjs", ".cjs"],
+        "go": [".go"],
+        "rust": [".rs"],
     }
-    ext = ext_map.get(language, ".py")
+    extensions = ext_map.get(language, [".py"])
 
     # Try to find the module file
     # module_path "providers/anthropic" -> providers/anthropic.py
-    module_file = project / f"{module_path}{ext}"
+    module_file = None
+    checked_paths = []
+    for ext in extensions:
+        candidate = project / f"{module_path}{ext}"
+        checked_paths.append(candidate)
+        if candidate.exists():
+            module_file = candidate
+            break
 
-    if not module_file.exists():
+    if module_file is None:
         # Try as directory with __init__.py (Python package)
         init_file = project / module_path / "__init__.py"
         if init_file.exists():
             module_file = init_file
         else:
-            raise ValueError(f"Module not found: {module_path} (tried {module_file} and {init_file})")
+            tried = ", ".join(str(path) for path in checked_paths + [init_file])
+            raise ValueError(f"Module not found: {module_path} (tried {tried})")
 
     # Extract all functions and classes from the module
     extractor = HybridExtractor()
@@ -536,7 +545,7 @@ def get_relevant_context(
         project: Path to project root
         entry_point: Function/method name (e.g., "Client.stream") or module path (e.g., "providers/anthropic")
         depth: How deep to traverse the call graph
-        language: python, typescript, go, or rust
+        language: python, typescript, javascript, go, or rust
         include_docstrings: Whether to include function docstrings
 
     Returns:
@@ -547,15 +556,6 @@ def get_relevant_context(
     # Module query mode: path with / and no . (e.g., "providers/anthropic")
     if "/" in entry_point and "." not in entry_point:
         return _get_module_exports(project, entry_point, language, include_docstrings)
-
-    # Check if entry_point is a module name (no / or .)
-    # e.g., "unified_gate" -> check for unified_gate.py
-    ext_for_lang = {
-        "python": ".py",
-        "typescript": ".ts",
-        "go": ".go",
-        "rust": ".rs"
-    }.get(language, ".py")
 
     # NOTE: Removed module-file shortcut that conflicted with function lookup.
     # If entry_point="main" matched "main.ts", it would return module exports
@@ -572,6 +572,7 @@ def get_relevant_context(
     ext_map = {
         "python": {".py"},
         "typescript": {".ts", ".tsx"},
+        "javascript": {".js", ".jsx", ".mjs", ".cjs"},
         "go": {".go"},
         "rust": {".rs"}
     }
@@ -629,6 +630,7 @@ def get_relevant_context(
     cfg_extractors = {
         "python": extract_python_cfg,
         "typescript": extract_typescript_cfg,
+        "javascript": extract_typescript_cfg,
         "go": extract_go_cfg,
         "rust": extract_rust_cfg,
         "java": extract_java_cfg,
@@ -1522,7 +1524,7 @@ def get_code_structure(
 
     Args:
         root: Root directory to analyze
-        language: Language to analyze ("python", "typescript", "go", "rust")
+        language: Language to analyze ("python", "typescript", "javascript", "go", "rust")
         max_results: Maximum number of files to analyze (default 100)
         ignore_spec: Optional pathspec.PathSpec for gitignore-style patterns
 
@@ -1547,7 +1549,7 @@ def get_code_structure(
     ext_map = {
         "python": {".py"},
         "typescript": {".ts", ".tsx"},
-        "javascript": {".js", ".jsx"},
+        "javascript": {".js", ".jsx", ".mjs", ".cjs"},
         "go": {".go"},
         "rust": {".rs"},
         "java": {".java"},
