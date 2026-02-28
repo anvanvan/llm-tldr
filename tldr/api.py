@@ -476,7 +476,7 @@ def _get_module_exports(
         if init_file.exists():
             module_file = init_file
         else:
-            tried = ", ".join(str(path) for path in checked_paths + [init_file])
+            tried = ", ".join(str(path) for path in [*checked_paths, init_file])
             raise ValueError(f"Module not found: {module_path} (tried {tried})")
 
     # Extract all functions and classes from the module

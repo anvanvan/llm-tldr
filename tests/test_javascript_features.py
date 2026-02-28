@@ -66,9 +66,10 @@ export function main() {
     assert ("main.js", "main", "helper.js", "helper") in graph.edges
 
 
-def test_calls_builds_edges_for_javascript_commonjs_destructure(tmp_path: Path) -> None:
+@pytest.mark.parametrize("module_ext", [".js", ".cjs"])
+def test_calls_builds_edges_for_javascript_commonjs_destructure(tmp_path: Path, module_ext: str) -> None:
     _write(
-        tmp_path / "helper.js",
+        tmp_path / f"helper{module_ext}",
         """
 exports.helper = function (input) {
   return input + "-done";
@@ -87,12 +88,13 @@ function main() {
     )
 
     graph = build_project_call_graph(tmp_path, language="javascript", use_workspace_config=False)
-    assert ("main.js", "main", "helper.js", "helper") in graph.edges
+    assert ("main.js", "main", f"helper{module_ext}", "helper") in graph.edges
 
 
-def test_calls_builds_edges_for_javascript_commonjs_namespace(tmp_path: Path) -> None:
+@pytest.mark.parametrize("module_ext", [".js", ".cjs"])
+def test_calls_builds_edges_for_javascript_commonjs_namespace(tmp_path: Path, module_ext: str) -> None:
     _write(
-        tmp_path / "helper.js",
+        tmp_path / f"helper{module_ext}",
         """
 module.exports.helper = function (input) {
   return input + "-done";
@@ -111,7 +113,33 @@ function main() {
     )
 
     graph = build_project_call_graph(tmp_path, language="javascript", use_workspace_config=False)
-    assert ("main.js", "main", "helper.js", "helper") in graph.edges
+    assert ("main.js", "main", f"helper{module_ext}", "helper") in graph.edges
+
+
+@pytest.mark.parametrize("module_ext", [".js", ".cjs"])
+def test_calls_builds_edges_for_javascript_commonjs_default_export(tmp_path: Path, module_ext: str) -> None:
+    _write(
+        tmp_path / f"worker{module_ext}",
+        """
+module.exports = function doThing(input) {
+  return input + "-done";
+};
+""".strip(),
+    )
+    _write(
+        tmp_path / "main.js",
+        """
+const work = require("./worker");
+
+function run() {
+  return work("job");
+}
+""".strip(),
+    )
+
+    graph = build_project_call_graph(tmp_path, language="javascript", use_workspace_config=False)
+    assert ("main.js", "run", f"worker{module_ext}", "doThing") in graph.edges
+    assert ("main.js", "run", "main.js", "work") not in graph.edges
 
 
 def test_context_includes_javascript_callee_and_cfg_metrics(tmp_path: Path) -> None:

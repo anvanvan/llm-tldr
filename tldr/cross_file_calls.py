@@ -2185,10 +2185,30 @@ def _get_commonjs_export_names(assign_node, source: bytes) -> list[str]:
         export_name = lhs_text.split("module.exports.", 1)[1]
         return [export_name] if export_name.isidentifier() else []
 
+    if lhs_text == "module.exports" and rhs.type in function_like_rhs:
+        export_names = ["default"]
+        rhs_name = _get_commonjs_rhs_name(rhs, source)
+        if rhs_name and rhs_name not in export_names:
+            export_names.append(rhs_name)
+        return export_names
+
     if lhs_text == "module.exports" and rhs.type == "object":
         return _extract_commonjs_object_export_names(rhs, source)
 
     return []
+
+
+def _get_commonjs_rhs_name(rhs_node, source: bytes) -> str | None:
+    """Extract a stable symbol name from a CommonJS RHS expression when possible."""
+    if rhs_node.type == "identifier":
+        name = source[rhs_node.start_byte:rhs_node.end_byte].decode("utf-8")
+        return name if name.isidentifier() else None
+
+    if rhs_node.type in {"function_expression", "class", "class_declaration"}:
+        name = _get_ts_node_name(rhs_node, source)
+        return name if name and name.isidentifier() else None
+
+    return None
 
 
 def _extract_commonjs_object_export_names(object_node, source: bytes) -> list[str]:
@@ -2769,10 +2789,15 @@ def _extract_ts_file_calls(
         elif node.type == "lexical_declaration":
             for child in node.children:
                 if child.type == "variable_declarator":
+                    var_name = None
+                    has_local_callable_initializer = False
                     for vc in child.children:
-                        if vc.type == "identifier":
-                            defined_names.add(source[vc.start_byte:vc.end_byte].decode("utf-8"))
-                            break
+                        if vc.type == "identifier" and var_name is None:
+                            var_name = source[vc.start_byte:vc.end_byte].decode("utf-8")
+                        elif vc.type in ("arrow_function", "function_expression", "class", "class_declaration"):
+                            has_local_callable_initializer = True
+                    if var_name and has_local_callable_initializer:
+                        defined_names.add(var_name)
         for child in node.children:
             collect_definitions(child)
 
@@ -3653,6 +3678,23 @@ def _build_typescript_call_graph(
                         if key in func_index:
                             dst_file = func_index[key]
                             graph.add_edge(rel_path, caller_func, dst_file, call_target)
+                        else:
+                            default_key = (simple_module, "default")
+                            if default_key in func_index:
+                                dst_file = func_index[default_key]
+                                named_candidates = {
+                                    index_key[1]
+                                    for index_key, index_path in func_index.items()
+                                    if (
+                                        isinstance(index_key, tuple)
+                                        and len(index_key) == 2
+                                        and index_key[0] == simple_module
+                                        and index_path == dst_file
+                                        and index_key[1] not in {"default", call_target}
+                                    )
+                                }
+                                resolved_target = next(iter(named_candidates)) if len(named_candidates) == 1 else "default"
+                                graph.add_edge(rel_path, caller_func, dst_file, resolved_target)
 
                 elif call_type == 'attr':
                     parts = call_target.split('.', 1)
