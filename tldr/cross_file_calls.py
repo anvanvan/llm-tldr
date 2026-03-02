@@ -1934,7 +1934,7 @@ def build_function_index(
     Returns:
         Dict mapping (module, func_name) tuples to relative file paths
     """
-    root = Path(root)
+    root = Path(root).resolve()
     index = {}
 
     for src_file in scan_project(root, language, workspace_config):
@@ -3317,7 +3317,7 @@ def build_project_call_graph(
     Returns:
         ProjectCallGraph with edges as (src_file, src_func, dst_file, dst_func)
     """
-    root = Path(root)
+    root = Path(root).resolve()
     graph = ProjectCallGraph()
 
     # Load workspace config if enabled
