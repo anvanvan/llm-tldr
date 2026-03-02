@@ -295,7 +295,7 @@ def scan_project(
     """
     from .tldrignore import load_ignore_patterns, should_ignore, filter_files
 
-    root = Path(root)
+    root = Path(root).resolve()
     files = []
 
     # Load ignore patterns if respecting .tldrignore
