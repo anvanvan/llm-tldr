@@ -293,7 +293,7 @@ def scan_project(
     Returns:
         List of absolute paths to source files
     """
-    from .tldrignore import load_ignore_patterns, should_ignore
+    from .tldrignore import load_ignore_patterns, should_ignore, filter_files
 
     root = Path(root)
     files = []
@@ -340,27 +340,42 @@ def scan_project(
 
     for dirpath, dirnames, filenames in os.walk(root):
         # Skip ignored directories (modifying dirnames in-place prunes os.walk)
+        # use_gitignore=False avoids spawning a subprocess per directory;
+        # gitignore is checked in a single batch call after file collection
         if respect_ignore and ignore_spec:
             rel_dir = os.path.relpath(dirpath, root)
             # Check if current directory should be ignored
-            if rel_dir != '.' and should_ignore(rel_dir + '/', root, ignore_spec):
+            if rel_dir != '.' and should_ignore(
+                rel_dir + '/', root, ignore_spec, use_gitignore=False
+            ):
                 dirnames.clear()  # Don't descend into ignored directories
                 continue
             # Filter subdirectories
             dirnames[:] = [
                 d for d in dirnames
-                if not should_ignore(os.path.join(rel_dir, d) + '/', root, ignore_spec)
+                if not should_ignore(
+                    os.path.join(rel_dir, d) + '/', root, ignore_spec,
+                    use_gitignore=False,
+                )
             ]
 
         for filename in filenames:
             if any(filename.endswith(ext) for ext in extensions):
                 file_path = os.path.join(dirpath, filename)
-                # Check individual file against ignore patterns
+                # Check individual file against .tldrignore patterns only
                 if respect_ignore and ignore_spec:
                     rel_path = os.path.relpath(file_path, root)
-                    if should_ignore(rel_path, root, ignore_spec):
+                    if should_ignore(
+                        rel_path, root, ignore_spec, use_gitignore=False
+                    ):
                         continue
                 files.append(file_path)
+
+    # Batch-check gitignore in a single subprocess call (instead of per-file)
+    if respect_ignore and files:
+        files = [str(f) for f in filter_files(
+            [Path(f) for f in files], root, respect_ignore=True
+        )]
 
     # Apply workspace config filtering if provided
     if workspace_config is not None:
