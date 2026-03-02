@@ -293,7 +293,10 @@ def scan_project(
     Returns:
         List of absolute paths to source files
     """
-    from .tldrignore import load_ignore_patterns, should_ignore, filter_files
+    from .tldrignore import (
+        load_ignore_patterns, should_ignore,
+        batch_gitignored, is_git_repo, _has_negation_for_file,
+    )
 
     root = Path(root).resolve()
     files = []
@@ -371,11 +374,23 @@ def scan_project(
                         continue
                 files.append(file_path)
 
-    # Batch-check gitignore in a single subprocess call (instead of per-file)
-    if respect_ignore and files:
-        files = [str(f) for f in filter_files(
-            [Path(f) for f in files], root, respect_ignore=True
-        )]
+    # Batch-check gitignore in a single subprocess call (instead of per-file).
+    # Use batch_gitignored directly rather than filter_files, because
+    # filter_files' gitignore pass doesn't preserve .tldrignore negation (!)
+    # patterns — files explicitly un-ignored by .tldrignore must stay even
+    # when gitignored.
+    if respect_ignore and files and is_git_repo(str(root)):
+        gitignored = batch_gitignored([Path(f) for f in files], root)
+        if gitignored:
+            kept = []
+            for f in files:
+                rel = os.path.relpath(f, root)
+                if rel not in gitignored:
+                    kept.append(f)
+                elif ignore_spec and _has_negation_for_file(ignore_spec, rel):
+                    # .tldrignore negation overrides gitignore
+                    kept.append(f)
+            files = kept
 
     # Apply workspace config filtering if provided
     if workspace_config is not None:
