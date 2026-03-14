@@ -703,6 +703,9 @@ Semantic Search:
             ctx = get_relevant_context(
                 args.project, args.entry, depth=args.depth, language=args.lang
             )
+            if ctx.error:
+                print(ctx.to_llm_string(), file=sys.stderr)
+                sys.exit(1)
             # Output LLM-ready string directly
             print(ctx.to_llm_string())
 
