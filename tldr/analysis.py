@@ -81,6 +81,7 @@ def impact_analysis(
     target_func: str,
     max_depth: int = 3,
     target_file: str | None = None,
+    _reverse: dict | None = None,
 ) -> dict:
     """Find all callers of a function, up to max_depth levels.
 
@@ -92,12 +93,14 @@ def impact_analysis(
         target_func: Function name to find callers of
         max_depth: How deep to traverse callers
         target_file: Optional file filter
+        _reverse: Optional pre-built reverse graph; if provided, skips
+            calling build_reverse_graph (optimization for repeated calls)
 
     Returns:
         Dict with 'targets' (tree of callers) and 'total_targets' count
     """
     edges = call_graph.edges
-    reverse = build_reverse_graph(edges)
+    reverse = _reverse if _reverse is not None else build_reverse_graph(edges)
 
     # Find target function(s) as callees (functions being called)
     all_callees = set()

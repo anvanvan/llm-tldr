@@ -1146,12 +1146,12 @@ def semantic_search(
     query_embedding = query_embedding.reshape(1, -1)
 
     # Search
-    k = min(k, len(units))
-    scores, indices = index.search(query_embedding, k)
+    search_k = min(k, len(units))
+    scores, indices = index.search(query_embedding, search_k)
 
     # Build results
     results = []
-    for i, (score, idx) in enumerate(zip(scores[0], indices[0])):
+    for score, idx in zip(scores[0], indices[0], strict=True):
         if idx < 0 or idx >= len(units):
             continue
 
@@ -1173,5 +1173,7 @@ def semantic_search(
             result["related"] = list(set(unit.get("calls", []) + unit.get("called_by", [])))
 
         results.append(result)
+        if len(results) >= k:
+            break
 
     return results
