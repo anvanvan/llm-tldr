@@ -16,6 +16,7 @@ Usage:
 
 from collections import defaultdict
 from dataclasses import dataclass, field
+from itertools import chain
 from pathlib import Path
 from typing import Optional
 
@@ -1155,7 +1156,10 @@ def get_imports(file_path: str, language: str = "python") -> list[dict]:
     elif language == "luau":
         return _parse_luau_imports(file_path)
     elif language == "elixir":
-        return _parse_elixir_imports(file_path)
+        # parse_elixir_imports returns dict keyed by defmodule; flatten for API
+        scoped = _parse_elixir_imports(file_path)
+        flat = list(chain.from_iterable(scoped.values()))
+        return flat
     else:
         raise ValueError(f"Unsupported language: {language}")
 
