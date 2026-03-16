@@ -97,6 +97,8 @@ def cached_context(db: SalsaDB, project: str, entry: str, language: str, depth: 
     """Cached relevant context - memoized by SalsaDB."""
     from tldr.api import get_relevant_context
     result = get_relevant_context(project, entry, language=language, depth=depth)
+    if result.error:
+        return {"status": "error", "message": result.error}
     return {"status": "ok", "result": result}
 
 

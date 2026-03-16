@@ -27,6 +27,8 @@ import subprocess
 from pathlib import Path
 from xml.etree import ElementTree
 
+from .semantic import EXTENSION_TO_LANGUAGE
+
 
 # Mapping of language -> tools configuration
 LANG_TOOLS: dict[str, dict] = {
@@ -96,31 +98,7 @@ LANG_TOOLS: dict[str, dict] = {
 def _detect_language(file_path: str) -> str:
     """Detect language from file extension."""
     ext = Path(file_path).suffix.lower()
-    mapping = {
-        ".py": "python",
-        ".ts": "typescript",
-        ".tsx": "typescript",
-        ".js": "javascript",
-        ".jsx": "javascript",
-        ".go": "go",
-        ".rs": "rust",
-        ".java": "java",
-        ".c": "c",
-        ".h": "c",
-        ".cpp": "cpp",
-        ".cc": "cpp",
-        ".cxx": "cpp",
-        ".hpp": "cpp",
-        ".rb": "ruby",
-        ".php": "php",
-        ".kt": "kotlin",
-        ".swift": "swift",
-        ".cs": "csharp",
-        ".scala": "scala",
-        ".ex": "elixir",
-        ".exs": "elixir",
-    }
-    return mapping.get(ext, "unknown")
+    return EXTENSION_TO_LANGUAGE.get(ext, "unknown")
 
 
 def _parse_pyright_output(stdout: str) -> list[dict]:
