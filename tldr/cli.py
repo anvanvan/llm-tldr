@@ -869,7 +869,7 @@ Semantic Search:
             if args.background:
                 # Spawn background process (cross-platform)
                 subprocess.Popen(
-                    [sys.executable, "-m", "tldr.cli", "warm", str(project_path), "--lang", args.lang],
+                    [sys.executable, "-m", "tldr.cli", "warm", str(project_path), "--lang", "all" if args.lang == "auto" else args.lang],
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                     **_get_subprocess_detach_kwargs(),
@@ -888,7 +888,7 @@ Semantic Search:
                 respect_ignore = not getattr(args, 'no_ignore', False)
                 
                 # Determine languages to process
-                if args.lang == "all":
+                if args.lang in ("auto", "all"):
                     try:
                         from .semantic import _detect_project_languages
                         target_languages = _detect_project_languages(project_path, respect_ignore=respect_ignore)
