@@ -30,6 +30,7 @@ if os.name == 'nt':
         pass
 
 from . import __version__
+from .api import SUPPORTED_CONTEXT_LANGUAGES
 from .semantic import ALL_LANGUAGES, EXTENSION_TO_LANGUAGE
 
 
@@ -42,8 +43,10 @@ def _get_subprocess_detach_kwargs():
         return {'start_new_session': True}
 
 # Canonical list of supported languages for --lang choices (derived from semantic.py)
-LANG_CHOICES = ["auto"] + ALL_LANGUAGES
-LANG_CHOICES_WITH_ALL = LANG_CHOICES + ["all"]
+LANG_CHOICES = ["auto", *ALL_LANGUAGES]
+LANG_CHOICES_WITH_ALL = [*LANG_CHOICES, "all"]
+
+# SUPPORTED_CONTEXT_LANGUAGES is now imported from api.py (single source of truth)
 
 
 def detect_language_from_extension(file_path: str) -> str:
@@ -205,8 +208,8 @@ Semantic Search:
     ctx_p.add_argument(
         "--lang",
         default="auto",
-        choices=LANG_CHOICES,
-        help="Language (auto=detect from project, default: auto)",
+        choices=["auto", *sorted(SUPPORTED_CONTEXT_LANGUAGES)],
+        help="Language (auto=detect from project; supported: python, typescript, go, rust)",
     )
 
     # tldr cfg <file> <function>
@@ -553,9 +556,11 @@ Semantic Search:
         return None
 
     def resolve_language(lang_arg: str, project_path: str | Path) -> str:
-        """Resolve 'auto'/'all' to actual language. Returns first language for single-lang commands."""
+        """Resolve 'auto' to actual language. Returns 'all' unchanged for multi-lang commands."""
+        if lang_arg == "all":
+            return "all"
         project_path = Path(project_path).resolve()
-        if lang_arg in ("auto", "all"):
+        if lang_arg == "auto":
             # Try cache first, then detect if no cache
             cached = get_cached_languages(project_path)
             if cached:
@@ -685,6 +690,13 @@ Semantic Search:
 
         elif args.command == "context":
             lang = resolve_language(args.lang, args.project)
+            if lang not in SUPPORTED_CONTEXT_LANGUAGES:
+                print(
+                    f"Warning: language '{lang}' is not supported by context command. "
+                    f"Supported languages: {', '.join(sorted(SUPPORTED_CONTEXT_LANGUAGES))}",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
             ctx = get_relevant_context(
                 args.project, args.entry, depth=args.depth, language=lang
             )
@@ -963,7 +975,7 @@ Semantic Search:
                 print(f"Indexed {count} code units")
 
             elif args.action == "search":
-                lang = resolve_language(args.lang, args.path)
+                lang = None if args.lang in ("auto", "all") else resolve_language(args.lang, args.path)
                 results = semantic_search(
                     args.path,
                     args.query,

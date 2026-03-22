@@ -54,7 +54,19 @@ __all__ = [
     "get_code_structure",
     # P5 #21: Content-hash deduplication
     "ContentHashedIndex",
+    # Language support constants
+    "SUPPORTED_CONTEXT_LANGUAGES",
+    "SUPPORTED_CONTEXT_EXT_MAP",
 ]
+
+# Languages supported by get_relevant_context (ext_map used for file scanning)
+SUPPORTED_CONTEXT_EXT_MAP: dict[str, set[str]] = {
+    "python": {".py"},
+    "typescript": {".ts", ".tsx"},
+    "go": {".go"},
+    "rust": {".rs"},
+}
+SUPPORTED_CONTEXT_LANGUAGES: frozenset[str] = frozenset(SUPPORTED_CONTEXT_EXT_MAP.keys())
 from .cfg_extractor import (
     CFGBlock,  # Re-exported for type hints
     CFGEdge,  # Re-exported for type hints
@@ -569,13 +581,7 @@ def get_relevant_context(
     extractor = HybridExtractor()
     signatures: dict[str, tuple[str, FunctionInfo]] = {}  # func_name -> (file, info)
 
-    ext_map = {
-        "python": {".py"},
-        "typescript": {".ts", ".tsx"},
-        "go": {".go"},
-        "rust": {".rs"}
-    }
-    extensions = ext_map.get(language, {".py"})
+    extensions = SUPPORTED_CONTEXT_EXT_MAP.get(language, {".py"})
 
     # Also cache file sources for CFG extraction
     file_sources: dict[str, str] = {}
