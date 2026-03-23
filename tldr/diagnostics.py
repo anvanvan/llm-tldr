@@ -27,7 +27,7 @@ import subprocess
 from pathlib import Path
 from xml.etree import ElementTree
 
-from .semantic import EXTENSION_TO_LANGUAGE
+from .semantic import EXTENSION_TO_LANGUAGE, _detect_project_languages
 
 
 # Mapping of language -> tools configuration
@@ -940,6 +940,34 @@ def get_project_diagnostics(
     path = Path(project_path).resolve()
     if not path.exists():
         return {"error": f"Path not found: {project_path}", "diagnostics": []}
+
+    # Languages with project-level diagnostic dispatch below
+    _DIAG_LANGUAGES = {"python", "typescript", "go", "rust", "ruby", "elixir"}
+
+    # Handle "all": detect project languages, run diagnostics per language, merge
+    if language == "all":
+        detected = _detect_project_languages(path)
+        languages = [l for l in detected if l in _DIAG_LANGUAGES] or ["python"]
+        merged_diagnostics = []
+        merged_tools: list = []
+        seen_tools: set = set()
+        for lang in languages:
+            sub = get_project_diagnostics(str(path), language=lang, include_lint=include_lint)
+            merged_diagnostics.extend(sub.get("diagnostics", []))
+            for t in sub.get("tools", []):
+                if t not in seen_tools:
+                    merged_tools.append(t)
+                    seen_tools.add(t)
+        merged_diagnostics.sort(key=lambda d: (d.get("file", ""), d.get("line", 0)))
+        return {
+            "project": str(path),
+            "language": "all",
+            "tools": merged_tools,
+            "diagnostics": merged_diagnostics,
+            "error_count": sum(1 for d in merged_diagnostics if d.get("severity") == "error"),
+            "warning_count": sum(1 for d in merged_diagnostics if d.get("severity") == "warning"),
+            "file_count": len(set(d["file"] for d in merged_diagnostics if d.get("file"))),
+        }
 
     all_diagnostics = []
     tools_used = []
