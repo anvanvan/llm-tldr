@@ -157,6 +157,14 @@ try:
 except ImportError:
     pass
 
+TREE_SITTER_PHP_AVAILABLE = False
+try:
+    from tree_sitter import Language, Parser
+    import tree_sitter_php
+    TREE_SITTER_PHP_AVAILABLE = True
+except ImportError:
+    pass
+
 
 class HybridExtractor:
     """
@@ -184,6 +192,7 @@ class HybridExtractor:
     LUA_EXTENSIONS = {".lua"}
     LUAU_EXTENSIONS = {".luau"}
     ELIXIR_EXTENSIONS = {".ex", ".exs"}
+    PHP_EXTENSIONS = {".php"}
 
     def __init__(self):
         self._pygments_extractor = SignatureExtractor()
@@ -342,6 +351,14 @@ class HybridExtractor:
                     return result
             logger.debug(f"Tree-sitter-elixir not available or failed, using Pygments for {suffix}")
 
+        # PHP - use tree-sitter-php if available
+        if suffix in self.PHP_EXTENSIONS:
+            if TREE_SITTER_PHP_AVAILABLE:
+                result = self._try_tree_sitter(self._extract_php, file_path, "php")
+                if result:
+                    return result
+            logger.debug(f"Tree-sitter-php not available or failed, using Pygments for {suffix}")
+
         # Fallback to Pygments
         return self._extract_pygments(file_path)
 
@@ -357,19 +374,21 @@ class HybridExtractor:
         # Convert to ModuleInfo format
         # Pygments doesn't give us enough info to distinguish classes from functions
         # so we put everything in functions
+        detected_lang = self._detect_language(file_path)
         functions = [
             FunctionInfo(
                 name=sig.split("(")[0].strip() if "(" in sig else sig,
                 params=self._extract_params_from_sig(sig),
                 return_type=None,
                 docstring=None,
+                language=detected_lang,
             )
             for sig in signatures
         ]
 
         return ModuleInfo(
             file_path=str(file_path),
-            language=self._detect_language(file_path),
+            language=detected_lang,
             docstring=None,
             functions=functions,
         )
@@ -3150,6 +3169,202 @@ class HybridExtractor:
             docstring=None,
             line_number=node.start_point[0] + 1,
         )
+
+    # === PHP Extraction ===
+
+    def _extract_php(self, file_path: Path) -> ModuleInfo:
+        """Extract using tree-sitter-php."""
+        with open(file_path, "rb") as f:
+            source = f.read()
+
+        parser = self._get_php_parser()
+        tree = self._safe_parse(parser, source, file_path, "php")
+
+        module_info = ModuleInfo(
+            file_path=str(file_path),
+            language="php",
+            docstring=None,
+        )
+
+        module_info.call_graph = CallGraphInfo()
+        self._extract_php_nodes(tree.root_node, source, module_info)
+        return module_info
+
+    def _get_php_parser(self) -> Any:
+        """Get or create tree-sitter PHP parser."""
+        if "php" not in self._ts_parsers:
+            php_lang = Language(tree_sitter_php.language_php())
+            parser = Parser(php_lang)
+            self._ts_parsers["php"] = parser
+        return self._ts_parsers["php"]
+
+    def _extract_php_nodes(self, node, source: bytes, module_info: ModuleInfo, current_class: str | None = None):
+        """Recursively extract PHP nodes into module info."""
+        for child in node.children:
+            node_type = child.type
+
+            if node_type == "class_declaration":
+                class_info = self._extract_php_class(child, source, module_info)
+                if class_info:
+                    module_info.classes.append(class_info)
+
+            elif node_type in ("interface_declaration", "trait_declaration"):
+                class_info = self._extract_php_class(child, source, module_info)
+                if class_info:
+                    module_info.classes.append(class_info)
+
+            elif node_type == "function_definition":
+                func = self._extract_php_function(child, source)
+                if func:
+                    module_info.functions.append(func)
+                    # Extract call graph from function body
+                    self._extract_php_calls(child, func.name, source, module_info.call_graph)
+
+            elif node_type == "namespace_definition":
+                # Recurse into namespace body
+                body = child.child_by_field_name("body")
+                if body:
+                    self._extract_php_nodes(body, source, module_info, current_class)
+
+            elif node_type == "program":
+                self._extract_php_nodes(child, source, module_info, current_class)
+
+    def _extract_php_class(self, node, source: bytes, module_info: ModuleInfo) -> ClassInfo | None:
+        """Extract PHP class/interface/trait declaration."""
+        name = ""
+        methods = []
+        bases = []
+
+        for child in node.children:
+            if child.type == "name":
+                name = self._safe_decode(source[child.start_byte:child.end_byte])
+            elif child.type == "base_clause":
+                for c in child.children:
+                    if c.type == "name" or c.type == "qualified_name":
+                        bases.append(self._safe_decode(source[c.start_byte:c.end_byte]))
+            elif child.type == "class_interface_clause":
+                for c in child.children:
+                    if c.type == "name" or c.type == "qualified_name":
+                        bases.append(self._safe_decode(source[c.start_byte:c.end_byte]))
+            elif child.type == "declaration_list":
+                for body_child in child.children:
+                    if body_child.type == "method_declaration":
+                        method = self._extract_php_method(body_child, source)
+                        if method:
+                            methods.append(method)
+                            # Extract call graph from method body
+                            self._extract_php_calls(body_child, f"{name}::{method.name}", source, module_info.call_graph)
+
+        if not name:
+            return None
+
+        return ClassInfo(
+            name=name,
+            bases=bases,
+            docstring=None,
+            methods=methods,
+            line_number=node.start_point[0] + 1,
+        )
+
+    def _extract_php_callable(self, node, source: bytes, *, is_method: bool = False) -> FunctionInfo | None:
+        """Extract PHP function or method declaration."""
+        name = ""
+        params = []
+        return_type = None
+
+        for child in node.children:
+            if child.type == "name":
+                name = self._safe_decode(source[child.start_byte:child.end_byte])
+            elif child.type == "formal_parameters":
+                params = self._extract_php_params(child, source)
+            elif child.type in ("named_type", "primitive_type", "nullable_type", "union_type"):
+                return_type = self._safe_decode(source[child.start_byte:child.end_byte])
+
+        if not name:
+            return None
+
+        return FunctionInfo(
+            name=name,
+            params=params,
+            return_type=return_type,
+            docstring=None,
+            is_method=is_method,
+            line_number=node.start_point[0] + 1,
+            language="php",
+        )
+
+    def _extract_php_method(self, node, source: bytes) -> FunctionInfo | None:
+        """Extract PHP method declaration."""
+        return self._extract_php_callable(node, source, is_method=True)
+
+    def _extract_php_function(self, node, source: bytes) -> FunctionInfo | None:
+        """Extract PHP top-level function definition."""
+        return self._extract_php_callable(node, source, is_method=False)
+
+    def _extract_php_params(self, node, source: bytes) -> list[str]:
+        """Extract PHP formal parameters."""
+        params = []
+        for child in node.children:
+            if child.type in ("simple_parameter", "variadic_parameter"):
+                params.append(self._safe_decode(source[child.start_byte:child.end_byte]))
+        return params
+
+    def _extract_php_calls(self, node, caller_name: str, source: bytes, call_graph: CallGraphInfo):
+        """Extract function/method calls from a PHP method body."""
+        for child in node.children:
+            if child.type == "member_call_expression":
+                # $this->method() calls
+                callee = self._get_php_member_call_name(child, source)
+                if callee and caller_name:
+                    # Resolve $this->method to ClassName::method
+                    class_name = caller_name.split("::")[0] if "::" in caller_name else ""
+                    if class_name:
+                        call_graph.add_call(caller_name, f"{class_name}::{callee}")
+            elif child.type == "scoped_call_expression":
+                # ClassName::method() static calls
+                callee = self._get_php_scoped_call_name(child, source)
+                if callee:
+                    call_graph.add_call(caller_name, callee)
+            elif child.type == "function_call_expression":
+                # Regular function calls
+                callee = self._get_php_function_call_name(child, source)
+                if callee:
+                    call_graph.add_call(caller_name, callee)
+
+            # Recurse into all children
+            self._extract_php_calls(child, caller_name, source, call_graph)
+
+    def _get_php_member_call_name(self, node, source: bytes) -> str | None:
+        """Get the method name from a member_call_expression ($this->method())."""
+        for child in node.children:
+            if child.type == "name":
+                return self._safe_decode(source[child.start_byte:child.end_byte])
+        return None
+
+    def _get_php_scoped_call_name(self, node, source: bytes) -> str | None:
+        """Get ClassName::method from a scoped_call_expression."""
+        class_name = None
+        method_name = None
+        for child in node.children:
+            if child.type == "name":
+                if class_name is None:
+                    class_name = self._safe_decode(source[child.start_byte:child.end_byte])
+                else:
+                    method_name = self._safe_decode(source[child.start_byte:child.end_byte])
+            elif child.type == "qualified_name":
+                class_name = self._safe_decode(source[child.start_byte:child.end_byte])
+        if class_name and method_name:
+            return f"{class_name}::{method_name}"
+        return None
+
+    def _get_php_function_call_name(self, node, source: bytes) -> str | None:
+        """Get function name from a function_call_expression."""
+        for child in node.children:
+            if child.type == "name":
+                return self._safe_decode(source[child.start_byte:child.end_byte])
+            elif child.type == "qualified_name":
+                return self._safe_decode(source[child.start_byte:child.end_byte])
+        return None
 
     def _parse_signatures(self, text: str) -> list[str]:
         """Parse Pygments signature output."""

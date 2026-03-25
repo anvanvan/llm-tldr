@@ -25,6 +25,9 @@ logger = logging.getLogger("tldr.semantic")
 
 ALL_LANGUAGES = ["python", "typescript", "javascript", "go", "rust", "java", "c", "cpp", "ruby", "php", "kotlin", "swift", "csharp", "scala", "lua", "luau", "elixir"]
 
+# Languages for which build_project_call_graph has a full implementation.
+CALL_GRAPH_LANGUAGES: frozenset = frozenset({"python", "typescript", "go", "rust", "java", "c", "php"})
+
 # Lazy imports for heavy dependencies
 _model = None
 _model_name = None  # Track which model is loaded
@@ -733,6 +736,63 @@ def _process_file_for_extraction(
         except Exception as e:
             logger.debug(f"AST parse failed for {file_path}: {e}")
 
+    elif lang == "php":
+        try:
+            from tldr.cross_file_calls import _get_php_parser
+
+            parser = _get_php_parser()
+            if parser:
+                content_bytes = content.encode("utf-8")
+                tree = parser.parse(content_bytes)
+
+                def _walk_php(node):
+                    if node.type in ("function_definition", "function_declaration", "method_declaration"):
+                        func_name = None
+                        params = []
+                        for child in node.children:
+                            if child.type == "name":
+                                func_name = content_bytes[child.start_byte:child.end_byte].decode("utf-8", errors="replace")
+                            elif child.type == "formal_parameters":
+                                for p in child.children:
+                                    if p.type in ("simple_parameter", "variadic_parameter"):
+                                        params.append(content_bytes[p.start_byte:p.end_byte].decode("utf-8", errors="replace").strip())
+
+                        if func_name:
+                            start_line = node.start_point[0] + 1
+                            sig = f"function {func_name}({', '.join(params)})"
+                            # Check if method (inside class) via O(1) field lookup
+                            parent_class = None
+                            p = node.parent
+                            while p and p.type not in ("class_declaration", "interface_declaration", "trait_declaration", "program"):
+                                p = p.parent
+                            if p and p.type in ("class_declaration", "interface_declaration", "trait_declaration"):
+                                name_node = p.child_by_field_name("name")
+                                if name_node:
+                                    parent_class = content_bytes[name_node.start_byte:name_node.end_byte].decode("utf-8", errors="replace")
+
+                            if parent_class:
+                                key = f"{parent_class}.{func_name}"
+                                ast_info["methods"][key] = {"line": start_line, "code_preview": ""}
+                                all_signatures[key] = sig
+                                all_docstrings[key] = ""
+                            else:
+                                ast_info["functions"][func_name] = {"line": start_line, "code_preview": ""}
+                                all_signatures[func_name] = sig
+                                all_docstrings[func_name] = ""
+
+                    elif node.type in ("class_declaration", "interface_declaration", "trait_declaration"):
+                        name_node = node.child_by_field_name("name")
+                        if name_node:
+                            cls_name = content_bytes[name_node.start_byte:name_node.end_byte].decode("utf-8", errors="replace")
+                            ast_info["classes"][cls_name] = {"line": node.start_point[0] + 1}
+
+                    for child in node.children:
+                        _walk_php(child)
+
+                _walk_php(tree.root_node)
+        except Exception as e:
+            logger.debug(f"PHP AST parse failed for {file_path}: {e}")
+
     # Get dependencies (imports) - single call
     dependencies = ""
     try:
@@ -758,6 +818,10 @@ def _process_file_for_extraction(
             from tldr.cfg_extractor import extract_typescript_cfg
             from tldr.dfg_extractor import extract_typescript_dfg
             return extract_typescript_cfg, extract_typescript_dfg
+        elif language == "php":
+            from tldr.cfg_extractor import extract_php_cfg
+            from tldr.dfg_extractor import extract_php_dfg
+            return extract_php_cfg, extract_php_dfg
         return None, None
 
     cfg_extractor, dfg_extractor = _get_extractors(lang)
@@ -783,9 +847,30 @@ def _process_file_for_extraction(
             except Exception:
                 dfg_cache[func_name] = ""
 
+    # Build suffix -> (mkey, mval) reverse lookup for O(1) method fallback
+    _ast_methods = ast_info.get("methods", {})
+    _method_by_suffix: dict = {}
+    for _mk, _mv in _ast_methods.items():
+        _dot = _mk.rfind(".")
+        if _dot != -1:
+            _method_by_suffix[_mk[_dot:]] = (_mk, _mv)  # key is ".methodName"
+
     # Process functions
     for func_name in file_info.get("functions", []):
         func_info = ast_info.get("functions", {}).get(func_name, {})
+        sig = all_signatures.get(func_name)
+        # Fallback: check ast_info["methods"] for "*.func_name" compound keys (O(1))
+        if not func_info or not sig:
+            hit = _method_by_suffix.get(f".{func_name}")
+            if hit:
+                mkey, mval = hit
+                if not func_info:
+                    func_info = mval
+                if not sig:
+                    sig = all_signatures.get(mkey)
+        if not sig:
+            kw = "function" if lang == "php" else "def"
+            sig = f"{kw} {func_name}(...)"
         unit = EmbeddingUnit(
             name=func_name,
             qualified_name=f"{file_path.replace('/', '.')}.{func_name}",
@@ -793,7 +878,7 @@ def _process_file_for_extraction(
             line=func_info.get("line", 1),
             language=lang,
             unit_type="function",
-            signature=all_signatures.get(func_name, f"def {func_name}(...)"),
+            signature=sig,
             docstring=all_docstrings.get(func_name, ""),
             calls=calls_map.get(func_name, [])[:5],
             called_by=called_by_map.get(func_name, [])[:5],
@@ -811,7 +896,9 @@ def _process_file_for_extraction(
             methods = class_info.get("methods", [])
         else:
             class_name = class_info
-            methods = []
+            # Derive methods from ast_info["methods"] keys matching "ClassName.method"
+            prefix = f"{class_name}."
+            methods = [k[len(prefix):] for k in ast_info.get("methods", {}) if k.startswith(prefix)]
 
         class_line = ast_info.get("classes", {}).get(class_name, {}).get("line", 1)
 
@@ -835,6 +922,8 @@ def _process_file_for_extraction(
         units.append(unit)
 
         # Add methods
+        _sig_kw = "function" if lang == "php" else "def"
+        _sig_args = "..." if lang == "php" else "self, ..."
         for method in methods:
             method_key = f"{class_name}.{method}"
             method_info = ast_info.get("methods", {}).get(method_key, {})
@@ -846,7 +935,7 @@ def _process_file_for_extraction(
                 line=method_info.get("line", 1),
                 language=lang,
                 unit_type="method",
-                signature=all_signatures.get(method_key, f"def {method}(self, ...)"),
+                signature=all_signatures.get(method_key, f"{_sig_kw} {method}({_sig_args})"),
                 docstring=all_docstrings.get(method_key, ""),
                 calls=calls_map.get(method, [])[:5],
                 called_by=called_by_map.get(method, [])[:5],
@@ -927,7 +1016,9 @@ def _detect_project_languages(project_path: Path, respect_ignore: bool = True) -
                  found_languages.add(EXTENSION_TO_LANGUAGE[ext])
 
     # Return sorted list intersect with ALL_LANGUAGES to ensure validity
-    return sorted(list(found_languages & set(ALL_LANGUAGES)))
+    # Sort with call-graph-supported languages first so resolve_language picks them
+    valid = list(found_languages & set(ALL_LANGUAGES))
+    return sorted(valid, key=lambda l: (0 if l in CALL_GRAPH_LANGUAGES else 1, l))
 
 
 def build_semantic_index(

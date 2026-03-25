@@ -602,16 +602,21 @@ Semantic Search:
 
             # Determine language(s) to analyze
             if args.lang == "auto":
-                # Use cached languages, or detect if no cache
-                cached = get_cached_languages(project_path)
-                if cached:
-                    languages = cached
+                # For single files, detect language from extension
+                if project_path.is_file():
+                    detected = detect_language_from_extension(str(project_path))
+                    languages = [detected]
                 else:
-                    from .semantic import _detect_project_languages
-                    respect_ignore = not getattr(args, 'no_ignore', False)
-                    languages = _detect_project_languages(project_path, respect_ignore=respect_ignore)
-                    if not languages:
-                        languages = ["python"]
+                    # Use cached languages, or detect if no cache
+                    cached = get_cached_languages(project_path)
+                    if cached:
+                        languages = cached
+                    else:
+                        from .semantic import _detect_project_languages
+                        respect_ignore = not getattr(args, 'no_ignore', False)
+                        languages = _detect_project_languages(project_path, respect_ignore=respect_ignore)
+                        if not languages:
+                            languages = ["python"]
             elif args.lang == "all":
                 # Detect all languages in project
                 from .semantic import _detect_project_languages

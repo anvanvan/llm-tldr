@@ -100,10 +100,21 @@ def impact_analysis(
     reverse = build_reverse_graph(edges)
 
     # Find target function(s) as callees (functions being called)
+    # For PHP, names may be ClassName::method — match both qualified and bare names
+    def _matches_target(func_name: str, target: str) -> bool:
+        if func_name == target:
+            return True
+        # Match bare name against qualified ClassName::method
+        if "::" in func_name and func_name.split("::")[-1] == target:
+            return True
+        if "::" in target and target.split("::")[-1] == func_name:
+            return True
+        return False
+
     all_callees = set()
     for from_file, from_func, to_file, to_func in edges:
         callee = FunctionRef(file=to_file, name=to_func)
-        if callee.name == target_func:
+        if _matches_target(callee.name, target_func):
             if target_file is None or target_file in callee.file:
                 all_callees.add(callee)
 
@@ -114,7 +125,7 @@ def impact_analysis(
         # (function calls others but is never called itself = entry point)
         callers_only = set()
         for from_file, from_func, to_file, to_func in edges:
-            if from_func == target_func:
+            if _matches_target(from_func, target_func):
                 if target_file is None or target_file in from_file:
                     callers_only.add(FunctionRef(file=from_file, name=from_func))
 

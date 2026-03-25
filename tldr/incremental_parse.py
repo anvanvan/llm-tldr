@@ -339,6 +339,7 @@ class TreeCache:
             ".py": "python",
             ".go": "go",
             ".rs": "rust",
+            ".php": "php",
         }
         return lang_map.get(suffix, "unknown")
 

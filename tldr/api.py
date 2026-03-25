@@ -554,7 +554,8 @@ def get_relevant_context(
         "python": ".py",
         "typescript": ".ts",
         "go": ".go",
-        "rust": ".rs"
+        "rust": ".rs",
+        "php": ".php",
     }.get(language, ".py")
 
     # NOTE: Removed module-file shortcut that conflicted with function lookup.
@@ -573,7 +574,8 @@ def get_relevant_context(
         "python": {".py"},
         "typescript": {".ts", ".tsx"},
         "go": {".go"},
-        "rust": {".rs"}
+        "rust": {".rs"},
+        "php": {".php"},
     }
     extensions = ext_map.get(language, {".py"})
 
@@ -618,6 +620,10 @@ def get_relevant_context(
                         # Store as ClassName.method
                         key = f"{cls.name}.{method.name}"
                         signatures[key] = (str(file_path), method)
+                        # Also store ClassName::method alias (PHP convention)
+                        if language == "php":
+                            cc_key = f"{cls.name}::{method.name}"
+                            signatures[cc_key] = (str(file_path), method)
                         # Also store just method name (for call graph join)
                         # Only if not already taken by a standalone function
                         if method.name not in signatures:
@@ -659,6 +665,9 @@ def get_relevant_context(
     # Helper to resolve function name to signature (handles qualified/unqualified)
     def resolve_func_name(name: str) -> list[tuple[str, tuple[str, FunctionInfo]]]:
         """Resolve function name, returning all matches for ambiguous names."""
+        # Normalize PHP :: to . for qualified lookup (adv-2)
+        if "::" in name:
+            name = name.replace("::", ".")
         # If qualified (has dot), do direct lookup
         if "." in name:
             if name in signatures:
@@ -1511,6 +1520,25 @@ class Selection:
         return len(self._selected)
 
 
+def _build_file_entry(info_dict: dict, path: str) -> dict:
+    """Build a file entry dict from an extracted info dict and a path label."""
+    functions = [f["name"] for f in info_dict.get("functions", [])]
+    methods = []
+    for cls in info_dict.get("classes", []):
+        for method in cls.get("methods", []):
+            method_name = method.get("name", "")
+            if method_name:
+                methods.append(method_name)
+                functions.append(method_name)
+    return {
+        "path": path,
+        "functions": functions,
+        "classes": [c["name"] for c in info_dict.get("classes", [])],
+        "methods": methods,
+        "imports": info_dict.get("imports", []),
+    }
+
+
 def get_code_structure(
     root: str | Path,
     language: str = "python",
@@ -1568,6 +1596,16 @@ def get_code_structure(
 
     result = {"root": str(root), "language": language, "files": []}
 
+    # Handle single-file input: rglob("*") on a file returns empty iterator
+    if root.is_file():
+        if root.suffix in extensions:
+            try:
+                info = _extract_file_impl(str(root))
+                result["files"].append(_build_file_entry(info.to_dict(), root.name))
+            except Exception:
+                pass
+        return result
+
     count = 0
     for file_path in root.rglob("*"):
         if count >= max_results:
@@ -1592,30 +1630,9 @@ def get_code_structure(
 
         try:
             info = _extract_file_impl(str(file_path))
-            info_dict = info.to_dict()
-
-            # Collect top-level functions
-            functions = [f["name"] for f in info_dict.get("functions", [])]
-
-            # Collect class methods
-            methods = []
-            for cls in info_dict.get("classes", []):
-                cls_name = cls.get("name", "")
-                for method in cls.get("methods", []):
-                    method_name = method.get("name", "")
-                    if method_name:
-                        methods.append(method_name)  # Plain method name
-                        functions.append(method_name)  # Also in functions for discoverability
-
-            file_entry = {
-                "path": str(file_path.relative_to(root)),
-                "functions": functions,  # Includes both functions and methods
-                "classes": [c["name"] for c in info_dict.get("classes", [])],
-                "methods": methods,  # Methods only (for filtering)
-                "imports": info_dict.get("imports", []),
-            }
-
-            result["files"].append(file_entry)
+            result["files"].append(
+                _build_file_entry(info.to_dict(), str(file_path.relative_to(root)))
+            )
             count += 1
         except Exception:
             # Skip files that can't be parsed

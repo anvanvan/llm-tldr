@@ -3821,6 +3821,21 @@ def _build_c_call_graph(
                                 break
 
 
+def _find_method_in_index(method_index: dict, method: str, preferred_file: str | None = None) -> str | None:
+    """Return the file_path for the first func_index entry matching method name.
+
+    If preferred_file is given, a same-file match is returned first.
+    """
+    candidates = method_index.get(method, [])
+    if not candidates:
+        return None
+    if preferred_file:
+        for _key, fp in candidates:
+            if fp == preferred_file:
+                return fp
+    return candidates[0][1]
+
+
 def _build_php_call_graph(
     root: Path,
     graph: ProjectCallGraph,
@@ -3828,6 +3843,13 @@ def _build_php_call_graph(
     workspace_config: Optional[WorkspaceConfig] = None
 ):
     """Build call graph for PHP files."""
+    # Pre-build method_name -> [(key, file_path)] for O(1) lookups
+    method_index: dict[str, list] = {}
+    for key, file_path in func_index.items():
+        if isinstance(key, tuple) and len(key) == 2:
+            _, name = key
+            method_index.setdefault(name, []).append((key, file_path))
+
     for php_file in scan_project(root, "php", workspace_config):
         php_path = Path(php_file)
         rel_path = str(php_path.relative_to(root))
@@ -3880,12 +3902,9 @@ def _build_php_call_graph(
                                 graph.add_edge(rel_path, caller_func, dst_file, orig_name)
                     else:
                         # Try to find directly in func_index
-                        for key, file_path in func_index.items():
-                            if isinstance(key, tuple) and len(key) == 2:
-                                _, name = key
-                                if name == call_target:
-                                    graph.add_edge(rel_path, caller_func, file_path, call_target)
-                                    break
+                        dst = _find_method_in_index(method_index, call_target)
+                        if dst:
+                            graph.add_edge(rel_path, caller_func, dst, call_target)
 
                 elif call_type == 'static':
                     # ClassName::staticMethod()
@@ -3910,32 +3929,22 @@ def _build_php_call_graph(
                                 graph.add_edge(rel_path, caller_func, dst_file, method)
                             else:
                                 # Search in index
-                                for key, file_path in func_index.items():
-                                    if isinstance(key, tuple) and len(key) == 2:
-                                        _, name = key
-                                        if name == method:
-                                            graph.add_edge(rel_path, caller_func, file_path, method)
-                                            break
+                                dst = _find_method_in_index(method_index, method)
+                                if dst:
+                                    graph.add_edge(rel_path, caller_func, dst, method)
 
                 elif call_type == 'attr':
                     # $obj->method() - try to find method in index
                     parts = call_target.split('->', 1)
                     if len(parts) == 2:
                         obj, method = parts
-                        # For $this->method(), try to find method in same file first
+                        # For $this->method(), prefer same file (own class), fall back cross-file
                         if obj == "$this":
-                            # Check if method exists in current file's functions
-                            for key, file_path in func_index.items():
-                                if isinstance(key, tuple) and len(key) == 2:
-                                    _, name = key
-                                    if name == method and file_path == rel_path:
-                                        graph.add_edge(rel_path, caller_func, rel_path, method)
-                                        break
+                            dst = _find_method_in_index(method_index, method, preferred_file=rel_path)
+                            if dst:
+                                graph.add_edge(rel_path, caller_func, dst, method)
                         else:
                             # Generic object method call - try to find method
-                            for key, file_path in func_index.items():
-                                if isinstance(key, tuple) and len(key) == 2:
-                                    _, name = key
-                                    if name == method:
-                                        graph.add_edge(rel_path, caller_func, file_path, method)
-                                        break
+                            dst = _find_method_in_index(method_index, method)
+                            if dst:
+                                graph.add_edge(rel_path, caller_func, dst, method)
