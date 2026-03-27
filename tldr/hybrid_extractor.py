@@ -3198,42 +3198,62 @@ class HybridExtractor:
             self._ts_parsers["php"] = parser
         return self._ts_parsers["php"]
 
-    def _extract_php_nodes(self, node, source: bytes, module_info: ModuleInfo, current_class: str | None = None):
+    def _extract_php_nodes(self, node, source: bytes, module_info: ModuleInfo, namespace: str | None = None):
         """Recursively extract PHP nodes into module info."""
+        active_ns = namespace
         for child in node.children:
             node_type = child.type
 
-            if node_type == "class_declaration":
-                class_info = self._extract_php_class(child, source, module_info)
+            if node_type in ("class_declaration", "interface_declaration", "trait_declaration"):
+                class_info = self._extract_php_class(child, source, module_info, namespace=active_ns)
                 if class_info:
-                    module_info.classes.append(class_info)
-
-            elif node_type in ("interface_declaration", "trait_declaration"):
-                class_info = self._extract_php_class(child, source, module_info)
-                if class_info:
+                    if active_ns:
+                        bare_name = class_info.name
+                        class_info.name = f"{active_ns}\\{class_info.name}"
+                        qualified = class_info.name
+                        # Update callee values referencing the bare class name (bare -> qualified)
+                        module_info.call_graph.rename_prefix(f"{bare_name}::", f"{qualified}::")
                     module_info.classes.append(class_info)
 
             elif node_type == "function_definition":
                 func = self._extract_php_function(child, source)
                 if func:
+                    if active_ns:
+                        func.name = f"{active_ns}\\{func.name}"
                     module_info.functions.append(func)
                     # Extract call graph from function body
                     self._extract_php_calls(child, func.name, source, module_info.call_graph)
 
             elif node_type == "namespace_definition":
-                # Recurse into namespace body
+                # Extract namespace name
+                ns_name = None
+                for ns_child in child.children:
+                    if ns_child.type == "namespace_name":
+                        ns_name = self._safe_decode(source[ns_child.start_byte:ns_child.end_byte])
+                        break
                 body = child.child_by_field_name("body")
                 if body:
-                    self._extract_php_nodes(body, source, module_info, current_class)
+                    # Braced namespace: recurse into body
+                    self._extract_php_nodes(body, source, module_info, namespace=ns_name)
+                else:
+                    # Semicolon namespace: applies to subsequent siblings
+                    active_ns = ns_name
 
             elif node_type == "program":
-                self._extract_php_nodes(child, source, module_info, current_class)
+                self._extract_php_nodes(child, source, module_info, namespace=active_ns)
 
-    def _extract_php_class(self, node, source: bytes, module_info: ModuleInfo) -> ClassInfo | None:
+    def _extract_php_class(self, node, source: bytes, module_info: ModuleInfo, namespace: str | None = None) -> ClassInfo | None:
         """Extract PHP class/interface/trait declaration."""
         name = ""
         methods = []
         bases = []
+
+        # Detect type keyword from node type
+        type_keyword = "class"
+        if node.type == "interface_declaration":
+            type_keyword = "interface"
+        elif node.type == "trait_declaration":
+            type_keyword = "trait"
 
         for child in node.children:
             if child.type == "name":
@@ -3247,13 +3267,15 @@ class HybridExtractor:
                     if c.type == "name" or c.type == "qualified_name":
                         bases.append(self._safe_decode(source[c.start_byte:c.end_byte]))
             elif child.type == "declaration_list":
+                # Use qualified class name for call graph entries if namespace is available
+                qualified_name = f"{namespace}\\{name}" if namespace else name
                 for body_child in child.children:
                     if body_child.type == "method_declaration":
                         method = self._extract_php_method(body_child, source)
                         if method:
                             methods.append(method)
-                            # Extract call graph from method body
-                            self._extract_php_calls(body_child, f"{name}::{method.name}", source, module_info.call_graph)
+                            # Extract call graph from method body with qualified caller
+                            self._extract_php_calls(body_child, f"{qualified_name}::{method.name}", source, module_info.call_graph)
 
         if not name:
             return None
@@ -3264,6 +3286,7 @@ class HybridExtractor:
             docstring=None,
             methods=methods,
             line_number=node.start_point[0] + 1,
+            type_keyword=type_keyword,
         )
 
     def _extract_php_callable(self, node, source: bytes, *, is_method: bool = False) -> FunctionInfo | None:
@@ -3312,17 +3335,34 @@ class HybridExtractor:
     def _extract_php_calls(self, node, caller_name: str, source: bytes, call_graph: CallGraphInfo):
         """Extract function/method calls from a PHP method body."""
         for child in node.children:
+            # Skip anonymous class bodies — their $this-> calls belong to the anon class
+            if child.type == "anonymous_class":
+                continue
+            elif child.type == "object_creation_expression":
+                if any(gc.type == "anonymous_class" for gc in child.children):
+                    continue
             if child.type == "member_call_expression":
-                # $this->method() calls
+                # $this->method() calls — only qualify when receiver is $this
+                obj_node = child.child_by_field_name("object")
+                is_this = (
+                    obj_node is not None
+                    and obj_node.type == "variable_name"
+                    and self._safe_decode(source[obj_node.start_byte:obj_node.end_byte]) == "$this"
+                )
                 callee = self._get_php_member_call_name(child, source)
-                if callee and caller_name:
+                if callee and caller_name and is_this:
                     # Resolve $this->method to ClassName::method
                     class_name = caller_name.split("::")[0] if "::" in caller_name else ""
                     if class_name:
                         call_graph.add_call(caller_name, f"{class_name}::{callee}")
+                elif callee and caller_name and not is_this:
+                    # Non-$this member call (e.g. $user->getName()) — record bare
+                    # method name intentionally; the receiver's class is unknown at
+                    # static analysis time without type inference.
+                    call_graph.add_call(caller_name, callee)
             elif child.type == "scoped_call_expression":
                 # ClassName::method() static calls
-                callee = self._get_php_scoped_call_name(child, source)
+                callee = self._get_php_scoped_call_name(child, caller_name, source)
                 if callee:
                     call_graph.add_call(caller_name, callee)
             elif child.type == "function_call_expression":
@@ -3341,7 +3381,7 @@ class HybridExtractor:
                 return self._safe_decode(source[child.start_byte:child.end_byte])
         return None
 
-    def _get_php_scoped_call_name(self, node, source: bytes) -> str | None:
+    def _get_php_scoped_call_name(self, node, caller_name: str | None, source: bytes) -> str | None:
         """Get ClassName::method from a scoped_call_expression."""
         class_name = None
         method_name = None
@@ -3353,6 +3393,11 @@ class HybridExtractor:
                     method_name = self._safe_decode(source[child.start_byte:child.end_byte])
             elif child.type == "qualified_name":
                 class_name = self._safe_decode(source[child.start_byte:child.end_byte])
+            elif child.type == "relative_scope":
+                # self::, static::, parent:: — resolve to current class context
+                scope_text = self._safe_decode(source[child.start_byte:child.end_byte])
+                if scope_text in ("self", "static", "parent") and caller_name and "::" in caller_name:
+                    class_name = caller_name.split("::")[0]
         if class_name and method_name:
             return f"{class_name}::{method_name}"
         return None
@@ -3429,6 +3474,7 @@ def extract_directory(
         extensions = (
             HybridExtractor.PYTHON_EXTENSIONS |
             HybridExtractor.TREE_SITTER_EXTENSIONS |
+            HybridExtractor.PHP_EXTENSIONS |
             {".go", ".rs", ".rb", ".java", ".kt", ".c", ".cpp", ".h", ".hpp", ".cs", ".swift", ".scala", ".sc"}
         )
 

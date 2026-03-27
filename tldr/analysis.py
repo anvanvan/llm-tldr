@@ -81,6 +81,7 @@ def impact_analysis(
     target_func: str,
     max_depth: int = 3,
     target_file: str | None = None,
+    language: str | None = None,
 ) -> dict:
     """Find all callers of a function, up to max_depth levels.
 
@@ -101,20 +102,28 @@ def impact_analysis(
 
     # Find target function(s) as callees (functions being called)
     # For PHP, names may be ClassName::method — match both qualified and bare names
-    def _matches_target(func_name: str, target: str) -> bool:
-        if func_name == target:
+    is_php = language == "php"
+    norm_target_func = target_func.replace(".", "::") if is_php else target_func
+
+    def _matches_target(func_name: str) -> bool:
+        if is_php:
+            # Normalize '.' to '::' so "Class.method" matches "Class::method"
+            norm_func = func_name.replace(".", "::")
+        else:
+            norm_func = func_name
+        if norm_func == norm_target_func:
             return True
         # Match bare name against qualified ClassName::method
-        if "::" in func_name and func_name.split("::")[-1] == target:
+        if "::" in norm_func and norm_func.split("::")[-1] == norm_target_func:
             return True
-        if "::" in target and target.split("::")[-1] == func_name:
+        if "::" in norm_target_func and norm_target_func.split("::")[-1] == norm_func:
             return True
         return False
 
     all_callees = set()
     for from_file, from_func, to_file, to_func in edges:
         callee = FunctionRef(file=to_file, name=to_func)
-        if _matches_target(callee.name, target_func):
+        if _matches_target(callee.name):
             if target_file is None or target_file in callee.file:
                 all_callees.add(callee)
 
@@ -125,7 +134,7 @@ def impact_analysis(
         # (function calls others but is never called itself = entry point)
         callers_only = set()
         for from_file, from_func, to_file, to_func in edges:
-            if _matches_target(from_func, target_func):
+            if _matches_target(from_func):
                 if target_file is None or target_file in from_file:
                     callers_only.add(FunctionRef(file=from_file, name=from_func))
 
@@ -395,7 +404,7 @@ def analyze_impact(
     from .api import build_project_call_graph
 
     call_graph = build_project_call_graph(path, language=language)
-    return impact_analysis(call_graph, target_func, max_depth, target_file)
+    return impact_analysis(call_graph, target_func, max_depth, target_file, language=language)
 
 
 def analyze_dead_code(

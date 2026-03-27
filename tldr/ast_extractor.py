@@ -56,11 +56,13 @@ class ClassInfo:
     methods: list[FunctionInfo] = field(default_factory=list)
     decorators: list[str] = field(default_factory=list)
     line_number: int = 0
+    type_keyword: str = "class"
 
     def signature(self) -> str:
         """Return class definition signature."""
+        kw = self.type_keyword or "class"
         bases_str = ", ".join(self.bases) if self.bases else ""
-        return f"class {self.name}({bases_str})" if bases_str else f"class {self.name}"
+        return f"{kw} {self.name}({bases_str})" if bases_str else f"{kw} {self.name}"
 
 
 @dataclass
@@ -96,6 +98,22 @@ class CallGraphInfo:
             self.called_by[callee] = []
         if caller not in self.called_by[callee]:
             self.called_by[callee].append(caller)
+
+    def rename_prefix(self, old_prefix: str, new_prefix: str) -> None:
+        """Replace old_prefix with new_prefix in all call graph edge values."""
+        def _rewrite(lst: list[str]) -> list[str]:
+            return [
+                f"{new_prefix}{c[len(old_prefix):]}" if c.startswith(old_prefix) else c
+                for c in lst
+            ]
+        for d in (self.calls, self.called_by):
+            for key in d:
+                d[key] = _rewrite(d[key])
+            # Rewrite dict keys that start with old_prefix
+            keys_to_rename = [k for k in d if k.startswith(old_prefix)]
+            for k in keys_to_rename:
+                new_key = f"{new_prefix}{k[len(old_prefix):]}"
+                d[new_key] = d.pop(k)
 
 
 @dataclass

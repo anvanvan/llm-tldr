@@ -1529,7 +1529,7 @@ def _build_file_entry(info_dict: dict, path: str) -> dict:
             method_name = method.get("name", "")
             if method_name:
                 methods.append(method_name)
-                functions.append(method_name)
+                functions.append(method_name)  # Also in functions for discoverability
     return {
         "path": path,
         "functions": functions,

@@ -847,13 +847,13 @@ def _process_file_for_extraction(
             except Exception:
                 dfg_cache[func_name] = ""
 
-    # Build suffix -> (mkey, mval) reverse lookup for O(1) method fallback
+    # Build suffix -> list[(mkey, mval)] reverse lookup for O(1) method fallback
     _ast_methods = ast_info.get("methods", {})
-    _method_by_suffix: dict = {}
+    _method_by_suffix: dict[str, list] = {}
     for _mk, _mv in _ast_methods.items():
         _dot = _mk.rfind(".")
         if _dot != -1:
-            _method_by_suffix[_mk[_dot:]] = (_mk, _mv)  # key is ".methodName"
+            _method_by_suffix.setdefault(_mk[_dot:], []).append((_mk, _mv))  # key is ".methodName"
 
     # Process functions
     for func_name in file_info.get("functions", []):
@@ -861,9 +861,14 @@ def _process_file_for_extraction(
         sig = all_signatures.get(func_name)
         # Fallback: check ast_info["methods"] for "*.func_name" compound keys (O(1))
         if not func_info or not sig:
-            hit = _method_by_suffix.get(f".{func_name}")
-            if hit:
-                mkey, mval = hit
+            hits = _method_by_suffix.get(f".{func_name}")
+            if hits:
+                # Prefer the hit whose class belongs to the current file
+                if len(hits) > 1:
+                    file_hits = [h for h in hits if h[0].split(".")[0] in file_path]
+                    if file_hits:
+                        hits = file_hits
+                mkey, mval = hits[0]
                 if not func_info:
                     func_info = mval
                 if not sig:
@@ -937,8 +942,8 @@ def _process_file_for_extraction(
                 unit_type="method",
                 signature=all_signatures.get(method_key, f"{_sig_kw} {method}({_sig_args})"),
                 docstring=all_docstrings.get(method_key, ""),
-                calls=calls_map.get(method, [])[:5],
-                called_by=called_by_map.get(method, [])[:5],
+                calls=(calls_map.get(f"{class_name}::{method}") or calls_map.get(method, []))[:5],
+                called_by=(called_by_map.get(f"{class_name}::{method}") or called_by_map.get(method, []))[:5],
                 cfg_summary=cfg_cache.get(method, ""),
                 dfg_summary=dfg_cache.get(method, ""),
                 dependencies=dependencies,
