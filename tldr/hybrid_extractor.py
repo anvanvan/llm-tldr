@@ -3339,7 +3339,12 @@ class HybridExtractor:
             if child.type == "anonymous_class":
                 continue
             elif child.type == "object_creation_expression":
-                if any(gc.type == "anonymous_class" for gc in child.children):
+                anon = next((gc for gc in child.children if gc.type == "anonymous_class"), None)
+                if anon is not None:
+                    # Recurse into constructor arguments but skip the anonymous class body
+                    for ac_child in anon.children:
+                        if ac_child.type == "arguments":
+                            self._extract_php_calls(ac_child, caller_name, source, call_graph)
                     continue
             if child.type == "member_call_expression":
                 # $this->method() calls — only qualify when receiver is $this

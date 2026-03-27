@@ -113,7 +113,12 @@ class CallGraphInfo:
             keys_to_rename = [k for k in d if k.startswith(old_prefix)]
             for k in keys_to_rename:
                 new_key = f"{new_prefix}{k[len(old_prefix):]}"
-                d[new_key] = d.pop(k)
+                old_val = d.pop(k)
+                if new_key in d:
+                    existing = set(d[new_key])
+                    d[new_key] = d[new_key] + [v for v in old_val if v not in existing]
+                else:
+                    d[new_key] = old_val
 
 
 @dataclass
