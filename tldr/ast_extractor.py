@@ -107,8 +107,9 @@ class CallGraphInfo:
                 for c in lst
             ]
         for d in (self.calls, self.called_by):
+            # Rewrite and deduplicate values in a single pass (preserving order)
             for key in d:
-                d[key] = _rewrite(d[key])
+                d[key] = list(dict.fromkeys(_rewrite(d[key])))
             # Rewrite dict keys that start with old_prefix
             keys_to_rename = [k for k in d if k.startswith(old_prefix)]
             for k in keys_to_rename:
