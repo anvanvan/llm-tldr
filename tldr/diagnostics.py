@@ -1075,6 +1075,22 @@ def get_project_diagnostics(
             except subprocess.TimeoutExpired:
                 pass
 
+    elif language == "php":
+        # Run phpstan for linting
+        if include_lint and shutil.which("phpstan"):
+            try:
+                result = subprocess.run(
+                    ["phpstan", "analyse", "--error-format=json", str(path)],
+                    capture_output=True,
+                    text=True,
+                    timeout=120,
+                    cwd=str(path),
+                )
+                all_diagnostics.extend(_parse_phpstan_output(result.stdout))
+                tools_used.append("phpstan")
+            except subprocess.TimeoutExpired:
+                pass
+
     elif language == "ruby":
         # Run rubocop on project
         if include_lint and shutil.which("rubocop"):

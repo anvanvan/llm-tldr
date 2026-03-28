@@ -134,6 +134,12 @@ except ImportError:
     pass
 
 
+# Languages with a full _build_*_call_graph implementation in build_project_call_graph.
+CALL_GRAPH_LANGUAGES: frozenset[str] = frozenset(
+    {"python", "typescript", "go", "rust", "java", "c", "php"}
+)
+
+
 @dataclass
 class ProjectCallGraph:
     """Cross-file call graph with edges as (src_file, src_func, dst_file, dst_func)."""
@@ -3822,9 +3828,11 @@ def _build_c_call_graph(
 
 
 def _find_method_in_index(method_index: dict, method: str, preferred_file: str | None = None) -> str | None:
-    """Return the file_path for the first func_index entry matching method name.
+    """Return the file_path for a func_index entry matching method name, or None.
 
-    If preferred_file is given, a same-file match is returned first.
+    Returns None when no candidates exist or when the match is ambiguous
+    (multiple candidates and no preferred_file match), to avoid false edges.
+    If preferred_file is given, a same-file match is returned preferentially.
     """
     candidates = method_index.get(method, [])
     if not candidates:
@@ -3833,7 +3841,11 @@ def _find_method_in_index(method_index: dict, method: str, preferred_file: str |
         for _key, fp in candidates:
             if fp == preferred_file:
                 return fp
-    return candidates[0][1]
+    # Only one candidate — unambiguous, safe to return
+    if len(candidates) == 1:
+        return candidates[0][1]
+    # Multiple candidates and no preferred_file match — ambiguous; skip edge
+    return None
 
 
 def _build_php_call_graph(
@@ -3914,13 +3926,19 @@ def _build_php_call_graph(
                         # Try to resolve class name via imports
                         if class_name in import_map:
                             namespace, resolved_class = import_map[class_name]
-                            # Look for Class::method in index
+                            # Look for Class::method in index (ambiguity-safe)
+                            _candidates = []
                             for key, file_path in func_index.items():
                                 if isinstance(key, tuple) and len(key) == 2:
                                     _, name = key
                                     if name == method or name == f"{resolved_class}::{method}":
-                                        graph.add_edge(rel_path, caller_func, file_path, method)
-                                        break
+                                        _candidates.append(file_path)
+                            if len(_candidates) == 1:
+                                graph.add_edge(rel_path, caller_func, _candidates[0], method)
+                            elif _candidates:
+                                # Multiple candidates: prefer same-file, else skip
+                                if rel_path in _candidates:
+                                    graph.add_edge(rel_path, caller_func, rel_path, method)
                         else:
                             # Try direct lookup
                             key = (class_name, method)

@@ -25,8 +25,7 @@ logger = logging.getLogger("tldr.semantic")
 
 ALL_LANGUAGES = ["python", "typescript", "javascript", "go", "rust", "java", "c", "cpp", "ruby", "php", "kotlin", "swift", "csharp", "scala", "lua", "luau", "elixir"]
 
-# Languages for which build_project_call_graph has a full implementation.
-CALL_GRAPH_LANGUAGES: frozenset = frozenset({"python", "typescript", "go", "rust", "java", "c", "php"})
+from tldr.cross_file_calls import CALL_GRAPH_LANGUAGES  # single source of truth
 
 # Lazy imports for heavy dependencies
 _model = None
@@ -745,7 +744,17 @@ def _process_file_for_extraction(
                 content_bytes = content.encode("utf-8")
                 tree = parser.parse(content_bytes)
 
+                # F3: Track active PHP namespace for qualified names
+                _php_active_ns = ""
+
                 def _walk_php(node):
+                    nonlocal _php_active_ns
+                    # F3: Detect namespace_definition and update active namespace
+                    if node.type == "namespace_definition":
+                        ns_name_node = node.child_by_field_name("name")
+                        if ns_name_node:
+                            _php_active_ns = content_bytes[ns_name_node.start_byte:ns_name_node.end_byte].decode("utf-8", errors="replace")
+
                     if node.type in ("function_definition", "function_declaration", "method_declaration"):
                         func_name = None
                         params = []
@@ -760,7 +769,7 @@ def _process_file_for_extraction(
                         if func_name:
                             start_line = node.start_point[0] + 1
                             sig = f"function {func_name}({', '.join(params)})"
-                            # Check if method (inside class) via O(1) field lookup
+                            # Walk up to the enclosing class/interface/trait, if any
                             parent_class = None
                             p = node.parent
                             while p and p.type not in ("class_declaration", "interface_declaration", "trait_declaration", "program"):
@@ -771,20 +780,27 @@ def _process_file_for_extraction(
                                     parent_class = content_bytes[name_node.start_byte:name_node.end_byte].decode("utf-8", errors="replace")
 
                             if parent_class:
-                                key = f"{parent_class}.{func_name}"
+                                # F3: Qualify parent class with namespace
+                                fq_parent = f"{_php_active_ns}\\{parent_class}" if _php_active_ns else parent_class
+                                key = f"{fq_parent}.{func_name}"
                                 ast_info["methods"][key] = {"line": start_line, "code_preview": ""}
                                 all_signatures[key] = sig
                                 all_docstrings[key] = ""
                             else:
-                                ast_info["functions"][func_name] = {"line": start_line, "code_preview": ""}
-                                all_signatures[func_name] = sig
-                                all_docstrings[func_name] = ""
+                                # F3: Qualify top-level function with namespace
+                                fq_func = f"{_php_active_ns}\\{func_name}" if _php_active_ns else func_name
+                                ast_info["functions"][fq_func] = {"line": start_line, "code_preview": ""}
+                                all_signatures[fq_func] = sig
+                                all_docstrings[fq_func] = ""
 
                     elif node.type in ("class_declaration", "interface_declaration", "trait_declaration"):
                         name_node = node.child_by_field_name("name")
                         if name_node:
                             cls_name = content_bytes[name_node.start_byte:name_node.end_byte].decode("utf-8", errors="replace")
-                            ast_info["classes"][cls_name] = {"line": node.start_point[0] + 1}
+                            # F4: Qualify with namespace and store kind
+                            fq_cls = f"{_php_active_ns}\\{cls_name}" if _php_active_ns else cls_name
+                            kind = node.type.replace("_declaration", "")  # class, interface, trait
+                            ast_info["classes"][fq_cls] = {"line": node.start_point[0] + 1, "kind": kind}
 
                     for child in node.children:
                         _walk_php(child)
@@ -832,6 +848,14 @@ def _process_file_for_extraction(
         for class_info in file_info.get("classes", []):
             if isinstance(class_info, dict):
                 all_func_names.extend(class_info.get("methods", []))
+            else:
+                # F5: Derive methods from ast_info for string-type class_info (PHP path)
+                _prefix = f"{class_info}."
+                # Also check FQ variants: any key ending with "\ClassName.method"
+                _fq_suffix = f"\\{class_info}."
+                for mk in ast_info.get("methods", {}):
+                    if mk.startswith(_prefix) or _fq_suffix in mk:
+                        all_func_names.append(mk.split(".")[-1])
 
         for func_name in all_func_names:
             try:
@@ -855,10 +879,32 @@ def _process_file_for_extraction(
         if _dot != -1:
             _method_by_suffix.setdefault(_mk[_dot:], []).append((_mk, _mv))  # key is ".methodName"
 
+    # Pre-build bare_name -> fq_key reverse maps for O(1) PHP FQ-name resolution
+    _ast_funcs = ast_info.get("functions", {})
+    _func_by_bare: dict[str, str] = {}
+    for _fk in _ast_funcs:
+        _bare = _fk.rsplit("\\", 1)[-1]
+        if _bare not in _func_by_bare:
+            _func_by_bare[_bare] = _fk
+
+    _ast_classes = ast_info.get("classes", {})
+    _cls_by_bare: dict[str, tuple[str, dict]] = {}
+    for _ck, _cv in _ast_classes.items():
+        _bare = _ck.rsplit("\\", 1)[-1]
+        if _bare not in _cls_by_bare:
+            _cls_by_bare[_bare] = (_ck, _cv)
+
     # Process functions
     file_stem = Path(file_path).stem
-    for func_name in file_info.get("functions", []):
-        func_info = ast_info.get("functions", {}).get(func_name, {})
+    for _bare_func in file_info.get("functions", []):
+        # F3: Resolve bare PHP function name to FQ name from ast_info
+        func_name = _bare_func
+        func_info = _ast_funcs.get(func_name) or {}
+        if not func_info:
+            _fq = _func_by_bare.get(func_name)
+            if _fq:
+                func_name = _fq
+                func_info = _ast_funcs[_fq]
         sig = all_signatures.get(func_name)
         # Fallback: check ast_info["methods"] for "*.func_name" compound keys (O(1))
         if not func_info or not sig:
@@ -886,8 +932,8 @@ def _process_file_for_extraction(
             unit_type="function",
             signature=sig,
             docstring=all_docstrings.get(func_name, ""),
-            calls=calls_map.get(func_name, [])[:5],
-            called_by=called_by_map.get(func_name, [])[:5],
+            calls=(calls_map.get(func_name) or calls_map.get(func_name.rsplit("\\", 1)[-1], []))[:5],
+            called_by=(called_by_map.get(func_name) or called_by_map.get(func_name.rsplit("\\", 1)[-1], []))[:5],
             cfg_summary=cfg_cache.get(func_name, ""),
             dfg_summary=dfg_cache.get(func_name, ""),
             dependencies=dependencies,
@@ -902,11 +948,23 @@ def _process_file_for_extraction(
             methods = class_info.get("methods", [])
         else:
             class_name = class_info
+            # F3/F4: Resolve bare class name to FQ name from ast_info
+            _cls_data = _ast_classes.get(class_name)
+            if not _cls_data:
+                # O(1) lookup via pre-built bare_name -> (fq_key, data) map
+                _cls_hit = _cls_by_bare.get(class_name)
+                if _cls_hit:
+                    class_name, _cls_data = _cls_hit
             # Derive methods from ast_info["methods"] keys matching "ClassName.method"
             prefix = f"{class_name}."
             methods = [k[len(prefix):] for k in ast_info.get("methods", {}) if k.startswith(prefix)]
 
-        class_line = ast_info.get("classes", {}).get(class_name, {}).get("line", 1)
+        _cls_data_for_line = ast_info.get("classes", {}).get(class_name, {})
+        class_line = _cls_data_for_line.get("line", 1) if isinstance(_cls_data_for_line, dict) else 1
+        # F4: Use kind from ast_info to distinguish class/interface/trait in signature
+        _kind = "class"
+        if isinstance(_cls_data_for_line, dict) and "kind" in _cls_data_for_line:
+            _kind = _cls_data_for_line["kind"]
 
         # Add class itself
         unit = EmbeddingUnit(
@@ -916,7 +974,7 @@ def _process_file_for_extraction(
             line=class_line,
             language=lang,
             unit_type="class",
-            signature=f"class {class_name}",
+            signature=f"{_kind} {class_name}",
             docstring="",
             calls=[],
             called_by=[],
@@ -934,6 +992,7 @@ def _process_file_for_extraction(
             method_key = f"{class_name}.{method}"
             method_info = ast_info.get("methods", {}).get(method_key, {})
 
+            _bare_cls = class_name.rsplit("\\", 1)[-1]
             unit = EmbeddingUnit(
                 name=method,
                 qualified_name=f"{file_path.replace('/', '.')}.{method_key}",
@@ -943,8 +1002,8 @@ def _process_file_for_extraction(
                 unit_type="method",
                 signature=all_signatures.get(method_key, f"{_sig_kw} {method}({_sig_args})"),
                 docstring=all_docstrings.get(method_key, ""),
-                calls=(calls_map.get(f"{class_name}::{method}") or calls_map.get(method, []))[:5],
-                called_by=(called_by_map.get(f"{class_name}::{method}") or called_by_map.get(method, []))[:5],
+                calls=(calls_map.get(f"{_bare_cls}::{method}") or calls_map.get(method, []))[:5],
+                called_by=(called_by_map.get(f"{_bare_cls}::{method}") or called_by_map.get(method, []))[:5],
                 cfg_summary=cfg_cache.get(method, ""),
                 dfg_summary=dfg_cache.get(method, ""),
                 dependencies=dependencies,

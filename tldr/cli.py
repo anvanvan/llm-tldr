@@ -561,7 +561,13 @@ Semantic Search:
         if lang_cache.exists():
             try:
                 data = json.loads(lang_cache.read_text())
-                return data.get("languages")
+                langs = data.get("languages")
+                if langs:
+                    # Re-sort with call-graph-supported languages first
+                    # to stay consistent with _detect_project_languages sort
+                    from tldr.cross_file_calls import CALL_GRAPH_LANGUAGES
+                    langs = sorted(langs, key=lambda l: (0 if l in CALL_GRAPH_LANGUAGES else 1, l))
+                return langs
             except (json.JSONDecodeError, OSError):
                 pass
         return None
