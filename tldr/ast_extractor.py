@@ -57,6 +57,7 @@ class ClassInfo:
     decorators: list[str] = field(default_factory=list)
     line_number: int = 0
     type_keyword: str = "class"
+    parent_base: str | None = None
 
     def signature(self) -> str:
         """Return class definition signature."""

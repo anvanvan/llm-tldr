@@ -856,6 +856,7 @@ def _process_file_for_extraction(
             _method_by_suffix.setdefault(_mk[_dot:], []).append((_mk, _mv))  # key is ".methodName"
 
     # Process functions
+    file_stem = Path(file_path).stem
     for func_name in file_info.get("functions", []):
         func_info = ast_info.get("functions", {}).get(func_name, {})
         sig = all_signatures.get(func_name)
@@ -865,7 +866,7 @@ def _process_file_for_extraction(
             if hits:
                 # Prefer the hit whose class belongs to the current file
                 if len(hits) > 1:
-                    file_hits = [h for h in hits if h[0].split(".")[0] in file_path]
+                    file_hits = [h for h in hits if h[0].split(".")[0] == file_stem]
                     if file_hits:
                         hits = file_hits
                 mkey, mval = hits[0]

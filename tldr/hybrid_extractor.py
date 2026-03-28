@@ -165,61 +165,6 @@ try:
 except ImportError:
     pass
 
-# Common PHP builtin function names — skip namespace qualification for these.
-# Not exhaustive; covers the most frequently used builtins to avoid false
-# qualification (e.g. qualifying array_map to App\Services\array_map).
-PHP_BUILTIN_FUNCTIONS = frozenset({
-    # Array functions
-    "array_chunk", "array_column", "array_combine", "array_count_values",
-    "array_diff", "array_diff_assoc", "array_diff_key", "array_fill",
-    "array_fill_keys", "array_filter", "array_flip", "array_intersect",
-    "array_intersect_assoc", "array_intersect_key", "array_key_exists",
-    "array_key_first", "array_key_last", "array_keys", "array_map",
-    "array_merge", "array_merge_recursive", "array_pad", "array_pop",
-    "array_push", "array_rand", "array_reduce", "array_replace",
-    "array_reverse", "array_search", "array_shift", "array_slice",
-    "array_splice", "array_sum", "array_unique", "array_unshift",
-    "array_values", "array_walk", "compact", "count", "in_array",
-    "list", "range", "shuffle", "sizeof", "sort", "rsort", "asort",
-    "arsort", "ksort", "krsort", "usort", "uasort", "uksort",
-    # String functions
-    "chr", "explode", "htmlspecialchars", "htmlentities", "implode",
-    "join", "ltrim", "md5", "nl2br", "number_format", "ord", "rtrim",
-    "sha1", "sprintf", "str_contains", "str_ends_with", "str_pad",
-    "str_repeat", "str_replace", "str_starts_with", "str_word_count",
-    "strcasecmp", "strcmp", "strip_tags", "stripos", "strlen", "strpos",
-    "strrchr", "strrev", "strstr", "strtolower", "strtoupper", "substr",
-    "substr_count", "trim", "ucfirst", "ucwords", "wordwrap",
-    # Type / variable functions
-    "boolval", "floatval", "gettype", "intval", "is_array", "is_bool",
-    "is_callable", "is_float", "is_int", "is_null", "is_numeric",
-    "is_object", "is_string", "isset", "empty", "unset", "settype",
-    "strval", "var_dump", "var_export", "print_r",
-    # Math functions
-    "abs", "ceil", "floor", "max", "min", "pow", "round", "sqrt",
-    "rand", "mt_rand", "random_int",
-    # File / IO functions
-    "file_exists", "file_get_contents", "file_put_contents", "fopen",
-    "fclose", "fread", "fwrite", "is_dir", "is_file", "mkdir",
-    "realpath", "unlink",
-    # Date / time
-    "date", "mktime", "strtotime", "time", "microtime",
-    # JSON
-    "json_decode", "json_encode",
-    # Regex
-    "preg_match", "preg_match_all", "preg_replace", "preg_split",
-    # Misc commonly used
-    "array_walk_recursive", "call_user_func", "call_user_func_array",
-    "class_exists", "defined", "define", "die", "echo", "exit",
-    "extract", "func_get_args", "function_exists", "get_class",
-    "header", "interface_exists", "method_exists", "ob_end_clean",
-    "ob_get_clean", "ob_start", "phpinfo", "phpversion", "printf",
-    "property_exists", "serialize", "unserialize", "sleep", "usleep",
-    "trigger_error", "base64_decode", "base64_encode", "urlencode",
-    "urldecode", "http_build_query", "parse_url", "parse_str",
-})
-
-
 class HybridExtractor:
     """
     Extract code structure using best available method per language.
@@ -3263,12 +3208,18 @@ class HybridExtractor:
                 forward-reference qualification).
         """
         # Pass 1: collect all declarations, deferring call extraction
-        deferred_calls: list[tuple] = []  # (ast_node, caller_name, class_bases_or_None)
+        deferred_calls: list[tuple] = []  # (ast_node, caller_name, parent_base_or_None)
         self._collect_php_declarations(node, source, module_info, namespace, deferred_calls)
 
         # Pass 2: extract call graphs with full knowledge of all declarations
-        for ast_node, caller_name, class_bases in deferred_calls:
-            self._extract_php_calls(ast_node, caller_name, source, module_info.call_graph, module_info, class_bases)
+        # Build a short-name → FQ-name dict once so every scoped-call lookup is O(1)
+        _class_fq: dict[str, str] = {}
+        for ci in module_info.classes:
+            short = ci.name.rsplit("\\", 1)[-1]
+            _class_fq.setdefault(short, ci.name)  # first wins (matches loop semantics)
+
+        for ast_node, caller_name, parent_base in deferred_calls:
+            self._extract_php_calls(ast_node, caller_name, source, module_info.call_graph, module_info, parent_base=parent_base, _class_fq=_class_fq)
 
     def _collect_php_declarations(self, node, source: bytes, module_info: ModuleInfo, namespace: str | None, deferred_calls: list):
         """Pass 1: Collect function/class declarations and defer call extraction."""
@@ -3282,14 +3233,16 @@ class HybridExtractor:
                     if active_ns:
                         bare_name = class_info.name
                         class_info.name = f"{active_ns}\\{class_info.name}"
+                        if class_info.parent_base and "\\" not in class_info.parent_base:
+                            class_info.parent_base = f"{active_ns}\\{class_info.parent_base}"
                         qualified = class_info.name
                         # Update callee values referencing the bare class name (bare -> qualified)
                         module_info.call_graph.rename_prefix(f"{bare_name}::", f"{qualified}::")
                         # Update deferred caller names to use qualified class name
                         method_calls = [
-                            (ast_node, f"{qualified}::{caller.split('::')[1]}", bases)
-                            if "::" in caller else (ast_node, caller, bases)
-                            for ast_node, caller, bases in method_calls
+                            (ast_node, f"{qualified}::{caller.split('::')[1]}", parent_base)
+                            if "::" in caller else (ast_node, caller, parent_base)
+                            for ast_node, caller, parent_base in method_calls
                         ]
                     module_info.classes.append(class_info)
                     deferred_calls.extend(method_calls)
@@ -3325,11 +3278,12 @@ class HybridExtractor:
         """Extract PHP class/interface/trait declaration.
 
         Returns (ClassInfo, deferred_calls) where deferred_calls is a list of
-        (ast_node, caller_name, class_bases) tuples for pass-2 call extraction.
+        (ast_node, caller_name, parent_base) tuples for pass-2 call extraction.
         """
         name = ""
         methods = []
         bases = []
+        parent_base = None
         deferred_calls: list[tuple] = []
 
         # Detect type keyword from node type
@@ -3345,7 +3299,10 @@ class HybridExtractor:
             elif child.type == "base_clause":
                 for c in child.children:
                     if c.type == "name" or c.type == "qualified_name":
-                        bases.append(self._safe_decode(source[c.start_byte:c.end_byte]))
+                        base = self._safe_decode(source[c.start_byte:c.end_byte])
+                        bases.append(base)
+                        if parent_base is None:
+                            parent_base = base
             elif child.type == "class_interface_clause":
                 for c in child.children:
                     if c.type == "name" or c.type == "qualified_name":
@@ -3359,7 +3316,9 @@ class HybridExtractor:
                         if method:
                             methods.append(method)
                             # Defer call graph extraction to pass 2
-                            deferred_calls.append((body_child, f"{qualified_name}::{method.name}", bases))
+                            # Pass parent_base (str | None) — only the parent class matters
+                            # for parent:: resolution; interfaces are irrelevant.
+                            deferred_calls.append((body_child, f"{qualified_name}::{method.name}", parent_base))
 
         if not name:
             return None, []
@@ -3371,6 +3330,7 @@ class HybridExtractor:
             methods=methods,
             line_number=node.start_point[0] + 1,
             type_keyword=type_keyword,
+            parent_base=parent_base,
         ), deferred_calls
 
     def _extract_php_callable(self, node, source: bytes, *, is_method: bool = False) -> FunctionInfo | None:
@@ -3416,7 +3376,7 @@ class HybridExtractor:
                 params.append(self._safe_decode(source[child.start_byte:child.end_byte]))
         return params
 
-    def _extract_php_calls(self, node, caller_name: str, source: bytes, call_graph: CallGraphInfo, module_info: "ModuleInfo | None" = None, class_bases: list[str] | None = None, _fn_names: "frozenset[str] | None" = None, _ns: str = ""):
+    def _extract_php_calls(self, node, caller_name: str, source: bytes, call_graph: CallGraphInfo, module_info: "ModuleInfo | None" = None, parent_base: "str | None" = None, _fn_names: "frozenset[str] | None" = None, _ns: str = "", _class_fq: "dict[str, str] | None" = None):
         """Extract function/method calls from a PHP method body."""
         # Precompute namespace-qualification data once per call frame
         if _fn_names is None and module_info is not None:
@@ -3436,7 +3396,7 @@ class HybridExtractor:
                     # Recurse into constructor arguments but skip the anonymous class body
                     for ac_child in anon.children:
                         if ac_child.type == "arguments":
-                            self._extract_php_calls(ac_child, caller_name, source, call_graph, module_info, class_bases, _fn_names, _ns)
+                            self._extract_php_calls(ac_child, caller_name, source, call_graph, module_info, parent_base, _fn_names, _ns, _class_fq)
                     continue
             if child.type == "member_call_expression":
                 # $this->method() calls — only qualify when receiver is $this
@@ -3459,13 +3419,13 @@ class HybridExtractor:
                     call_graph.add_call(caller_name, callee)
             elif child.type == "scoped_call_expression":
                 # ClassName::method() static calls
-                callee = self._get_php_scoped_call_name(child, caller_name, source, module_info, class_bases)
+                callee = self._get_php_scoped_call_name(child, caller_name, source, module_info, parent_base, _class_fq)
                 if callee:
                     call_graph.add_call(caller_name, callee)
             elif child.type == "function_call_expression":
                 # Regular function calls
                 callee = self._get_php_function_call_name(child, source)
-                if callee and "\\" not in callee and _fn_names and _ns and callee not in PHP_BUILTIN_FUNCTIONS:
+                if callee and "\\" not in callee and _fn_names and _ns:
                     # Qualify unqualified intrafile calls with the active namespace
                     qualified = f"{_ns}\\{callee}"
                     if qualified in _fn_names:
@@ -3474,7 +3434,7 @@ class HybridExtractor:
                     call_graph.add_call(caller_name, callee)
 
             # Recurse into all children
-            self._extract_php_calls(child, caller_name, source, call_graph, module_info, class_bases, _fn_names, _ns)
+            self._extract_php_calls(child, caller_name, source, call_graph, module_info, parent_base, _fn_names, _ns, _class_fq)
 
     def _get_php_member_call_name(self, node, source: bytes) -> str | None:
         """Get the method name from a member_call_expression ($this->method())."""
@@ -3483,7 +3443,24 @@ class HybridExtractor:
                 return self._safe_decode(source[child.start_byte:child.end_byte])
         return None
 
-    def _get_php_scoped_call_name(self, node, caller_name: str | None, source: bytes, module_info: "ModuleInfo | None" = None, class_bases: list[str] | None = None) -> str | None:
+    def _fq_php_class(self, bare: str, class_fq: "dict[str, str] | None", module_info: "ModuleInfo | None" = None) -> str | None:
+        """Resolve a bare PHP class name to its namespace-qualified form.
+
+        Prefers the pre-built *class_fq* dict (O(1)) when available; falls back to
+        a linear scan of *module_info.classes* so callers that don't have the dict
+        still work correctly.
+        """
+        if class_fq is not None:
+            result = class_fq.get(bare)
+            if result is not None:
+                return result
+        if module_info is not None:
+            for ci in module_info.classes:
+                if ci.name.endswith("\\" + bare) or ci.name == bare:
+                    return ci.name
+        return None
+
+    def _get_php_scoped_call_name(self, node, caller_name: str | None, source: bytes, module_info: "ModuleInfo | None" = None, parent_base: "str | None" = None, _class_fq: "dict[str, str] | None" = None) -> str | None:
         """Get ClassName::method from a scoped_call_expression."""
         class_name = None
         method_name = None
@@ -3502,17 +3479,14 @@ class HybridExtractor:
                 elif scope_text == "parent" and caller_name and "::" in caller_name:
                     # Resolve parent:: to the actual base class
                     parent_class = None
-                    if class_bases:
-                        base_name = class_bases[0]
+                    if parent_base:
+                        base_name = parent_base
                         if "\\" in base_name:
                             # Already fully qualified
                             parent_class = base_name
-                        elif module_info:
-                            # Try to find the FQ name among extracted classes
-                            for ci in module_info.classes:
-                                if ci.name.endswith("\\" + base_name) or ci.name == base_name:
-                                    parent_class = ci.name
-                                    break
+                        else:
+                            # Try to find the FQ name via helper (dict or linear scan)
+                            parent_class = self._fq_php_class(base_name, _class_fq, module_info)
                         if parent_class is None:
                             return None  # Unresolvable parent — skip to avoid ambiguous edge
                     if parent_class:
@@ -3521,6 +3495,11 @@ class HybridExtractor:
                         # Unknown parent class — skip to avoid unresolvable edge
                         return None
         if class_name and method_name:
+            # Namespace-qualify bare class names (self/static/parent already FQ)
+            if "\\" not in class_name:
+                fq = self._fq_php_class(class_name, _class_fq, module_info)
+                if fq:
+                    class_name = fq
             return f"{class_name}::{method_name}"
         return None
 
