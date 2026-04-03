@@ -912,7 +912,7 @@ def _process_file_for_extraction(
             if hits:
                 # Prefer the hit whose class belongs to the current file
                 if len(hits) > 1:
-                    file_hits = [h for h in hits if h[0].split(".")[0] == file_stem]
+                    file_hits = [h for h in hits if h[0].split(".")[0].rsplit("\\", 1)[-1] == file_stem]
                     if file_hits:
                         hits = file_hits
                 mkey, mval = hits[0]
