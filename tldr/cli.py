@@ -203,7 +203,11 @@ Semantic Search:
     )
 
     # tldr search <pattern> [path]
-    search_p = subparsers.add_parser("search", help="Search files for pattern")
+    search_p = subparsers.add_parser(
+        "search",
+        help="Search files for pattern",
+        description="Search files for a regex pattern. Use the global --ignore PATTERN flag to exclude directories from search.",
+    )
     search_p.add_argument("pattern", help="Regex pattern to search")
     search_p.add_argument("path", nargs="?", default=".", help="Directory to search")
     search_p.add_argument("--ext", nargs="+", help="Filter by extensions")
@@ -650,6 +654,9 @@ Semantic Search:
             print(json.dumps(combined_result, indent=2))
 
         elif args.command == "search":
+            if Path(args.path).is_file():
+                print(f"Error: '{args.path}' is a file, not a directory. Use a directory path for search.", file=sys.stderr)
+                sys.exit(1)
             ext = set(args.ext) if args.ext else None
             ignore_spec = get_ignore_spec(args.path)
             result = api_search(
