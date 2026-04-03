@@ -392,9 +392,13 @@ class RelevantContext:
     entry_point: str
     depth: int
     functions: list[FunctionContext] = field(default_factory=list)
+    error: str | None = None
 
     def to_llm_string(self) -> str:
         """Format for LLM injection."""
+        if self.error:
+            return f"Error: {self.error}"
+
         lines = [
             f"## Code Context: {self.entry_point} (depth={self.depth})",
             ""
@@ -736,7 +740,15 @@ def get_relevant_context(
                     if callee not in visited and current_depth < depth:
                         queue.append((callee, current_depth + 1))
         else:
-            # Function not found in signatures, still include it
+            # Entry point not found — return error instead of phantom stub
+            if func_name == entry_point and current_depth == 0:
+                return RelevantContext(
+                    entry_point=entry_point,
+                    depth=depth,
+                    error=f"Function '{entry_point}' not found in project"
+                )
+
+            # Callee not found in signatures during BFS, still include stub
             ctx = FunctionContext(
                 name=func_name,
                 file="?",
