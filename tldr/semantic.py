@@ -27,6 +27,40 @@ ALL_LANGUAGES = ["python", "typescript", "javascript", "go", "rust", "java", "c"
 
 from tldr.cross_file_calls import CALL_GRAPH_LANGUAGES  # single source of truth
 
+# Extension-to-language map (defined here to avoid circular import with cli.py)
+EXTENSION_TO_LANGUAGE = {
+    '.java': 'java',
+    '.py': 'python',
+    '.ts': 'typescript',
+    '.tsx': 'typescript',
+    '.js': 'javascript',
+    '.jsx': 'javascript',
+    '.go': 'go',
+    '.rs': 'rust',
+    '.c': 'c',
+    '.h': 'c',
+    '.cpp': 'cpp',
+    '.hpp': 'cpp',
+    '.cc': 'cpp',
+    '.cxx': 'cpp',
+    '.hh': 'cpp',
+    '.rb': 'ruby',
+    '.php': 'php',
+    '.swift': 'swift',
+    '.cs': 'csharp',
+    '.kt': 'kotlin',
+    '.kts': 'kotlin',
+    '.scala': 'scala',
+    '.sc': 'scala',
+    '.lua': 'lua',
+    '.luau': 'luau',
+    '.ex': 'elixir',
+    '.exs': 'elixir',
+    '.mjs': 'javascript',
+    '.cjs': 'javascript',
+    '.hxx': 'cpp',
+}
+
 # Lazy imports for heavy dependencies
 _model = None
 _model_name = None  # Track which model is loaded
@@ -1031,37 +1065,6 @@ def _detect_project_languages(project_path: Path, respect_ignore: bool = True) -
     """Scan project files to detect present languages."""
     from tldr.tldrignore import load_ignore_patterns, should_ignore
 
-    # Extension map (copied from cli.py to avoid circular import)
-    EXTENSION_TO_LANGUAGE = {
-        '.java': 'java',
-        '.py': 'python',
-        '.ts': 'typescript',
-        '.tsx': 'typescript',
-        '.js': 'javascript',
-        '.jsx': 'javascript',
-        '.go': 'go',
-        '.rs': 'rust',
-        '.c': 'c',
-        '.h': 'c',
-        '.cpp': 'cpp',
-        '.hpp': 'cpp',
-        '.cc': 'cpp',
-        '.cxx': 'cpp',
-        '.hh': 'cpp',
-        '.rb': 'ruby',
-        '.php': 'php',
-        '.swift': 'swift',
-        '.cs': 'csharp',
-        '.kt': 'kotlin',
-        '.kts': 'kotlin',
-        '.scala': 'scala',
-        '.sc': 'scala',
-        '.lua': 'lua',
-        '.luau': 'luau',
-        '.ex': 'elixir',
-        '.exs': 'elixir',
-    }
-
     found_languages = set()
     spec = load_ignore_patterns(project_path) if respect_ignore else None
 
@@ -1250,6 +1253,7 @@ def semantic_search(
     k: int = 5,
     expand_graph: bool = False,
     model: Optional[str] = None,
+    language: Optional[str] = None,
 ) -> List[dict]:
     """Search for code units semantically.
 
@@ -1260,6 +1264,7 @@ def semantic_search(
         expand_graph: If True, include callers/callees in results.
         model: Model to use for query embedding. If None, uses
                the model from the index metadata.
+        language: Filter results to this language. None or "all" returns all.
 
     Returns:
         List of result dictionaries with name, file, line, score, etc.
@@ -1301,17 +1306,22 @@ def semantic_search(
     query_embedding = compute_embedding(query_text, model_name=model)
     query_embedding = query_embedding.reshape(1, -1)
 
-    # Search
-    k = min(k, len(units))
-    scores, indices = index.search(query_embedding, k)
+    # Search -- request more results when filtering by language
+    filter_lang = language if language and language != "all" else None
+    search_k = min(k * 3 if filter_lang else k, len(units))
+    scores, indices = index.search(query_embedding, search_k)
 
     # Build results
     results = []
-    for i, (score, idx) in enumerate(zip(scores[0], indices[0])):
+    for score, idx in zip(scores[0], indices[0]):
         if idx < 0 or idx >= len(units):
             continue
 
         unit = units[idx]
+
+        if filter_lang and unit.get("language") != filter_lang:
+            continue
+
         result = {
             "name": unit["name"],
             "qualified_name": unit["qualified_name"],
@@ -1329,5 +1339,7 @@ def semantic_search(
             result["related"] = list(set(unit.get("calls", []) + unit.get("called_by", [])))
 
         results.append(result)
+        if len(results) >= k:
+            break
 
     return results

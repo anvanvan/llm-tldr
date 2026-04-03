@@ -634,7 +634,7 @@ class TLDRDaemon:
             from tldr.semantic import build_semantic_index, semantic_search
 
             if action == "index":
-                language = command.get("language", "python")
+                language = command.get("language", "all")
                 count = build_semantic_index(str(self.project), lang=language)
                 return {"status": "ok", "indexed": count}
 

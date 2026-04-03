@@ -30,6 +30,8 @@ if os.name == 'nt':
         pass
 
 from . import __version__
+from .api import SUPPORTED_CONTEXT_LANGUAGES
+from .semantic import ALL_LANGUAGES, EXTENSION_TO_LANGUAGE
 
 
 def _get_subprocess_detach_kwargs():
@@ -40,37 +42,11 @@ def _get_subprocess_detach_kwargs():
     else:  # Unix (Mac/Linux)
         return {'start_new_session': True}
 
+# Canonical list of supported languages for --lang choices (derived from semantic.py)
+LANG_CHOICES = ["auto", *ALL_LANGUAGES]
+LANG_CHOICES_WITH_ALL = [*LANG_CHOICES, "all"]
 
-# Extension to language mapping for auto-detection
-EXTENSION_TO_LANGUAGE = {
-    '.java': 'java',
-    '.py': 'python',
-    '.ts': 'typescript',
-    '.tsx': 'typescript',
-    '.js': 'javascript',
-    '.jsx': 'javascript',
-    '.go': 'go',
-    '.rs': 'rust',
-    '.c': 'c',
-    '.h': 'c',
-    '.cpp': 'cpp',
-    '.hpp': 'cpp',
-    '.cc': 'cpp',
-    '.cxx': 'cpp',
-    '.hh': 'cpp',
-    '.rb': 'ruby',
-    '.php': 'php',
-    '.swift': 'swift',
-    '.cs': 'csharp',
-    '.kt': 'kotlin',
-    '.kts': 'kotlin',
-    '.scala': 'scala',
-    '.sc': 'scala',
-    '.lua': 'lua',
-    '.luau': 'luau',
-    '.ex': 'elixir',
-    '.exs': 'elixir',
-}
+# SUPPORTED_CONTEXT_LANGUAGES is now imported from api.py (single source of truth)
 
 
 def detect_language_from_extension(file_path: str) -> str:
@@ -194,8 +170,7 @@ Semantic Search:
     struct_p.add_argument(
         "--lang",
         default="auto",
-        choices=["auto", "all", "python", "typescript", "javascript", "go", "rust", "java", "c",
-                 "cpp", "ruby", "php", "kotlin", "swift", "csharp", "scala", "lua", "luau", "elixir"],
+        choices=LANG_CHOICES_WITH_ALL,
         help="Language to analyze (auto=use cached, all=detect all)",
     )
     struct_p.add_argument(
@@ -236,10 +211,9 @@ Semantic Search:
     ctx_p.add_argument("--depth", type=int, default=2, help="Call depth (default: 2)")
     ctx_p.add_argument(
         "--lang",
-        default="python",
-        choices=["python", "typescript", "javascript", "go", "rust", "java", "c",
-                 "cpp", "ruby", "php", "kotlin", "swift", "csharp", "scala", "lua", "luau", "elixir"],
-        help="Language",
+        default="auto",
+        choices=["auto", *sorted(SUPPORTED_CONTEXT_LANGUAGES)],
+        help="Language (auto=detect from project; supported: python, typescript, go, rust)",
     )
 
     # tldr cfg <file> <function>
@@ -312,7 +286,12 @@ Semantic Search:
     )
     importers_p.add_argument("module", help="Module name to search for importers")
     importers_p.add_argument("path", nargs="?", default=".", help="Project root")
-    importers_p.add_argument("--lang", default="python", help="Language")
+    importers_p.add_argument(
+        "--lang",
+        default="auto",
+        choices=LANG_CHOICES,
+        help="Language (auto=detect from project)",
+    )
 
     # tldr change-impact [files...]
     impact_p = subparsers.add_parser(
@@ -330,7 +309,12 @@ Semantic Search:
     impact_p.add_argument(
         "--git-base", default="HEAD~1", help="Git ref to diff against (default: HEAD~1)"
     )
-    impact_p.add_argument("--lang", default="python", help="Language")
+    impact_p.add_argument(
+        "--lang",
+        default="auto",
+        choices=LANG_CHOICES,
+        help="Language (auto=detect from project)",
+    )
     impact_p.add_argument(
         "--depth", type=int, default=5, help="Max call graph depth (default: 5)"
     )
@@ -365,7 +349,7 @@ Semantic Search:
     warm_p.add_argument(
         "--lang",
         default="all",
-        choices=["python", "typescript", "javascript", "go", "rust", "java", "c", "cpp", "ruby", "php", "kotlin", "swift", "csharp", "scala", "lua", "luau", "elixir", "all"],
+        choices=LANG_CHOICES_WITH_ALL,
         help="Language (default: auto-detect all)",
     )
 
@@ -380,9 +364,9 @@ Semantic Search:
     index_p.add_argument("path", nargs="?", default=".", help="Project root")
     index_p.add_argument(
         "--lang",
-        default="python",
-        choices=["python", "typescript", "javascript", "go", "rust", "java", "c", "cpp", "ruby", "php", "kotlin", "swift", "csharp", "scala", "lua", "luau", "elixir", "all"],
-        help="Language (use 'all' for multi-language)",
+        default="auto",
+        choices=LANG_CHOICES_WITH_ALL,
+        help="Language (auto=detect from project, 'all' for multi-language)",
     )
     index_p.add_argument(
         "--model",
@@ -396,7 +380,12 @@ Semantic Search:
     search_p.add_argument("--path", default=".", help="Project root")
     search_p.add_argument("--k", type=int, default=5, help="Number of results")
     search_p.add_argument("--expand", action="store_true", help="Include call graph expansion")
-    search_p.add_argument("--lang", default="python", help="Language")
+    search_p.add_argument(
+        "--lang",
+        default="auto",
+        choices=LANG_CHOICES_WITH_ALL,
+        help="Language (auto=detect from project)",
+    )
     search_p.add_argument(
         "--model",
         default=None,
@@ -577,7 +566,9 @@ Semantic Search:
         return None
 
     def resolve_language(lang_arg: str, project_path: str | Path) -> str:
-        """Resolve 'auto'/'all' to actual language. Returns first language for single-lang commands."""
+        """Resolve 'auto' to actual language. Returns 'all' unchanged for multi-lang commands."""
+        if lang_arg == "all":
+            return "all"
         project_path = Path(project_path).resolve()
         if lang_arg == "auto":
             # Try cache first, then detect if no cache
@@ -588,12 +579,10 @@ Semantic Search:
             from .semantic import _detect_project_languages
             respect_ignore = not getattr(args, 'no_ignore', False)
             langs = _detect_project_languages(project_path, respect_ignore=respect_ignore)
-            return langs[0] if langs else "python"
-        elif lang_arg == "all":
-            from .semantic import _detect_project_languages
-            respect_ignore = not getattr(args, 'no_ignore', False)
-            langs = _detect_project_languages(project_path, respect_ignore=respect_ignore)
-            return langs[0] if langs else "python"
+            if langs:
+                return langs[0]
+            print(f"Warning: no source files detected in '{project_path}', defaulting to python", file=sys.stderr)
+            return "python"
         return lang_arg
 
     try:
@@ -718,8 +707,16 @@ Semantic Search:
             print(json.dumps(result, indent=2))
 
         elif args.command == "context":
+            lang = resolve_language(args.lang, args.project)
+            if lang not in SUPPORTED_CONTEXT_LANGUAGES:
+                print(
+                    f"Warning: language '{lang}' is not supported by context command. "
+                    f"Supported languages: {', '.join(sorted(SUPPORTED_CONTEXT_LANGUAGES))}",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
             ctx = get_relevant_context(
-                args.project, args.entry, depth=args.depth, language=args.lang
+                args.project, args.entry, depth=args.depth, language=lang
             )
             if ctx.error:
                 print(ctx.to_llm_string(), file=sys.stderr)
@@ -812,12 +809,13 @@ Semantic Search:
                 sys.exit(1)
 
             # Scan all source files and check their imports
+            lang = resolve_language(args.lang, args.path)
             respect_ignore = not getattr(args, 'no_ignore', False)
-            files = scan_project_files(str(project), language=args.lang, respect_ignore=respect_ignore)
+            files = scan_project_files(str(project), language=lang, respect_ignore=respect_ignore)
             importers = []
             for file_path in files:
                 try:
-                    imports = get_imports(file_path, language=args.lang)
+                    imports = get_imports(file_path, language=lang)
                     for imp in imports:
                         module = imp.get("module", "")
                         names = imp.get("names", [])
@@ -836,13 +834,14 @@ Semantic Search:
         elif args.command == "change-impact":
             from .change_impact import analyze_change_impact
 
+            lang = resolve_language(args.lang, ".")
             result = analyze_change_impact(
                 project_path=".",
                 files=args.files if args.files else None,
                 use_session=args.session,
                 use_git=args.git,
                 git_base=args.git_base,
-                language=args.lang,
+                language=lang,
                 max_depth=args.depth,
             )
 
@@ -869,15 +868,17 @@ Semantic Search:
                 sys.exit(1)
 
             if args.project or target.is_dir():
+                diag_lang = resolve_language(args.lang or "auto", str(target))
                 result = get_project_diagnostics(
                     str(target),
-                    language=args.lang or "python",
+                    language=diag_lang,
                     include_lint=not args.no_lint,
                 )
             else:
+                diag_lang = detect_language_from_extension(str(target)) if not args.lang or args.lang == "auto" else args.lang
                 result = get_diagnostics(
                     str(target),
-                    language=args.lang,
+                    language=diag_lang,
                     include_lint=not args.no_lint,
                 )
 
@@ -901,7 +902,7 @@ Semantic Search:
             if args.background:
                 # Spawn background process (cross-platform)
                 subprocess.Popen(
-                    [sys.executable, "-m", "tldr.cli", "warm", str(project_path), "--lang", args.lang],
+                    [sys.executable, "-m", "tldr.cli", "warm", str(project_path), "--lang", "all" if args.lang == "auto" else args.lang],
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                     **_get_subprocess_detach_kwargs(),
@@ -920,7 +921,7 @@ Semantic Search:
                 respect_ignore = not getattr(args, 'no_ignore', False)
                 
                 # Determine languages to process
-                if args.lang == "all":
+                if args.lang in ("auto", "all"):
                     try:
                         from .semantic import _detect_project_languages
                         target_languages = _detect_project_languages(project_path, respect_ignore=respect_ignore)
@@ -990,16 +991,19 @@ Semantic Search:
 
             if args.action == "index":
                 respect_ignore = not getattr(args, 'no_ignore', False)
-                count = build_semantic_index(args.path, lang=args.lang, model=args.model, respect_ignore=respect_ignore)
+                lang = resolve_language(args.lang, args.path)
+                count = build_semantic_index(args.path, lang=lang, model=args.model, respect_ignore=respect_ignore)
                 print(f"Indexed {count} code units")
 
             elif args.action == "search":
+                lang = None if args.lang in ("auto", "all") else resolve_language(args.lang, args.path)
                 results = semantic_search(
                     args.path,
                     args.query,
                     k=args.k,
                     expand_graph=args.expand,
                     model=args.model,
+                    language=lang,
                 )
                 print(json.dumps(results, indent=2))
 
