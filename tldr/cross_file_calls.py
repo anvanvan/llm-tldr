@@ -1450,7 +1450,7 @@ def _extract_luau_string(node, source: bytes) -> str | None:
     return text
 
 
-def parse_elixir_imports(file_path: str | Path) -> list[dict]:
+def parse_elixir_imports(file_path: str | Path) -> dict[str, list[dict]]:
     """
     Extract alias/import/use/require statements from an Elixir file.
 
@@ -1458,11 +1458,13 @@ def parse_elixir_imports(file_path: str | Path) -> list[dict]:
         file_path: Path to Elixir file
 
     Returns:
-        List of import info dicts with keys: module, type, as (optional)
+        Dict keyed by defmodule name -> list of import info dicts.
+        Each import dict has keys: module, type, as (optional),
+        only (optional), except (optional).
         Types: "alias", "import", "use", "require"
     """
     if not TREE_SITTER_ELIXIR_AVAILABLE:
-        return []
+        return {}
 
     file_path = Path(file_path)
     try:
@@ -1470,22 +1472,54 @@ def parse_elixir_imports(file_path: str | Path) -> list[dict]:
         parser = _get_elixir_parser()
         tree = parser.parse(source)
     except (FileNotFoundError, Exception):
-        return []
+        return {}
 
-    imports = []
+    scoped_imports: dict[str, list[dict]] = {}
+    current_module: list[str] = []
 
     def walk_tree(node):
-        # Elixir imports are call nodes with specific identifiers
+        # current_module: list[str] stack of FQN names (deepest scope at [-1])
+        # Track defmodule scope
         if node.type == "call":
+            func_id = None
+            for child in node.children:
+                if child.type == "identifier":
+                    func_id = source[child.start_byte:child.end_byte].decode("utf-8")
+                    break
+
+            if func_id == "defmodule":
+                mod_name = _extract_elixir_module_name(node, source)
+                if mod_name:
+                    # Build fully-qualified name from parent context
+                    if current_module:
+                        fqn = f"{current_module[-1]}.{mod_name}"
+                    else:
+                        fqn = mod_name
+                    current_module.append(fqn)
+                    if fqn not in scoped_imports:
+                        scoped_imports[fqn] = []
+                    for child in node.children:
+                        walk_tree(child)
+                    current_module.pop()
+                else:
+                    # mod_name is None — still recurse into children so nested
+                    # imports are not missed, but don't fall through to
+                    # _parse_elixir_import_node which would misinterpret the
+                    # defmodule call as an import statement.
+                    for child in node.children:
+                        walk_tree(child)
+                return
+
+            # Elixir imports are call nodes with specific identifiers
             import_info = _parse_elixir_import_node(node, source)
-            if import_info:
-                imports.append(import_info)
+            if import_info and current_module:
+                scoped_imports[current_module[-1]].append(import_info)
 
         for child in node.children:
             walk_tree(child)
 
     walk_tree(tree.root_node)
-    return imports
+    return scoped_imports
 
 
 def _get_elixir_parser():
@@ -1494,6 +1528,48 @@ def _get_elixir_parser():
     parser = Parser()
     parser.language = Language(tree_sitter_elixir.language())
     return parser
+
+
+def _extract_elixir_module_name(call_node, source: bytes) -> str | None:
+    """Extract the module name from an Elixir defmodule call node.
+
+    Walks the call node's arguments to find an alias node (e.g. MyApp.Web)
+    and returns its text.
+    """
+    for child in call_node.children:
+        if child.type == "arguments":
+            for arg_child in child.children:
+                if arg_child.is_named and arg_child.type == "alias":
+                    return source[arg_child.start_byte:arg_child.end_byte].decode("utf-8")
+    return None
+
+
+def _extract_elixir_func_name(call_node, source: bytes) -> str | None:
+    """Extract the function name from an Elixir def/defp call node.
+
+    Handles:
+      def func_name(args) do ... end  ->  arguments > call > identifier
+      def func_name do ... end        ->  arguments > identifier
+      def func_name \\\\ default      ->  arguments > binary_operator > identifier/call
+    """
+    for child in call_node.children:
+        if child.type == "arguments":
+            for arg_child in child.children:
+                if arg_child.type == "call":
+                    for cc in arg_child.children:
+                        if cc.type == "identifier":
+                            return source[cc.start_byte:cc.end_byte].decode("utf-8")
+                elif arg_child.type == "identifier":
+                    return source[arg_child.start_byte:arg_child.end_byte].decode("utf-8")
+                elif arg_child.type == "binary_operator":
+                    for cc in arg_child.children:
+                        if cc.type == "identifier":
+                            return source[cc.start_byte:cc.end_byte].decode("utf-8")
+                        elif cc.type == "call":
+                            for ccc in cc.children:
+                                if ccc.type == "identifier":
+                                    return source[ccc.start_byte:ccc.end_byte].decode("utf-8")
+    return None
 
 
 def _parse_elixir_import_node(node, source: bytes) -> dict | None:
@@ -1527,6 +1603,7 @@ def _parse_elixir_import_node(node, source: bytes) -> dict | None:
     # Get the module argument (first argument)
     module = None
     alias_name = None
+    filter_lists = {}
 
     for child in arguments.children:
         if child.is_named:
@@ -1537,18 +1614,37 @@ def _parse_elixir_import_node(node, source: bytes) -> dict | None:
                 # Qualified module name
                 module = source[child.start_byte:child.end_byte].decode("utf-8")
             elif child.type == "keywords":
-                # Keyword arguments like "as: AliasName"
+                # Keyword arguments like "as: AliasName", "only: [...]", "except: [...]"
                 for kw_child in child.children:
                     if kw_child.type == "pair":
                         key = None
                         value = None
+                        list_items = None
                         for pair_child in kw_child.children:
                             if pair_child.type == "keyword":
                                 key = source[pair_child.start_byte:pair_child.end_byte].decode("utf-8").rstrip(": ")
                             elif pair_child.type == "alias":
                                 value = source[pair_child.start_byte:pair_child.end_byte].decode("utf-8")
+                            elif pair_child.type == "list":
+                                # Parse [func: arity, ...] list for only/except
+                                list_items = []
+                                for list_child in pair_child.children:
+                                    if list_child.type == "keywords":
+                                        for kw in list_child.children:
+                                            if kw.type == "pair":
+                                                fname = None
+                                                arity = None
+                                                for pc in kw.children:
+                                                    if pc.type == "keyword":
+                                                        fname = source[pc.start_byte:pc.end_byte].decode("utf-8").rstrip(": ")
+                                                    elif pc.type == "integer":
+                                                        arity = int(source[pc.start_byte:pc.end_byte].decode("utf-8"))
+                                                if fname is not None and arity is not None:
+                                                    list_items.append((fname, arity))
                         if key == "as" and value:
                             alias_name = value
+                        elif key in ("only", "except") and list_items is not None:
+                            filter_lists[key] = list_items
 
     if not module:
         return None
@@ -1559,6 +1655,10 @@ def _parse_elixir_import_node(node, source: bytes) -> dict | None:
     }
     if alias_name:
         result['as'] = alias_name
+    if 'only' in filter_lists:
+        result['only'] = filter_lists['only']
+    if 'except' in filter_lists:
+        result['except'] = filter_lists['except']
 
     return result
 
@@ -1939,6 +2039,8 @@ def build_function_index(
             _index_c_file(src_path, rel_path, module_name, simple_module, index)
         elif language == "php":
             _index_php_file(src_path, rel_path, module_name, simple_module, index)
+        elif language == "elixir":
+            _index_elixir_file(src_path, rel_path, module_name, simple_module, index)
 
     return index
 
@@ -2413,6 +2515,86 @@ def _get_php_class_context(node, source: bytes) -> str | None:
             return _get_php_node_name(parent, source)
         parent = parent.parent
     return None
+
+
+def _index_elixir_file(src_path: Path, rel_path: Path, module_name: str, simple_module: str, index: dict):
+    """Index functions and modules from an Elixir file.
+
+    Walks the AST to find defmodule declarations and def/defp function definitions.
+    Indexes each function under both the file-path-derived module name and the
+    Elixir module name (from defmodule), so callers can resolve by either.
+    """
+    if not TREE_SITTER_ELIXIR_AVAILABLE:
+        return
+
+    try:
+        source = src_path.read_bytes()
+        parser = _get_elixir_parser()
+        tree = parser.parse(source)
+    except (FileNotFoundError, Exception):
+        return
+
+    def add_to_index(func_name: str, elixir_module: str | None):
+        """Add a function to the index under multiple keys."""
+        index[(module_name, func_name)] = str(rel_path)
+        index[(simple_module, func_name)] = str(rel_path)
+        index[f"{module_name}.{func_name}"] = str(rel_path)
+        if elixir_module:
+            index[(elixir_module, func_name)] = str(rel_path)
+            index[f"{elixir_module}.{func_name}"] = str(rel_path)
+            # Also index with the last segment of the module name
+            last_segment = elixir_module.rsplit(".", 1)[-1]
+            if last_segment != elixir_module:
+                index[(last_segment, func_name)] = str(rel_path)
+
+    current_module = None
+
+    def walk_tree(node):
+        # current_module: str scalar tracking current FQN
+        nonlocal current_module
+
+        if node.type == "call":
+            # Check if this is a defmodule, def, or defp
+            func_id = None
+            for child in node.children:
+                if child.type == "identifier":
+                    func_id = source[child.start_byte:child.end_byte].decode("utf-8")
+                    break
+
+            if func_id == "defmodule":
+                elixir_mod = _extract_elixir_module_name(node, source)
+                if elixir_mod:
+                    # Build fully-qualified name from parent context
+                    if current_module:
+                        fqn = f"{current_module}.{elixir_mod}"
+                    else:
+                        fqn = elixir_mod
+                    # Index the module itself
+                    index[(module_name, fqn)] = str(rel_path)
+                    index[(simple_module, fqn)] = str(rel_path)
+
+                    old_module = current_module
+                    current_module = fqn
+                    # Process the do_block children
+                    for child in node.children:
+                        if child.type == "do_block":
+                            for do_child in child.children:
+                                walk_tree(do_child)
+                    current_module = old_module
+                    return
+
+            elif func_id == "def":
+                func_name = _extract_elixir_func_name(node, source)
+                if func_name:
+                    add_to_index(func_name, current_module)
+                return  # Don't recurse into function bodies for indexing
+            elif func_id == "defp":
+                return  # Private functions — skip cross-file index
+
+        for child in node.children:
+            walk_tree(child)
+
+    walk_tree(tree.root_node)
 
 
 class CallVisitor(ast.NodeVisitor):
@@ -3317,6 +3499,8 @@ def build_project_call_graph(
         _build_c_call_graph(root, graph, func_index, workspace_config)
     elif language == "php":
         _build_php_call_graph(root, graph, func_index, workspace_config)
+    elif language == "elixir":
+        _build_elixir_call_graph(root, graph, func_index, workspace_config)
 
     return graph
 
@@ -3966,3 +4150,327 @@ def _build_php_call_graph(
                             dst = _find_method_in_index(method_index, method)
                             if dst:
                                 graph.add_edge(rel_path, caller_func, dst, method)
+
+
+def _extract_elixir_file_calls(file_path: Path, root: Path) -> dict[str, list[tuple[str, str]]]:
+    """
+    Extract all function calls from an Elixir file, grouped by caller function.
+
+    Args:
+        file_path: Path to the Elixir source file.
+        root: Project root (unused — kept for consistent _extract_*_file_calls signature).
+
+    Returns:
+        Dict mapping module-qualified caller name (e.g., "MyModule.func") to list of
+        (call_type, call_target) tuples. Keys are scoped per defmodule block.
+        call_type is one of:
+          - 'intra': call to a function defined in the same module; call_target is the bare name.
+          - 'local': bare function call not defined in the caller's module; call_target is the name.
+          - 'qualified': Module.func() call; call_target is "AliasOrModule.func_name".
+    """
+    if not TREE_SITTER_ELIXIR_AVAILABLE:
+        return {}
+
+    try:
+        source = file_path.read_bytes()
+        parser = _get_elixir_parser()
+        tree = parser.parse(source)
+    except (FileNotFoundError, Exception):
+        return {}
+
+    calls_by_func = {}
+    # Module-scoped defined function names: module_name -> set(func_names)
+    defined_funcs: dict[str, set[str]] = {}
+
+    # Keywords that are call nodes but NOT actual function calls
+    _elixir_keywords = {
+        "def", "defp", "defmodule", "defmacro", "defmacrop", "defguard", "defguardp",
+        "defstruct", "defprotocol", "defimpl", "defexception", "defdelegate",
+        "defoverridable", "defcallback", "defmacrocallback",
+        "alias", "import", "use", "require",
+        "if", "unless", "case", "cond", "with", "for", "try", "receive",
+        "raise", "reraise", "throw", "exit",
+        "quote", "unquote", "unquote_splicing",
+        "super", "__MODULE__", "__DIR__", "__ENV__", "__CALLER__",
+    }
+
+    # Pass 1: Collect all defined function names, scoped by module
+    current_module = None
+
+    def collect_definitions(node):
+        nonlocal current_module
+        if node.type == "call":
+            func_id = None
+            for child in node.children:
+                if child.type == "identifier":
+                    func_id = source[child.start_byte:child.end_byte].decode("utf-8")
+                    break
+            if func_id == "defmodule":
+                mod_name = _extract_elixir_module_name(node, source)
+                if mod_name:
+                    old_module = current_module
+                    current_module = f"{current_module}.{mod_name}" if current_module else mod_name
+                    if current_module not in defined_funcs:
+                        defined_funcs[current_module] = set()
+                    for child in node.children:
+                        if child.type == "do_block":
+                            for do_child in child.children:
+                                collect_definitions(do_child)
+                    current_module = old_module
+                    return
+            if func_id in ("def", "defp"):
+                fname = _extract_elixir_func_name(node, source)
+                if fname and current_module is not None:
+                    defined_funcs[current_module].add(fname)
+        for child in node.children:
+            collect_definitions(child)
+
+    collect_definitions(tree.root_node)
+
+    # Pass 2: Extract calls from each def/defp body
+    def extract_calls_from_body(body_node, module_defined_funcs: set[str]) -> list[tuple[str, str]]:
+        """Walk the do_block of a function and extract call sites."""
+        calls = []
+
+        def visit(node):
+            if node.type == "call":
+                # Check for qualified call: call > dot > (alias, identifier)
+                dot_child = None
+                ident_child = None
+                for child in node.children:
+                    if child.type == "dot":
+                        dot_child = child
+                    elif child.type == "identifier" and dot_child is None:
+                        ident_child = child
+
+                if dot_child is not None:
+                    # Qualified call: Module.func()
+                    alias_text = None
+                    func_name = None
+                    for dc in dot_child.children:
+                        if dc.type == "alias":
+                            alias_text = source[dc.start_byte:dc.end_byte].decode("utf-8")
+                        elif dc.type == "identifier":
+                            func_name = source[dc.start_byte:dc.end_byte].decode("utf-8")
+                    if alias_text and func_name:
+                        calls.append(('qualified', f"{alias_text}.{func_name}"))
+                elif ident_child is not None:
+                    # Local call: func()
+                    func_name = source[ident_child.start_byte:ident_child.end_byte].decode("utf-8")
+                    if func_name not in _elixir_keywords:
+                        if func_name in module_defined_funcs:
+                            calls.append(('intra', func_name))
+                        else:
+                            calls.append(('local', func_name))
+
+            for child in node.children:
+                visit(child)
+
+        visit(body_node)
+        return calls
+
+    # Pass 3: Walk the tree to find def/defp and extract their body calls
+    current_module_p3 = None
+
+    def process_functions(node):
+        nonlocal current_module_p3
+        if node.type == "call":
+            func_id = None
+            for child in node.children:
+                if child.type == "identifier":
+                    func_id = source[child.start_byte:child.end_byte].decode("utf-8")
+                    break
+
+            if func_id == "defmodule":
+                mod_name = _extract_elixir_module_name(node, source)
+                if mod_name:
+                    old_module = current_module_p3
+                    current_module_p3 = f"{current_module_p3}.{mod_name}" if current_module_p3 else mod_name
+                    for child in node.children:
+                        if child.type == "do_block":
+                            for do_child in child.children:
+                                process_functions(do_child)
+                    current_module_p3 = old_module
+                    return
+
+            if func_id in ("def", "defp"):
+                fname = _extract_elixir_func_name(node, source)
+                if fname:
+                    # Module-qualify the function key
+                    qualified_key = f"{current_module_p3}.{fname}" if current_module_p3 else fname
+                    # Get the defined funcs for the current module
+                    module_funcs = defined_funcs.get(current_module_p3, set()) if current_module_p3 else set()
+                    # Find the do_block
+                    for child in node.children:
+                        if child.type == "do_block":
+                            body_calls = extract_calls_from_body(child, module_funcs)
+                            # Merge with existing calls for this function (multiple clauses)
+                            if qualified_key in calls_by_func:
+                                calls_by_func[qualified_key].extend(body_calls)
+                            else:
+                                calls_by_func[qualified_key] = body_calls
+                    return  # Don't recurse into the function body again
+
+        for child in node.children:
+            process_functions(child)
+
+    process_functions(tree.root_node)
+    return calls_by_func
+
+
+def _build_elixir_call_graph(
+    root: Path,
+    graph: ProjectCallGraph,
+    func_index: dict,
+    workspace_config: Optional[WorkspaceConfig] = None
+):
+    """Build call graph for Elixir files."""
+    for ex_file in scan_project(root, "elixir", workspace_config):
+        ex_path = Path(ex_file)
+        rel_path = str(ex_path.relative_to(root))
+
+        # Get imports for this file (scoped by defmodule)
+        scoped_imports = parse_elixir_imports(ex_path)
+
+        # Build per-scope alias maps and import sets
+        # alias_map_by_scope: {defmodule_name: {short_name: full_module}}
+        # import_modules_by_scope: {defmodule_name: {module_name: list[dict]}}
+        alias_map_by_scope: dict[str, dict[str, str]] = {}
+        import_modules_by_scope: dict[str, dict[str, list[dict]]] = {}
+
+        for scope_name, imports in scoped_imports.items():
+            alias_map = {}
+            import_mods: dict[str, list[dict]] = {}
+            for imp in imports:
+                if imp.get('type') == 'alias':
+                    full_module = imp['module']
+                    if 'as' in imp:
+                        alias_map[imp['as']] = full_module
+                    else:
+                        last_segment = full_module.rsplit('.', 1)[-1]
+                        alias_map[last_segment] = full_module
+                elif imp.get('type') in ('import', 'use'):
+                    # Pre-build frozensets of function names for O(1) filter
+                    # lookups instead of O(N) any() scans at call-resolution time.
+                    #
+                    # NOTE: only/except lists store (name, arity) tuples from
+                    # the parser, but we match by name only because the call
+                    # extractor (_extract_elixir_file_calls) does not track
+                    # call-site argument counts. If arity tracking is added
+                    # to the call extractor, the frozensets below can be
+                    # replaced with arity-aware lookups.
+                    imp = dict(imp)  # shallow copy to avoid mutating shared data
+                    only_raw = imp.get('only')
+                    except_raw = imp.get('except')
+                    imp['only_names'] = (
+                        frozenset(fn for fn, _arity in only_raw)
+                        if only_raw is not None else None
+                    )
+                    imp['except_names'] = (
+                        frozenset(fn for fn, _arity in except_raw)
+                        if except_raw is not None else None
+                    )
+                    import_mods.setdefault(imp['module'], []).append(imp)
+            alias_map_by_scope[scope_name] = alias_map
+            import_modules_by_scope[scope_name] = import_mods
+
+        # Extract calls from this file
+        calls_by_func = _extract_elixir_file_calls(ex_path, root)
+
+        # Sort scopes longest-first so the first prefix match is the most
+        # specific (longest) scope, avoiding the need to scan all scopes and
+        # track the longest seen so far.
+        sorted_scopes = sorted(alias_map_by_scope.keys(), key=len, reverse=True)
+
+        for caller_func, calls in calls_by_func.items():
+            # Determine which defmodule scope the caller belongs to.
+            # Iterate longest-prefix first and stop at the first match.
+            caller_scope = None
+            for scope_name in sorted_scopes:
+                if caller_func.startswith(scope_name + ".") or caller_func == scope_name:
+                    caller_scope = scope_name
+                    break
+
+            alias_map = alias_map_by_scope.get(caller_scope, {}) if caller_scope else {}
+            import_mods = import_modules_by_scope.get(caller_scope, {}) if caller_scope else {}
+
+            for call_type, call_target in calls:
+                if call_type == 'intra':
+                    # Same-file call to a locally defined function
+                    # Module-qualify the target to match module-qualified caller keys
+                    dot_pos = caller_func.rfind('.')
+                    if dot_pos >= 0:
+                        module_prefix = caller_func[:dot_pos + 1]
+                        graph.add_edge(rel_path, caller_func, rel_path, module_prefix + call_target)
+                    else:
+                        graph.add_edge(rel_path, caller_func, rel_path, call_target)
+
+                elif call_type == 'qualified':
+                    # call_target is "AliasOrModule.func_name"
+                    parts = call_target.rsplit('.', 1)
+                    if len(parts) == 2:
+                        module_ref, func_name = parts
+                        # Resolve alias
+                        resolved_module = alias_map.get(module_ref, module_ref)
+                        qualified_name = f"{resolved_module}.{func_name}"
+
+                        # Try to find in func_index
+                        # No dst_file != rel_path guard — Elixir files can contain
+                        # multiple defmodule blocks, so qualified cross-module calls
+                        # within the same file are valid edges.
+                        # 1. Try (resolved_module, func_name) tuple
+                        key = (resolved_module, func_name)
+                        if key in func_index:
+                            dst_file = func_index[key]
+                            graph.add_edge(rel_path, caller_func, dst_file, qualified_name)
+                        # 2. Try the qualified string key
+                        elif qualified_name in func_index:
+                            dst_file = func_index[qualified_name]
+                            graph.add_edge(rel_path, caller_func, dst_file, qualified_name)
+                        else:
+                            # 3. Try last segment of resolved module
+                            last_seg = resolved_module.rsplit('.', 1)[-1]
+                            key = (last_seg, func_name)
+                            if key in func_index:
+                                dst_file = func_index[key]
+                                graph.add_edge(rel_path, caller_func, dst_file, qualified_name)
+
+                elif call_type == 'local':
+                    # Bare function call — could be from an imported/used module
+                    func_name = call_target
+
+                    # Try each imported module (consult only/except filters)
+                    resolved = False
+                    for imp_module, imp_dicts in import_mods.items():
+                        for imp_dict in imp_dicts:
+                            # Check only/except filters
+                            only_names = imp_dict.get('only_names')
+                            except_names = imp_dict.get('except_names')
+                            if only_names is not None:
+                                # Only allow functions in the only list
+                                if func_name not in only_names:
+                                    continue
+                            if except_names is not None:
+                                # Skip functions in the except list
+                                if func_name in except_names:
+                                    continue
+
+                            key = (imp_module, func_name)
+                            if key in func_index:
+                                dst_file = func_index[key]
+                                graph.add_edge(rel_path, caller_func, dst_file, f"{imp_module}.{func_name}")
+                                resolved = True
+                                break
+                            # Try last segment of module
+                            last_seg = imp_module.rsplit('.', 1)[-1]
+                            key = (last_seg, func_name)
+                            if key in func_index:
+                                dst_file = func_index[key]
+                                graph.add_edge(rel_path, caller_func, dst_file, f"{imp_module}.{func_name}")
+                                resolved = True
+                                break
+                        if resolved:
+                            break
+                    # If not resolved through known imports, skip rather than
+                    # guessing — a broad name-only scan would create false
+                    # positives for common Elixir names (init, handle_call, etc.)
