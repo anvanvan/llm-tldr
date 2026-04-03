@@ -15,11 +15,10 @@ import pytest
 from pathlib import Path
 
 # All supported languages and their primary extensions
-# Note: Only includes extensions currently in cli.py EXTENSION_TO_LANGUAGE
 SUPPORTED_LANGUAGES = {
     "python": [".py"],
     "typescript": [".ts", ".tsx"],
-    "javascript": [".js", ".jsx"],  # .mjs/.cjs not in cli.py yet
+    "javascript": [".js", ".jsx", ".mjs", ".cjs"],
     "go": [".go"],
     "rust": [".rs"],
     "java": [".java"],
