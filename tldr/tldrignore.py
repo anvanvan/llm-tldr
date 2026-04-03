@@ -391,6 +391,11 @@ def should_ignore(
     if spec is None:
         spec = load_ignore_patterns(project_dir)
 
+    # Preserve trailing slash before Path() strips it — pathspec needs it
+    # to correctly match directory patterns like ".venv/" or "node_modules/"
+    orig_str = str(file_path)
+    has_trailing_slash = orig_str.endswith("/")
+
     project_path = Path(project_dir)
     file_path = Path(file_path)
 
@@ -402,6 +407,8 @@ def should_ignore(
         rel_path = file_path
 
     rel_path_str = str(rel_path)
+    if has_trailing_slash and not rel_path_str.endswith("/"):
+        rel_path_str += "/"
 
     # .tldrignore is the final authority - it can:
     # - Add ignores (positive patterns)

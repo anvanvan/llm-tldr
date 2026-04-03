@@ -5,12 +5,15 @@ Determines which tests to run based on changed files.
 Uses session-based tracking (dirty_flag) or explicit file list.
 """
 
+import logging
 import subprocess
 from pathlib import Path
 
-from .analysis import analyze_impact
-from .api import extract_file, get_imports, scan_project_files
+from .analysis import build_reverse_graph, impact_analysis
+from .api import build_project_call_graph, extract_file, get_imports, scan_project_files
 from .dirty_flag import get_dirty_files
+
+logger = logging.getLogger(__name__)
 
 
 def get_changed_functions(
@@ -112,6 +115,7 @@ def find_tests_importing_module(
     project_path: str,
     module_name: str,
     language: str = "python",
+    _cached_files: list[str] | None = None,
 ) -> list[str]:
     """
     Find test files that import a given module.
@@ -123,7 +127,7 @@ def find_tests_importing_module(
     importing_tests = []
 
     try:
-        all_files = scan_project_files(str(project), language=language)
+        all_files = _cached_files if _cached_files is not None else scan_project_files(str(project), language=language)
         test_files = [f for f in all_files if is_test_file(f)]
 
         for test_file in test_files:
@@ -144,7 +148,7 @@ def find_tests_importing_module(
             except Exception:
                 continue
     except Exception:
-        pass
+        logger.debug("Failed to find tests importing module %s", module_name, exc_info=True)
 
     return importing_tests
 
@@ -165,11 +169,12 @@ def find_affected_tests(
         max_depth: Max depth for call graph traversal
 
     Returns:
-        Dict with affected_tests, changed_functions, and metadata
+        Dict with affected_tests, changed_functions, degraded_analysis, and metadata
     """
     project = Path(project_path).resolve()
     affected_tests = set()
     all_changed_functions = []
+    degraded_analysis = False
 
     # Get all functions from changed files
     for file_path in changed_files:
@@ -192,6 +197,17 @@ def find_affected_tests(
             except ValueError:
                 affected_tests.add(str(abs_path))
 
+    # Build call graph once for all functions
+    call_graph = None
+    reverse_graph = None
+    if all_changed_functions:
+        try:
+            call_graph = build_project_call_graph(str(project), language=language)
+            reverse_graph = build_reverse_graph(call_graph.edges)
+        except Exception:
+            logger.debug("Failed to build call graph, skipping caller analysis", exc_info=True)
+            degraded_analysis = True
+
     # For each changed function, find callers and filter to test files
     for func_info in all_changed_functions:
         func_name = func_info["name"]
@@ -199,12 +215,19 @@ def find_affected_tests(
             continue
 
         try:
-            impact = analyze_impact(
-                str(project),
+            # Convert absolute file path to project-relative (same format as call_graph edges)
+            try:
+                rel_file = str(Path(func_info["file"]).relative_to(project))
+            except ValueError:
+                rel_file = func_info["file"]
+
+            impact = impact_analysis(
+                call_graph,
                 func_name,
                 max_depth=max_depth,
-                language=language,
-            )
+                target_file=rel_file,
+                _reverse=reverse_graph,
+            ) if call_graph is not None else {"targets": {}}
 
             # Walk the caller tree and collect test files
             def collect_test_files(node: dict):
@@ -221,11 +244,19 @@ def find_affected_tests(
                 for caller in node.get("callers", []):
                     collect_test_files(caller)
 
-            collect_test_files(impact.get("callers", {}))
+            for target_node in impact.get("targets", {}).values():
+                collect_test_files(target_node)
 
         except Exception:
             # If impact analysis fails for a function, continue
-            pass
+            logger.debug("Failed to analyze impact for function %s", func_name, exc_info=True)
+
+    # Scan project files once and reuse for import search + test count
+    all_files = None
+    try:
+        all_files = scan_project_files(str(project), language=language)
+    except Exception:
+        logger.debug("Failed to scan project files", exc_info=True)
 
     # Also find tests that import from changed modules (backup method)
     for file_path in changed_files:
@@ -237,20 +268,21 @@ def find_affected_tests(
         module_name = get_module_name(str(abs_path), str(project))
         if module_name:
             importing_tests = find_tests_importing_module(
-                str(project), module_name, language
+                str(project), module_name, language, _cached_files=all_files
             )
             affected_tests.update(importing_tests)
 
-    # Count total test files for skip calculation
-    all_test_files = []
-    try:
-        all_files = scan_project_files(str(project), language=language)
-        all_test_files = [f for f in all_files if is_test_file(f)]
-    except Exception:
-        pass
-
+    # Count total test files for skip calculation.
+    # When scan_project_files() failed (all_files is None), we cannot know
+    # the total test count, so default to 0 to avoid misleading numbers.
     affected_list = sorted(affected_tests)
-    skipped_count = len(all_test_files) - len(affected_list)
+    if all_files is not None:
+        all_test_files = [f for f in all_files if is_test_file(f)]
+        skipped_count = max(0, len(all_test_files) - len(affected_list))
+        total_tests = len(all_test_files)
+    else:
+        skipped_count = 0
+        total_tests = 0
 
     # Build test command (as list to avoid shell injection)
     if language == "python":
@@ -271,9 +303,10 @@ def find_affected_tests(
         "changed_functions": [f["name"] for f in all_changed_functions],
         "affected_tests": affected_list,
         "affected_count": len(affected_list),
-        "skipped_count": max(0, skipped_count),
-        "total_tests": len(all_test_files),
+        "skipped_count": skipped_count,
+        "total_tests": total_tests,
         "test_command": test_cmd,
+        "degraded_analysis": degraded_analysis,
     }
 
 
@@ -300,7 +333,7 @@ def get_git_changed_files(project_path: str, base: str = "HEAD~1") -> list[str]:
             files = [f.strip() for f in result.stdout.strip().split("\n") if f.strip()]
             return files
     except Exception:
-        pass
+        logger.debug("Failed to get changed files from git diff", exc_info=True)
     return []
 
 
@@ -363,6 +396,7 @@ def analyze_change_impact(
             "test_command": None,
             "source": source,
             "message": "No changed files detected",
+            "degraded_analysis": False,
         }
 
     # Filter to source files only (not tests, configs, etc.)
