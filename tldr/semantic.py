@@ -20,7 +20,8 @@ import sys
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterator, List, Optional, Tuple, Dict, Any
+from collections.abc import Iterator
+from typing import List, Optional, Tuple, Dict, Any
 
 logger = logging.getLogger("tldr.semantic")
 
