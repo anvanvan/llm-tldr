@@ -197,7 +197,7 @@ def _suppress_hf_noise():
         # huggingface_hub.utils.tqdm caches HF_HUB_DISABLE_PROGRESS_BARS at import time,
         # so env vars alone are insufficient once it is imported. Use the programmatic API.
         try:
-            from huggingface_hub.utils.tqdm import (
+            from huggingface_hub.utils import (
                 are_progress_bars_disabled,
                 disable_progress_bars,
                 enable_progress_bars,
