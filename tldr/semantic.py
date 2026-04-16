@@ -20,7 +20,7 @@ import sys
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional, Tuple, Dict, Any
+from typing import Iterator, List, Optional, Tuple, Dict, Any
 
 logger = logging.getLogger("tldr.semantic")
 
@@ -175,7 +175,7 @@ def _confirm_download(model_key: str) -> bool:
 
 
 @contextlib.contextmanager
-def _suppress_hf_noise():
+def _suppress_hf_noise() -> Iterator[None]:
     """Suppress HuggingFace/tqdm noise emitted during model weight loading.
 
     Sets env vars for libraries not yet imported, and attempts to call the
