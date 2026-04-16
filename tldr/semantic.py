@@ -178,9 +178,10 @@ def _confirm_download(model_key: str) -> bool:
 def _suppress_hf_noise():
     """Suppress HuggingFace/tqdm noise emitted during model weight loading.
 
-    Sets env vars for libraries not yet imported, and calls the huggingface_hub
-    programmatic API for the progress-bar state (which is frozen in a module-level
-    constant and cannot be changed via env vars after first import).
+    Sets env vars for libraries not yet imported, and attempts to call the
+    huggingface_hub programmatic API for the progress-bar state (which is
+    frozen in a module-level constant and cannot be changed via env vars after
+    first import). If the import fails, suppression gracefully degrades (best-effort).
 
     TOKENIZERS_PARALLELISM is set defensively: ProcessPoolExecutor forks worker
     processes before get_model() is called, so no active tokenizer pool exists at
@@ -195,15 +196,18 @@ def _suppress_hf_noise():
         os.environ.update(_HF_NOISE_SUPPRESSIONS)
         # huggingface_hub.utils.tqdm caches HF_HUB_DISABLE_PROGRESS_BARS at import time,
         # so env vars alone are insufficient once it is imported. Use the programmatic API.
-        from huggingface_hub.utils.tqdm import (
-            are_progress_bars_disabled,
-            disable_progress_bars,
-            enable_progress_bars,
-        )
-        _enable_progress_bars = enable_progress_bars
-        _bars_were_disabled = are_progress_bars_disabled()
-        if not _bars_were_disabled:
-            disable_progress_bars()
+        try:
+            from huggingface_hub.utils.tqdm import (
+                are_progress_bars_disabled,
+                disable_progress_bars,
+                enable_progress_bars,
+            )
+            _bars_were_disabled = are_progress_bars_disabled()
+            if not _bars_were_disabled:
+                disable_progress_bars()
+                _enable_progress_bars = enable_progress_bars
+        except (ImportError, AttributeError):
+            pass  # best-effort: if import fails, skip progress-bar suppression
         yield
     finally:
         for key in _HF_NOISE_SUPPRESSIONS:
@@ -212,7 +216,7 @@ def _suppress_hf_noise():
                 os.environ.pop(key, None)
             else:
                 os.environ[key] = val
-        if not _bars_were_disabled and _enable_progress_bars is not None:
+        if _enable_progress_bars is not None:
             _enable_progress_bars()
 
 
