@@ -12,6 +12,7 @@ Uses BAAI/bge-large-en-v1.5 for embeddings (1024 dimensions)
 and FAISS for fast vector similarity search.
 """
 
+import contextlib
 import json
 import logging
 import os
@@ -19,6 +20,7 @@ import sys
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
+from collections.abc import Iterator
 from typing import List, Optional, Tuple, Dict, Any
 
 logger = logging.getLogger("tldr.semantic")
@@ -61,6 +63,12 @@ EXTENSION_TO_LANGUAGE = {
     '.hxx': 'cpp',
 }
 
+_HF_NOISE_SUPPRESSIONS = {
+    "TRANSFORMERS_VERBOSITY": "error",
+    "TOKENIZERS_PARALLELISM": "false",
+    "TQDM_DISABLE": "1",
+    "HF_HUB_DISABLE_PROGRESS_BARS": "1",
+}
 # Lazy imports for heavy dependencies
 _model = None
 _model_name = None  # Track which model is loaded
@@ -203,6 +211,52 @@ def _confirm_download(model_key: str) -> bool:
         return False
 
 
+@contextlib.contextmanager
+def _suppress_hf_noise() -> Iterator[None]:
+    """Suppress HuggingFace/tqdm noise emitted during model weight loading.
+
+    Sets env vars for libraries not yet imported, and attempts to call the
+    huggingface_hub programmatic API for the progress-bar state (which is
+    frozen in a module-level constant and cannot be changed via env vars after
+    first import). If the import fails, suppression gracefully degrades (best-effort).
+
+    TOKENIZERS_PARALLELISM is set defensively: ProcessPoolExecutor forks worker
+    processes before get_model() is called, so no active tokenizer pool exists at
+    this point. The env var is set preemptively in case a tokenizer is initialised
+    inside the context body, not to suppress a warning that is already occurring.
+    """
+    saved = {key: os.environ.pop(key, None) for key in _HF_NOISE_SUPPRESSIONS}
+    _bars_were_disabled = False
+    _enable_progress_bars = None
+
+    try:
+        os.environ.update(_HF_NOISE_SUPPRESSIONS)
+        # huggingface_hub.utils.tqdm caches HF_HUB_DISABLE_PROGRESS_BARS at import time,
+        # so env vars alone are insufficient once it is imported. Use the programmatic API.
+        try:
+            from huggingface_hub.utils import (
+                are_progress_bars_disabled,
+                disable_progress_bars,
+                enable_progress_bars,
+            )
+            _bars_were_disabled = are_progress_bars_disabled()
+            if not _bars_were_disabled:
+                disable_progress_bars()
+                _enable_progress_bars = enable_progress_bars
+        except (ImportError, AttributeError):
+            pass  # best-effort: if import fails, skip progress-bar suppression
+        yield
+    finally:
+        for key in _HF_NOISE_SUPPRESSIONS:
+            val = saved[key]
+            if val is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = val
+        if _enable_progress_bars is not None:
+            _enable_progress_bars()
+
+
 def get_model(model_name: Optional[str] = None):
     """Lazy-load the embedding model (cached).
 
@@ -239,8 +293,9 @@ def get_model(model_name: Optional[str] = None):
         if model_key and not _confirm_download(model_key):
             raise ValueError(f"Model download declined. Use --model to choose a smaller model.")
 
-    from sentence_transformers import SentenceTransformer
-    _model = SentenceTransformer(hf_name)
+    with _suppress_hf_noise():
+        from sentence_transformers import SentenceTransformer
+        _model = SentenceTransformer(hf_name)
     _model_name = hf_name
     return _model
 
