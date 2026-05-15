@@ -385,6 +385,13 @@ Semantic Search:
         default=None,
         help="Embedding model: bge-large-en-v1.5 (1.3GB, default) or all-MiniLM-L6-v2 (80MB)",
     )
+    index_p.add_argument(
+        "--device",
+        default=None,
+        choices=["cpu", "metal"],
+        help="Compute device for embedding inference: 'cpu' or 'metal'. "
+             "If omitted, falls back to TLDR_DEVICE env var, then to 'cpu'.",
+    )
 
     # tldr semantic search <query>
     search_p = semantic_sub.add_parser("search", help="Search semantically")
@@ -397,6 +404,13 @@ Semantic Search:
         "--model",
         default=None,
         help="Embedding model (uses index model if not specified)",
+    )
+    search_p.add_argument(
+        "--device",
+        default=None,
+        choices=["cpu", "metal"],
+        help="Compute device for embedding inference: 'cpu' or 'metal'. "
+             "If omitted, falls back to TLDR_DEVICE env var, then to PyTorch auto-pick.",
     )
 
     # tldr daemon start/stop/status/query
@@ -564,6 +578,27 @@ Semantic Search:
                 return data.get("languages")
             except (json.JSONDecodeError, OSError):
                 pass
+        return None
+
+    def _resolve_device(args_device: str | None) -> str | None:
+        """Resolve compute device: CLI arg > TLDR_DEVICE env > None (auto-pick).
+
+        The CLI subcommand's argparse default supplies the per-command default
+        (e.g. 'cpu' for index). Validates TLDR_DEVICE if set; exits with code 2
+        on invalid env value. Returns 'cpu', 'metal', or None.
+        """
+        if args_device is not None:
+            return args_device
+        env_device = os.environ.get("TLDR_DEVICE")
+        if env_device:
+            if env_device not in ("cpu", "metal"):
+                print(
+                    f"tldr: error: TLDR_DEVICE: invalid choice: {env_device!r} "
+                    f"(choose from 'cpu', 'metal')",
+                    file=sys.stderr,
+                )
+                sys.exit(2)
+            return env_device
         return None
 
     def resolve_language(lang_arg: str, project_path: str | Path) -> str:
@@ -866,7 +901,6 @@ Semantic Search:
                 print(json.dumps(result, indent=2))
 
         elif args.command == "warm":
-            import os
             import subprocess
             import time
 
@@ -969,16 +1003,22 @@ Semantic Search:
 
             if args.action == "index":
                 respect_ignore = not getattr(args, 'no_ignore', False)
-                count = build_semantic_index(args.path, lang=args.lang, model=args.model, respect_ignore=respect_ignore)
+                device = _resolve_device(getattr(args, "device", None)) or "cpu"
+                count = build_semantic_index(
+                    args.path, lang=args.lang, model=args.model,
+                    respect_ignore=respect_ignore, device=device,
+                )
                 print(f"Indexed {count} code units")
 
             elif args.action == "search":
+                device = _resolve_device(getattr(args, "device", None))
                 results = semantic_search(
                     args.path,
                     args.query,
                     k=args.k,
                     expand_graph=args.expand,
                     model=args.model,
+                    device=device,
                 )
                 print(json.dumps(results, indent=2))
 
