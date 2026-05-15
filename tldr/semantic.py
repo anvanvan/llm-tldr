@@ -8,8 +8,9 @@ Embeds functions/methods using all 5 TLDR analysis layers:
 - L4: Data flow summary
 - L5: Dependencies
 
-Uses BAAI/bge-large-en-v1.5 for embeddings (1024 dimensions)
-and FAISS for fast vector similarity search.
+Supports multiple embedding backends: sentence-transformers models (BGE, MiniLM)
+and MLX-optimized models (Qwen3, Jina) for GPU-accelerated inference on Apple Silicon.
+Uses FAISS for fast vector similarity search.
 """
 
 import contextlib
@@ -24,6 +25,21 @@ from collections.abc import Iterator
 from typing import List, Optional, Tuple, Dict, Any
 
 logger = logging.getLogger("tldr.semantic")
+
+# Module-level guarded MLX import — names exist as None on non-Apple platforms
+# so tests can patch('tldr.semantic.mx', ...) regardless of install state.
+try:
+    import mlx.core as mx
+    import mlx_embeddings
+except ImportError:
+    mx = None
+    mlx_embeddings = None
+
+# Module-level SentenceTransformer import for monkeypatching in tests.
+try:
+    from sentence_transformers import SentenceTransformer
+except ImportError:
+    SentenceTransformer = None
 
 ALL_LANGUAGES = ["python", "typescript", "javascript", "go", "rust", "java", "c", "cpp", "ruby", "php", "kotlin", "swift", "csharp", "scala", "lua", "luau", "elixir"]
 
@@ -72,6 +88,7 @@ _HF_NOISE_SUPPRESSIONS = {
 # Lazy imports for heavy dependencies
 _model = None
 _model_name = None  # Track which model is loaded
+_model_device = None  # Track which device the cached model is on
 
 # Supported models with approximate download sizes
 SUPPORTED_MODELS = {
@@ -80,12 +97,48 @@ SUPPORTED_MODELS = {
         "size": "1.3GB",
         "dimension": 1024,
         "description": "High quality, recommended for production",
+        "backend": "sentence-transformers",
+    },
+    "bge-base-en-v1.5": {
+        "hf_name": "BAAI/bge-base-en-v1.5",
+        "size": "440MB",
+        "dimension": 768,
+        "description": "MIT, ~3x smaller than bge-large, near-identical MTEB",
+        "backend": "sentence-transformers",
     },
     "all-MiniLM-L6-v2": {
         "hf_name": "sentence-transformers/all-MiniLM-L6-v2",
         "size": "80MB",
         "dimension": 384,
         "description": "Lightweight, good for testing",
+        "backend": "sentence-transformers",
+    },
+    "qwen3-0.6b-mlx": {
+        "hf_name": "mlx-community/Qwen3-Embedding-0.6B-4bit-DWQ",
+        "size": "0.6GB",
+        "dimension": 1024,
+        "description": "Qwen3 0.6B 4-bit MLX, fast probe variant",
+        "backend": "mlx",
+        "mlx_batch": 8,
+        "upstream_hf_name": None,
+    },
+    "qwen3-4b-mlx": {
+        "hf_name": "mlx-community/Qwen3-Embedding-4B-4bit-DWQ",
+        "size": "2.5GB",
+        "dimension": 2560,
+        "description": "Qwen3 4B 4-bit MLX, top code quality, batch=4 for 24GB safety",
+        "backend": "mlx",
+        "mlx_batch": 4,
+        "upstream_hf_name": None,
+    },
+    "jina-v5-mlx": {
+        "hf_name": "jinaai/jina-embeddings-v5-text-small-retrieval-mlx",
+        "size": "0.6GB",
+        "dimension": 768,
+        "description": "Jina v5 text-small retrieval MLX, fastest",
+        "backend": "mlx",
+        "mlx_batch": 8,
+        "upstream_hf_name": "jinaai/jina-embeddings-v5-text-small-retrieval",
     },
 }
 
@@ -257,20 +310,30 @@ def _suppress_hf_noise() -> Iterator[None]:
             _enable_progress_bars()
 
 
-def get_model(model_name: Optional[str] = None):
+def get_model(model_name: Optional[str] = None, *, device: Optional[str] = None):
     """Lazy-load the embedding model (cached).
 
     Args:
         model_name: Model key from SUPPORTED_MODELS, or None for default.
                    Can also be a full HuggingFace model name.
+        device: 'cpu', 'metal', 'mps', or None for default behavior.
 
     Returns:
         SentenceTransformer model instance.
 
     Raises:
         ValueError: If model not found or user declines download.
+        RuntimeError: If model has no upstream_hf_name for CPU fallback.
     """
-    global _model, _model_name
+    global _model, _model_name, _model_device
+
+    # Default device from TLDR_DEVICE env if caller omitted it — ensures every
+    # call site (including no-console embed fallback and daemon paths) honors
+    # the requested device instead of letting PyTorch silently pick MPS.
+    if device is None:
+        env_device = os.environ.get("TLDR_DEVICE")
+        if env_device in ("cpu", "metal", "mps"):
+            device = env_device
 
     # Resolve model name
     if model_name is None:
@@ -283,8 +346,8 @@ def get_model(model_name: Optional[str] = None):
         # Allow arbitrary HuggingFace model names
         hf_name = model_name
 
-    # Return cached model if same
-    if _model is not None and _model_name == hf_name:
+    # Return cached model if same (key includes device)
+    if _model is not None and _model_name == hf_name and _model_device == device:
         return _model
 
     # Check if model needs downloading
@@ -293,11 +356,98 @@ def get_model(model_name: Optional[str] = None):
         if model_key and not _confirm_download(model_key):
             raise ValueError(f"Model download declined. Use --model to choose a smaller model.")
 
+    backend = "sentence-transformers"
+    if model_name in SUPPORTED_MODELS:
+        backend = SUPPORTED_MODELS[model_name].get("backend", "sentence-transformers")
+    elif "-mlx" in hf_name.lower() or "/mlx-" in hf_name.lower() or hf_name.startswith("mlx-community/"):
+        backend = "mlx"
+
     with _suppress_hf_noise():
-        from sentence_transformers import SentenceTransformer
-        _model = SentenceTransformer(hf_name)
+        if backend == "mlx" and device == "cpu":
+            # CPU fallback path for MLX-labeled models — requires upstream_hf_name.
+            if model_name not in SUPPORTED_MODELS:
+                raise RuntimeError(
+                    f"Model {model_name!r} cannot run on --device cpu: no upstream_hf_name (non-MLX weights) defined"
+                )
+            upstream = SUPPORTED_MODELS[model_name].get("upstream_hf_name")
+            if upstream is None:
+                raise RuntimeError(
+                    f"Model {model_name!r} cannot run on --device cpu: no upstream_hf_name (non-MLX weights) defined"
+                )
+            mlx_batch = SUPPORTED_MODELS[model_name].get("mlx_batch", 8)
+            if os.environ.get("TLDR_FORCE_PYTORCH_CPU"):
+                _model = SentenceTransformer(upstream, device="cpu", trust_remote_code=True)
+            else:
+                try:
+                    _model = _MLXEmbedder(hf_name, mlx_batch=mlx_batch, device="cpu")
+                except RuntimeError:
+                    _model = SentenceTransformer(upstream, device="cpu", trust_remote_code=True)
+        elif backend == "mlx":
+            mlx_batch = 8
+            if model_name in SUPPORTED_MODELS:
+                mlx_batch = SUPPORTED_MODELS[model_name].get("mlx_batch", 8)
+            _model = _MLXEmbedder(hf_name, mlx_batch=mlx_batch, device=device)
+        else:
+            if device == "cpu":
+                _model = SentenceTransformer(hf_name, device="cpu", trust_remote_code=True)
+            else:
+                _model = SentenceTransformer(hf_name, trust_remote_code=True)
     _model_name = hf_name
+    _model_device = device
     return _model
+
+
+class _MLXEmbedder:
+    """Wrapper around mlx-embeddings that mimics SentenceTransformer.encode()."""
+
+    def __init__(self, hf_name: str, mlx_batch: int = 8, *, device: Optional[str] = None):
+        if mx is None:
+            raise RuntimeError("MLX not available — install mlx and mlx-embeddings")
+        if device == "cpu":
+            if not hasattr(mx, "cpu"):
+                raise RuntimeError("mlx.cpu device not available in this MLX version")
+            mx.set_default_device(mx.cpu)
+        self._device = device
+        self.hf_name = hf_name
+        self.mlx_batch = mlx_batch
+        self.model, self.tokenizer = mlx_embeddings.load(hf_name)
+
+    def encode(self, texts, batch_size: int = 32,
+               normalize_embeddings: bool = True,
+               show_progress_bar: bool = False, **_kwargs):
+        import numpy as np
+        generate = mlx_embeddings.generate
+
+        if isinstance(texts, str):
+            texts = [texts]
+            single = True
+        else:
+            single = False
+
+        # MLX models (esp. autoregressive Qwen3) need cache clearing — without it,
+        # the Metal allocator caches buffers across calls and balloons swap.
+        mlx_batch = min(batch_size, self.mlx_batch)
+
+        out_chunks = []
+        for i in range(0, len(texts), mlx_batch):
+            batch = list(texts[i:i + mlx_batch])
+            result = generate(self.model, self.tokenizer, batch)
+            embeds = result.text_embeds
+            if normalize_embeddings:
+                norms = mx.linalg.norm(embeds, axis=1, keepdims=True)
+                embeds = mx.divide(embeds, mx.maximum(norms, 1e-12))
+            embeds = embeds.astype(mx.float32)
+            mx.eval(embeds)
+            out_chunks.append(np.asarray(embeds))
+            del result, embeds
+            if (i // mlx_batch) % 16 == 15:
+                if self._device != "cpu":
+                    mx.metal.clear_cache()
+
+        if self._device != "cpu":
+            mx.metal.clear_cache()
+        result_np = np.vstack(out_chunks) if len(out_chunks) > 1 else out_chunks[0]
+        return result_np[0] if single else result_np
 
 
 def build_embedding_text(unit: EmbeddingUnit) -> str:
@@ -353,19 +503,21 @@ def build_embedding_text(unit: EmbeddingUnit) -> str:
     return "\n".join(parts)
 
 
-def compute_embedding(text: str, model_name: Optional[str] = None):
+def compute_embedding(text: str, model_name: Optional[str] = None, *, device: Optional[str] = None):
     """Compute embedding vector for text.
 
     Args:
         text: The text to embed.
         model_name: Model to use (from SUPPORTED_MODELS or HF name).
+        device: Compute device ('cpu' or 'metal'). If None, get_model
+            falls back to TLDR_DEVICE env or auto-pick.
 
     Returns:
         numpy array with L2-normalized embedding.
     """
     import numpy as np
 
-    model = get_model(model_name)
+    model = get_model(model_name, device=device)
 
     # BGE models work best with instruction prefix for queries
     # For document embedding, we use text directly
@@ -1150,6 +1302,8 @@ def build_semantic_index(
     model: Optional[str] = None,
     show_progress: bool = True,
     respect_ignore: bool = True,
+    *,
+    device: Optional[str] = None,
 ) -> int:
     """Build and save FAISS index + metadata for a project.
 
@@ -1163,6 +1317,8 @@ def build_semantic_index(
         model: Model name from SUPPORTED_MODELS or HuggingFace name.
         show_progress: Show progress spinner (default: True).
         respect_ignore: If True, respect .tldrignore patterns (default True).
+        device: Compute device ('cpu' or 'metal'). If None, defaults to TLDR_DEVICE
+                environment variable. Defaults to 'cpu' if env var is not set.
 
     Returns:
         Number of indexed units.
@@ -1170,6 +1326,9 @@ def build_semantic_index(
     import faiss
     import numpy as np
     from tldr.tldrignore import ensure_tldrignore
+
+    if device is None:
+        device = os.environ.get("TLDR_DEVICE")
 
     console = _get_progress_console() if show_progress else None
 
@@ -1232,7 +1391,7 @@ def build_semantic_index(
 
     import numpy as np
 
-    BATCH_SIZE = 64
+    BATCH_SIZE = 128
     num_units = len(units)
     texts = [build_embedding_text(unit) for unit in units]
 
@@ -1247,7 +1406,7 @@ def build_semantic_index(
         ) as progress:
             task = progress.add_task("Computing embeddings...", total=num_units)
 
-            model_obj = get_model(model)
+            model_obj = get_model(model, device=device)
             all_embeddings = []
 
             for i in range(0, num_units, BATCH_SIZE):
@@ -1270,7 +1429,7 @@ def build_semantic_index(
 
             embeddings_matrix = np.vstack(all_embeddings)
     else:
-        model_obj = get_model(model)
+        model_obj = get_model(model, device=device)
         result = model_obj.encode(
             texts,
             batch_size=BATCH_SIZE,
@@ -1309,6 +1468,8 @@ def semantic_search(
     expand_graph: bool = False,
     model: Optional[str] = None,
     language: Optional[str] = None,
+    *,
+    device: Optional[str] = None,
 ) -> List[dict]:
     """Search for code units semantically.
 
@@ -1320,6 +1481,8 @@ def semantic_search(
         model: Model to use for query embedding. If None, uses
                the model from the index metadata.
         language: Filter results to this language. None or "all" returns all.
+        device: Compute device ('cpu' or 'metal'). If None, defaults to TLDR_DEVICE
+                environment variable. Must match the device used to build the index.
 
     Returns:
         List of result dictionaries with name, file, line, score, etc.
@@ -1358,7 +1521,7 @@ def semantic_search(
 
     # Embed query (with instruction prefix for BGE)
     query_text = f"Represent this code search query: {query}"
-    query_embedding = compute_embedding(query_text, model_name=model)
+    query_embedding = compute_embedding(query_text, model_name=model, device=device)
     query_embedding = query_embedding.reshape(1, -1)
 
     # Search -- request more results when filtering by language
