@@ -12,10 +12,12 @@ Uses BAAI/bge-large-en-v1.5 for embeddings (1024 dimensions)
 and FAISS for fast vector similarity search.
 """
 
+import contextlib
 import json
 import logging
 import os
 import sys
+from collections.abc import Iterator
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -167,6 +169,56 @@ def _confirm_download(model_key: str) -> bool:
         return False
 
 
+@contextlib.contextmanager
+def _suppress_hf_noise() -> Iterator[None]:
+    """Suppress huggingface_hub and transformers progress bars and warnings during model load.
+
+    Disables progress bars, warnings, and verbosity for transformers and
+    huggingface_hub libraries during the block; unconditionally re-enables
+    progress bars on exit (environment variables are restored to their prior values).
+    """
+    env_keys = {
+        "TRANSFORMERS_VERBOSITY": "error",
+        "HF_HUB_DISABLE_PROGRESS_BARS": "1",
+        "TRANSFORMERS_NO_ADVISORY_WARNINGS": "1",
+    }
+    saved_env = {k: os.environ.get(k) for k in env_keys}
+    os.environ.update(env_keys)
+
+    tf_logging = None
+    try:
+        from transformers.utils import logging as tf_logging  # type: ignore
+        tf_logging.disable_progress_bar()  # type: ignore[attr-defined]
+    except (ImportError, AttributeError):
+        tf_logging = None
+
+    hf_hub_utils = None
+    try:
+        import huggingface_hub.utils as hf_hub_utils  # type: ignore
+        hf_hub_utils.disable_progress_bars()  # type: ignore[attr-defined]
+    except (ImportError, AttributeError):
+        hf_hub_utils = None
+
+    try:
+        yield
+    finally:
+        if tf_logging is not None:
+            try:
+                tf_logging.enable_progress_bar()
+            except (ImportError, AttributeError):
+                pass
+        if hf_hub_utils is not None:
+            try:
+                hf_hub_utils.enable_progress_bars()
+            except (ImportError, AttributeError):
+                pass
+        for k, v in saved_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
 def get_model(model_name: Optional[str] = None):
     """Lazy-load the embedding model (cached).
 
@@ -203,8 +255,9 @@ def get_model(model_name: Optional[str] = None):
         if model_key and not _confirm_download(model_key):
             raise ValueError(f"Model download declined. Use --model to choose a smaller model.")
 
-    from sentence_transformers import SentenceTransformer
-    _model = SentenceTransformer(hf_name)
+    with _suppress_hf_noise():
+        from sentence_transformers import SentenceTransformer
+        _model = SentenceTransformer(hf_name)
     _model_name = hf_name
     return _model
 
