@@ -579,27 +579,25 @@ Semantic Search:
                 pass
         return None
 
-    def _resolve_device(args_device: str | None) -> str:
-        """Resolve compute device: CLI arg > TLDR_DEVICE env > default 'cpu'.
+    def _resolve_device(args_device: str | None) -> str | None:
+        """Resolve compute device: CLI arg > TLDR_DEVICE env > None (auto-pick).
 
         Validates TLDR_DEVICE if set. Exits with code 2 on invalid env value.
-        Returns resolved device string ('cpu' or 'metal').
+        Returns 'cpu', 'metal', or None (let downstream pick the default).
         """
-        device = args_device
-        if device is None:
-            env_device = os.environ.get("TLDR_DEVICE")
-            if env_device:
-                if env_device not in ("cpu", "metal"):
-                    print(
-                        f"tldr: error: TLDR_DEVICE: invalid choice: {env_device!r} "
-                        f"(choose from 'cpu', 'metal')",
-                        file=sys.stderr,
-                    )
-                    sys.exit(2)
-                device = env_device
-            else:
-                device = "cpu"
-        return device
+        if args_device is not None:
+            return args_device
+        env_device = os.environ.get("TLDR_DEVICE")
+        if env_device:
+            if env_device not in ("cpu", "metal"):
+                print(
+                    f"tldr: error: TLDR_DEVICE: invalid choice: {env_device!r} "
+                    f"(choose from 'cpu', 'metal')",
+                    file=sys.stderr,
+                )
+                sys.exit(2)
+            return env_device
+        return None
 
     def resolve_language(lang_arg: str, project_path: str | Path) -> str:
         """Resolve 'auto' to actual language. Returns 'all' unchanged for multi-lang commands."""

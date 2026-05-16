@@ -1328,7 +1328,7 @@ def build_semantic_index(
     from tldr.tldrignore import ensure_tldrignore
 
     if device is None:
-        device = os.environ.get("TLDR_DEVICE")
+        device = os.environ.get("TLDR_DEVICE") or "cpu"
 
     console = _get_progress_console() if show_progress else None
 
