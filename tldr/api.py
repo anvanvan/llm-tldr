@@ -1396,8 +1396,12 @@ def search(
 
     Args:
         pattern: Regex pattern to search for
-        root: Root directory to search in
-        extensions: Optional set of extensions to filter (e.g., {".py"})
+        root: Directory to search recursively, OR a single file to search.
+              When ``root`` is a file, ``extensions`` is ignored (explicit file
+              beats filter) and ignore_spec / hidden-dir / SKIP_DIRS gating are
+              skipped. The ``file`` field in each result is the file's basename.
+        extensions: Optional set of extensions to filter (e.g., {".py"}).
+            Ignored when ``root`` is a file path.
         context_lines: Number of context lines to include (default 0)
         max_results: Maximum matches to return (default 100, 0 = unlimited)
         max_files: Maximum files to scan (default 10000, 0 = unlimited)
@@ -1429,6 +1433,30 @@ def search(
     root = Path(root)
     compiled = re.compile(pattern)
     files_scanned = 0
+
+    # Single-file mode: user named an explicit file path. Skip rglob, ignore
+    # gating, and the extensions filter — explicit beats filter.
+    if root.is_file():
+        try:
+            content = root.read_text(encoding="utf-8", errors="ignore")
+            lines = content.splitlines()
+            for i, line in enumerate(lines, 1):
+                if compiled.search(line):
+                    match = {
+                        "file": root.name,
+                        "line": i,
+                        "content": line.strip(),
+                    }
+                    if context_lines > 0:
+                        start = max(0, i - 1 - context_lines)
+                        end = min(len(lines), i + context_lines)
+                        match["context"] = lines[start:end]
+                    results.append(match)
+                    if max_results > 0 and len(results) >= max_results:
+                        return results
+        except OSError:
+            pass
+        return results
 
     for file_path in root.rglob("*"):
         # Check file limit
