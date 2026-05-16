@@ -18,6 +18,7 @@ import json
 import logging
 import os
 import sys
+from collections.abc import Iterator
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -268,10 +269,12 @@ def _confirm_download(model_key: str) -> bool:
 def _suppress_hf_noise() -> Iterator[None]:
     """Suppress HuggingFace/tqdm noise emitted during model weight loading.
 
-    Sets env vars for libraries not yet imported, and attempts to call the
-    huggingface_hub programmatic API for the progress-bar state (which is
-    frozen in a module-level constant and cannot be changed via env vars after
-    first import). If the import fails, suppression gracefully degrades (best-effort).
+    Sets env vars for libraries not yet imported, and calls the programmatic
+    progress-bar disable APIs for both `huggingface_hub` and `transformers`
+    (the latter is the source of the `Loading weights:` bar emitted by
+    `transformers/core_model_loading.py` — env vars alone don't suppress it
+    once `tqdm.auto` has been imported). If either import fails, suppression
+    gracefully degrades (best-effort).
 
     TOKENIZERS_PARALLELISM is set defensively: ProcessPoolExecutor forks worker
     processes before get_model() is called, so no active tokenizer pool exists at
@@ -281,6 +284,8 @@ def _suppress_hf_noise() -> Iterator[None]:
     saved = {key: os.environ.pop(key, None) for key in _HF_NOISE_SUPPRESSIONS}
     _bars_were_disabled = False
     _enable_progress_bars = None
+    _tf_bar_was_enabled = False
+    _tf_enable_progress_bar = None
 
     try:
         os.environ.update(_HF_NOISE_SUPPRESSIONS)
@@ -298,6 +303,17 @@ def _suppress_hf_noise() -> Iterator[None]:
                 _enable_progress_bars = enable_progress_bars
         except (ImportError, AttributeError):
             pass  # best-effort: if import fails, skip progress-bar suppression
+        # transformers has its own tqdm wrapper (`from tqdm.auto import tqdm` cached
+        # at import time); HF_HUB_DISABLE_PROGRESS_BARS does not cover it. Disable
+        # via the programmatic API and snapshot prior state so we restore correctly.
+        try:
+            from transformers.utils import logging as _tf_logging
+            if _tf_logging.is_progress_bar_enabled():
+                _tf_logging.disable_progress_bar()
+                _tf_bar_was_enabled = True
+                _tf_enable_progress_bar = _tf_logging.enable_progress_bar
+        except (ImportError, AttributeError):
+            pass
         yield
     finally:
         for key in _HF_NOISE_SUPPRESSIONS:
@@ -308,6 +324,8 @@ def _suppress_hf_noise() -> Iterator[None]:
                 os.environ[key] = val
         if _enable_progress_bars is not None:
             _enable_progress_bars()
+        if _tf_enable_progress_bar is not None and _tf_bar_was_enabled:
+            _tf_enable_progress_bar()
 
 
 def get_model(model_name: Optional[str] = None, *, device: Optional[str] = None):
