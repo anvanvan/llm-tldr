@@ -639,8 +639,15 @@ Semantic Search:
             print(json.dumps(combined_result, indent=2))
 
         elif args.command == "search":
+            search_path = Path(args.path)
+            if not search_path.exists():
+                print(f"Error: path '{args.path}' not found", file=sys.stderr)
+                sys.exit(1)
             ext = set(args.ext) if args.ext else None
-            ignore_spec = get_ignore_spec(args.path)
+            # When search_path is a single file, api_search ignores --ext
+            # (explicit file beats filter) and ignore_spec is rooted at parent.
+            ignore_root = search_path.parent if search_path.is_file() else search_path
+            ignore_spec = get_ignore_spec(str(ignore_root))
             result = api_search(
                 args.pattern, args.path,
                 extensions=ext,
