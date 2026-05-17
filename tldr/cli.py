@@ -213,7 +213,7 @@ Semantic Search:
         "--lang",
         default="auto",
         choices=["auto", *sorted(SUPPORTED_CONTEXT_LANGUAGES)],
-        help="Language (auto=detect from project; supported: python, typescript, go, rust)",
+        help="Language for call-graph context (auto=detect; supported: python, typescript, javascript, go, rust, php, swift, java)",
     )
 
     # tldr cfg <file> <function>

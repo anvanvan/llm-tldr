@@ -69,6 +69,7 @@ SUPPORTED_CONTEXT_EXT_MAP: dict[str, set[str]] = {
     "rust": {".rs"},
     "php": {".php"},
     "swift": {".swift"},
+    "java": {".java"},
 }
 SUPPORTED_CONTEXT_LANGUAGES: frozenset[str] = frozenset(SUPPORTED_CONTEXT_EXT_MAP.keys())
 from .cfg_extractor import (
@@ -477,6 +478,7 @@ def _get_module_exports(
         "go": [".go"],
         "rust": [".rs"],
         "php": [".php"],
+        "java": [".java"],
     }
     extensions = ext_map.get(language, [".py"])
 
@@ -564,7 +566,7 @@ def get_relevant_context(
         project: Path to project root
         entry_point: Function/method name (e.g., "Client.stream") or module path (e.g., "providers/anthropic")
         depth: How deep to traverse the call graph
-        language: python, typescript, javascript, go, or rust
+        language: python, typescript, javascript, go, rust, php, or java
         include_docstrings: Whether to include function docstrings
 
     Returns:
