@@ -3970,10 +3970,17 @@ def _get_swift_func_name(node, source: bytes) -> str | None:
 
 
 def _get_swift_type_name(node, source: bytes) -> str | None:
-    """Get type name from a Swift class/protocol declaration."""
+    """Get type name from a Swift class/struct/enum/protocol/extension declaration.
+
+    Class/struct/enum/protocol use `type_identifier`; extensions use
+    `user_type` to reference the type being extended.
+    """
     for child in node.children:
         if child.type == "type_identifier":
             return source[child.start_byte:child.end_byte].decode("utf-8")
+    for child in node.children:
+        if child.type == "user_type":
+            return source[child.start_byte:child.end_byte].decode("utf-8").strip()
     return None
 
 
@@ -4015,11 +4022,16 @@ def _index_swift_file(src_path: Path, rel_path: Path, module_name: str, simple_m
                 return
 
         elif node.type == "extension_declaration":
-            # Extensions don't define a new type; reuse the surrounding
-            # current_type so member methods index against the existing type
-            # if the AST is nested, otherwise leave methods unqualified.
+            # Extensions don't define a new type — do NOT add_to_index the
+            # extension target. But DO set current_type to the extended type
+            # so member methods register as Type.method.
+            type_name = _get_swift_type_name(node, source)
+            old_type = current_type
+            if type_name:
+                current_type = type_name
             for child in node.children:
                 walk_tree(child)
+            current_type = old_type
             return
 
         elif node.type == "function_declaration":
@@ -4067,10 +4079,16 @@ def _extract_swift_file_calls(file_path: Path, root: Path) -> dict[str, list[tup
                 current_type = old_type
                 return
         elif node.type == "extension_declaration":
-            # Extensions reuse surrounding type-context; don't register the
-            # extension's target type as a new definition.
+            # Don't register the extension target as a new defined name, but
+            # set current_type so member methods join defined_names as
+            # Type.method (matches what _index_swift_file does).
+            type_name = _get_swift_type_name(node, source)
+            old_type = current_type
+            if type_name:
+                current_type = type_name
             for child in node.children:
                 collect_definitions(child)
+            current_type = old_type
             return
         elif node.type == "function_declaration":
             name = _get_swift_func_name(node, source)
@@ -4154,9 +4172,15 @@ def _extract_swift_file_calls(file_path: Path, root: Path) -> dict[str, list[tup
                 return
 
         elif node.type == "extension_declaration":
-            # Extensions reuse the surrounding type-context (if any).
+            # Set current_type_proc to the extended type (don't register the
+            # extension as a new type) so member call-keys are qualified.
+            type_name = _get_swift_type_name(node, source)
+            old_type = current_type_proc
+            if type_name:
+                current_type_proc = type_name
             for child in node.children:
                 process_functions(child)
+            current_type_proc = old_type
             return
 
         elif node.type == "function_declaration":
@@ -4227,7 +4251,14 @@ def _build_swift_call_graph(
 
                 elif call_type == 'attr':
                     if '.' in call_target:
+                        # Resolve file via qualified key ("Type.method") when
+                        # available so Foo.bar and Baz.bar don't collide, but
+                        # emit the edge with the bare method name so callers
+                        # (and `tldr impact <bare>`) match the Java convention.
                         method_name = call_target.split('.')[-1]
-                        if method_name in name_index and len(name_index[method_name]) == 1:
+                        if call_target in name_index and len(name_index[call_target]) == 1:
+                            target_file, _ = name_index[call_target][0]
+                            graph.add_edge(rel_path, caller_func, target_file, method_name)
+                        elif method_name in name_index and len(name_index[method_name]) == 1:
                             target_file, _ = name_index[method_name][0]
                             graph.add_edge(rel_path, caller_func, target_file, method_name)
