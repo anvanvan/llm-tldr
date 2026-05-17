@@ -44,7 +44,7 @@ dependencies = [
     "tree-sitter-ruby>=0.20.0",
     "tree-sitter-php>=0.20.0",
     "tree-sitter-c-sharp>=0.20.0",
-    # tree-sitter-swift only has 0.0.1 on PyPI - keeping optional until upstream fixes
+    "tree-sitter-swift>=0.7.2",
     "tree-sitter-kotlin>=1.0.0",
     "tree-sitter-scala>=0.23.0",
     "tree-sitter-lua<=0.4.1",
