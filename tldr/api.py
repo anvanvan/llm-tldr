@@ -454,7 +454,8 @@ def _get_module_exports(
         "python": ".py",
         "typescript": ".ts",
         "go": ".go",
-        "rust": ".rs"
+        "rust": ".rs",
+        "java": ".java",
     }
     ext = ext_map.get(language, ".py")
 
