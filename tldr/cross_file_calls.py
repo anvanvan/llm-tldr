@@ -4002,7 +4002,7 @@ def _index_swift_file(src_path: Path, rel_path: Path, module_name: str, simple_m
 
         if node.type in (
             "class_declaration", "protocol_declaration",
-            "struct_declaration", "enum_declaration", "extension_declaration",
+            "struct_declaration", "enum_declaration",
         ):
             type_name = _get_swift_type_name(node, source)
             if type_name:
@@ -4013,6 +4013,14 @@ def _index_swift_file(src_path: Path, rel_path: Path, module_name: str, simple_m
                     walk_tree(child)
                 current_type = old_type
                 return
+
+        elif node.type == "extension_declaration":
+            # Extensions don't define a new type; reuse the surrounding
+            # current_type so member methods index against the existing type
+            # if the AST is nested, otherwise leave methods unqualified.
+            for child in node.children:
+                walk_tree(child)
+            return
 
         elif node.type == "function_declaration":
             name = _get_swift_func_name(node, source)
@@ -4047,7 +4055,7 @@ def _extract_swift_file_calls(file_path: Path, root: Path) -> dict[str, list[tup
         nonlocal current_type
         if node.type in (
             "class_declaration", "protocol_declaration",
-            "struct_declaration", "enum_declaration", "extension_declaration",
+            "struct_declaration", "enum_declaration",
         ):
             type_name = _get_swift_type_name(node, source)
             if type_name:
@@ -4058,6 +4066,12 @@ def _extract_swift_file_calls(file_path: Path, root: Path) -> dict[str, list[tup
                     collect_definitions(child)
                 current_type = old_type
                 return
+        elif node.type == "extension_declaration":
+            # Extensions reuse surrounding type-context; don't register the
+            # extension's target type as a new definition.
+            for child in node.children:
+                collect_definitions(child)
+            return
         elif node.type == "function_declaration":
             name = _get_swift_func_name(node, source)
             if name:
@@ -4085,6 +4099,11 @@ def _extract_swift_file_calls(file_path: Path, root: Path) -> dict[str, list[tup
                             if ns.type == "simple_identifier":
                                 method_text = source[ns.start_byte:ns.end_byte].decode("utf-8")
                 if method_text:
+                    # self.foo() / Self.foo() refer to the enclosing type; route
+                    # them through bare-name resolution so _append_call can
+                    # classify them as intra-file when foo is locally defined.
+                    if receiver_text in ("self", "Self"):
+                        return ("bare", method_text)
                     callee_name = f"{receiver_text}.{method_text}" if receiver_text else method_text
                     return ("attr", callee_name)
                 break
@@ -4123,7 +4142,7 @@ def _extract_swift_file_calls(file_path: Path, root: Path) -> dict[str, list[tup
         nonlocal current_type_proc
         if node.type in (
             "class_declaration", "protocol_declaration",
-            "struct_declaration", "enum_declaration", "extension_declaration",
+            "struct_declaration", "enum_declaration",
         ):
             type_name = _get_swift_type_name(node, source)
             if type_name:
@@ -4133,6 +4152,12 @@ def _extract_swift_file_calls(file_path: Path, root: Path) -> dict[str, list[tup
                     process_functions(child)
                 current_type_proc = old_type
                 return
+
+        elif node.type == "extension_declaration":
+            # Extensions reuse the surrounding type-context (if any).
+            for child in node.children:
+                process_functions(child)
+            return
 
         elif node.type == "function_declaration":
             name = _get_swift_func_name(node, source)

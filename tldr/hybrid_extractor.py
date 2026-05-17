@@ -2284,19 +2284,30 @@ class HybridExtractor:
                 if class_info:
                     module_info.classes.append(class_info)
 
+            elif child.type in (
+                "struct_declaration", "extension_declaration",
+                "protocol_declaration", "enum_declaration",
+            ):
+                # Route non-class type declarations through the type extractor
+                # so their function_declaration members land in ClassInfo.methods
+                # instead of being dumped into module_info.functions.
+                # (Current tree-sitter-swift wraps class/struct/enum/extension
+                # under class_declaration; this branch is materially exercised
+                # for protocol_declaration, defensive for the others.)
+                type_info = self._extract_swift_class(child, source, defined_names or set(), call_graph)
+                if type_info:
+                    module_info.classes.append(type_info)
+
             elif child.type == "import_declaration":
                 import_info = self._extract_swift_import(child, source)
                 if import_info:
                     module_info.imports.append(import_info)
 
-            # Recurse for nested structures (FIXED: was only source_file, missed extensions/structs/protocols).
-            # NOTE: class_declaration/class_body deliberately excluded — _extract_swift_class
-            # already harvests function_declaration members into ClassInfo.methods; recursing
-            # would duplicate them as top-level module.functions.
-            if child.type in ("source_file",
-                              "struct_declaration", "extension_declaration",
-                              "protocol_declaration", "protocol_body",
-                              "enum_declaration"):
+            # Only descend through plain source_file to discover sibling
+            # declarations. Type bodies are handled inside _extract_swift_class
+            # to avoid leaking nested function_declaration nodes into
+            # module_info.functions.
+            if child.type == "source_file":
                 self._extract_swift_nodes(child, source, module_info, defined_names)
 
     def _extract_swift_function(self, node, source: bytes) -> FunctionInfo | None:
@@ -2369,22 +2380,32 @@ class HybridExtractor:
         )
 
     def _extract_swift_class(self, node, source: bytes, defined_names: set[str], call_graph: CallGraphInfo) -> ClassInfo | None:
-        """Extract class info from Swift class_declaration."""
+        """Extract class info from a Swift type declaration.
+
+        Handles class_declaration, struct_declaration, enum_declaration,
+        protocol_declaration, and extension_declaration. Extension names come
+        from a `user_type` child (the extended type's name); other type kinds
+        use `type_identifier`. Protocol bodies live under `protocol_body`.
+        """
         name = None
         methods = []
 
         for child in node.children:
-            if child.type == "type_identifier":
-                name = self._safe_decode(source[child.start_byte:child.end_byte])
-            elif child.type in ("class_body", "enum_class_body"):
-                # class_body covers class/struct; enum_class_body covers enum
+            if child.type in ("type_identifier", "user_type") and name is None:
+                name = self._safe_decode(source[child.start_byte:child.end_byte]).strip()
+            elif child.type in ("class_body", "enum_class_body", "protocol_body"):
                 for member in child.children:
                     if member.type == "function_declaration":
                         method = self._extract_swift_function(member, source)
                         if method:
                             methods.append(method)
-                            # Extract calls from method body
-                            self._extract_swift_calls(member, method.name, source, call_graph, defined_names)
+                            # Use qualified caller id so identically-named methods
+                            # across different types don't collide in the
+                            # module-level call_graph.
+                            qualified_caller = f"{name}.{method.name}" if name else method.name
+                            self._extract_swift_calls(
+                                member, qualified_caller, source, call_graph, defined_names
+                            )
 
         if not name:
             return None
