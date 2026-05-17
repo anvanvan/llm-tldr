@@ -1933,6 +1933,8 @@ def build_function_index(
             _index_c_file(src_path, rel_path, module_name, simple_module, index)
         elif language == "php":
             _index_php_file(src_path, rel_path, module_name, simple_module, index)
+        elif language == "swift":
+            _index_swift_file(src_path, rel_path, module_name, simple_module, index)
 
     return index
 
@@ -3311,6 +3313,8 @@ def build_project_call_graph(
         _build_c_call_graph(root, graph, func_index, workspace_config)
     elif language == "php":
         _build_php_call_graph(root, graph, func_index, workspace_config)
+    elif language == "swift":
+        _build_swift_call_graph(root, graph, func_index, workspace_config)
 
     return graph
 
@@ -3939,3 +3943,257 @@ def _build_php_call_graph(
                                     if name == method:
                                         graph.add_edge(rel_path, caller_func, file_path, method)
                                         break
+
+
+def _build_name_index(func_index: dict) -> dict[str, list[tuple[str, tuple]]]:
+    """Build a reverse index: function_name -> [(file_path, full_key), ...]."""
+    name_index: dict[str, list[tuple[str, tuple]]] = {}
+    seen: dict[str, set[str]] = {}
+    for key, file_path in func_index.items():
+        if isinstance(key, tuple) and len(key) == 2:
+            _, name = key
+            if name not in name_index:
+                name_index[name] = []
+                seen[name] = set()
+            if file_path not in seen[name]:
+                seen[name].add(file_path)
+                name_index[name].append((file_path, key))
+    return name_index
+
+
+def _get_swift_func_name(node, source: bytes) -> str | None:
+    """Get function name from a Swift AST node."""
+    for child in node.children:
+        if child.type == "simple_identifier":
+            return source[child.start_byte:child.end_byte].decode("utf-8")
+    return None
+
+
+def _get_swift_type_name(node, source: bytes) -> str | None:
+    """Get type name from a Swift class/protocol declaration."""
+    for child in node.children:
+        if child.type == "type_identifier":
+            return source[child.start_byte:child.end_byte].decode("utf-8")
+    return None
+
+
+def _index_swift_file(src_path: Path, rel_path: Path, module_name: str, simple_module: str, index: dict):
+    """Index top-level functions and class/struct/extension methods from a Swift file."""
+    if not TREE_SITTER_SWIFT_AVAILABLE:
+        return
+
+    try:
+        source = src_path.read_bytes()
+        parser = _get_swift_parser()
+        tree = parser.parse(source)
+    except (FileNotFoundError, Exception):
+        return
+
+    def add_to_index(name: str):
+        index[(module_name, name)] = str(rel_path)
+        index[(simple_module, name)] = str(rel_path)
+        index[f"{module_name}.{name}"] = str(rel_path)
+        index[f"{simple_module}.{name}"] = str(rel_path)
+
+    current_type = None
+
+    def walk_tree(node):
+        nonlocal current_type
+
+        if node.type in ("class_declaration", "protocol_declaration"):
+            type_name = _get_swift_type_name(node, source)
+            if type_name:
+                add_to_index(type_name)
+                old_type = current_type
+                current_type = type_name
+                for child in node.children:
+                    walk_tree(child)
+                current_type = old_type
+                return
+
+        elif node.type == "function_declaration":
+            name = _get_swift_func_name(node, source)
+            if name:
+                add_to_index(name)
+                if current_type:
+                    add_to_index(f"{current_type}.{name}")
+
+        for child in node.children:
+            walk_tree(child)
+
+    walk_tree(tree.root_node)
+
+
+def _extract_swift_file_calls(file_path: Path, root: Path) -> dict[str, list[tuple[str, str]]]:
+    """Extract all calls from a Swift file, grouped by containing function/method."""
+    if not TREE_SITTER_SWIFT_AVAILABLE:
+        return {}
+
+    try:
+        source = file_path.read_bytes()
+        parser = _get_swift_parser()
+        tree = parser.parse(source)
+    except (FileNotFoundError, Exception):
+        return {}
+
+    calls_by_func: dict[str, list[tuple[str, str]]] = {}
+    defined_names: set[str] = set()
+    current_type = None
+
+    def collect_definitions(node):
+        nonlocal current_type
+        if node.type in ("class_declaration", "protocol_declaration"):
+            type_name = _get_swift_type_name(node, source)
+            if type_name:
+                defined_names.add(type_name)
+                old_type = current_type
+                current_type = type_name
+                for child in node.children:
+                    collect_definitions(child)
+                current_type = old_type
+                return
+        elif node.type == "function_declaration":
+            name = _get_swift_func_name(node, source)
+            if name:
+                defined_names.add(name)
+                if current_type:
+                    defined_names.add(f"{current_type}.{name}")
+        for child in node.children:
+            collect_definitions(child)
+
+    collect_definitions(tree.root_node)
+
+    def _extract_call_from_expr(call_node):
+        for child in call_node.children:
+            if child.type == "simple_identifier":
+                callee_name = source[child.start_byte:child.end_byte].decode("utf-8")
+                return ("bare", callee_name)
+            elif child.type == "navigation_expression":
+                receiver_text = None
+                method_text = None
+                for sub in child.children:
+                    if sub.type == "simple_identifier" and receiver_text is None:
+                        receiver_text = source[sub.start_byte:sub.end_byte].decode("utf-8")
+                    elif sub.type == "navigation_suffix":
+                        for ns in sub.children:
+                            if ns.type == "simple_identifier":
+                                method_text = source[ns.start_byte:ns.end_byte].decode("utf-8")
+                if method_text:
+                    callee_name = f"{receiver_text}.{method_text}" if receiver_text else method_text
+                    return ("attr", callee_name)
+                break
+        return None
+
+    def _append_call(calls, call_kind, callee_name):
+        if call_kind == "bare":
+            if callee_name in defined_names:
+                calls.append(("intra", callee_name))
+            else:
+                calls.append(("direct", callee_name))
+        elif call_kind == "attr":
+            calls.append(("attr", callee_name))
+
+    def extract_calls_from_func(func_node):
+        calls: list[tuple[str, str]] = []
+
+        for child in func_node.children:
+            if child.type == "function_body":
+                def walk_body(node):
+                    if node.type == "function_declaration":
+                        return
+                    if node.type == "call_expression":
+                        result = _extract_call_from_expr(node)
+                        if result:
+                            _append_call(calls, result[0], result[1])
+                    for sub in node.children:
+                        walk_body(sub)
+
+                walk_body(child)
+        return calls
+
+    current_type_proc = None
+
+    def process_functions(node):
+        nonlocal current_type_proc
+        if node.type in ("class_declaration", "protocol_declaration"):
+            type_name = _get_swift_type_name(node, source)
+            if type_name:
+                old_type = current_type_proc
+                current_type_proc = type_name
+                for child in node.children:
+                    process_functions(child)
+                current_type_proc = old_type
+                return
+
+        elif node.type == "function_declaration":
+            name = _get_swift_func_name(node, source)
+            if name:
+                calls = extract_calls_from_func(node)
+                calls_by_func[name] = calls
+                if current_type_proc:
+                    calls_by_func[f"{current_type_proc}.{name}"] = calls
+
+        for child in node.children:
+            process_functions(child)
+
+    process_functions(tree.root_node)
+    return calls_by_func
+
+
+def _build_swift_call_graph(
+    root: Path,
+    graph: ProjectCallGraph,
+    func_index: dict,
+    workspace_config: Optional[WorkspaceConfig] = None
+):
+    """Build call graph for Swift files."""
+    name_index = _build_name_index(func_index)
+
+    for swift_file in scan_project(root, "swift", workspace_config):
+        swift_path = Path(swift_file)
+        rel_path = str(swift_path.relative_to(root))
+
+        try:
+            imports = parse_swift_imports(swift_path)
+        except Exception:
+            imports = []
+
+        import_map: dict[str, str] = {}
+        for imp in imports:
+            module = imp.get('module', '')
+            if not module:
+                continue
+            simple_name = module.split('.')[-1]
+            import_map[simple_name] = module
+
+        calls_by_func = _extract_swift_file_calls(swift_path, root)
+
+        for caller_func, calls in calls_by_func.items():
+            for call_type, call_target in calls:
+                if call_type == 'intra':
+                    graph.add_edge(rel_path, caller_func, rel_path, call_target)
+
+                elif call_type == 'direct':
+                    resolved = False
+                    if call_target in import_map:
+                        fq_module = import_map[call_target]
+                        fq_simple = fq_module.split('.')[-1]
+                        key = (fq_simple, call_target)
+                        if key in func_index:
+                            graph.add_edge(rel_path, caller_func, func_index[key], call_target)
+                            resolved = True
+                        else:
+                            key = (fq_module, call_target)
+                            if key in func_index:
+                                graph.add_edge(rel_path, caller_func, func_index[key], call_target)
+                                resolved = True
+                    if not resolved and call_target in name_index and len(name_index[call_target]) == 1:
+                        target_file, _ = name_index[call_target][0]
+                        graph.add_edge(rel_path, caller_func, target_file, call_target)
+
+                elif call_type == 'attr':
+                    if '.' in call_target:
+                        method_name = call_target.split('.')[-1]
+                        if method_name in name_index and len(name_index[method_name]) == 1:
+                            target_file, _ = name_index[method_name][0]
+                            graph.add_edge(rel_path, caller_func, target_file, method_name)

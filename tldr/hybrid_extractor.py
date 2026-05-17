@@ -2244,9 +2244,10 @@ class HybridExtractor:
                 if name_node:
                     names.add(self._safe_decode(source[name_node.start_byte:name_node.end_byte]))
             elif child.type == "class_declaration":
-                # Find methods in class body
+                # Find methods in class body (class_body for class/struct,
+                # enum_class_body for enum — class_declaration covers all three)
                 for c in child.children:
-                    if c.type == "class_body":
+                    if c.type in ("class_body", "enum_class_body"):
                         for member in c.children:
                             if member.type == "function_declaration":
                                 name_node = member.child_by_field_name("name")
@@ -2281,8 +2282,11 @@ class HybridExtractor:
                 if import_info:
                     module_info.imports.append(import_info)
 
-            # Recurse for nested structures (FIXED: was only source_file, missed extensions/structs/protocols)
-            if child.type in ("source_file", "class_declaration", "class_body",
+            # Recurse for nested structures (FIXED: was only source_file, missed extensions/structs/protocols).
+            # NOTE: class_declaration/class_body deliberately excluded — _extract_swift_class
+            # already harvests function_declaration members into ClassInfo.methods; recursing
+            # would duplicate them as top-level module.functions.
+            if child.type in ("source_file",
                               "struct_declaration", "extension_declaration",
                               "protocol_declaration", "protocol_body",
                               "enum_declaration"):
@@ -2298,18 +2302,52 @@ class HybridExtractor:
         if name_node:
             name = self._safe_decode(source[name_node.start_byte:name_node.end_byte])
 
-        for child in node.children:
+        children = list(node.children)
+        for idx, child in enumerate(children):
             if child.type == "parameter":
+                # Capture external_label + internal_name + type from parameter children.
+                idents = [c for c in child.children if c.type == "simple_identifier"]
+                type_str = None
+                type_node_types = {
+                    "type_annotation", "user_type", "type_identifier",
+                    "array_type", "optional_type", "tuple_type",
+                    "dictionary_type", "function_type", "metatype",
+                    "protocol_composition_type", "opaque_type",
+                }
                 for c in child.children:
-                    if c.type == "simple_identifier":
-                        params.append(self._safe_decode(source[c.start_byte:c.end_byte]))
+                    if c.type in type_node_types:
+                        raw = self._safe_decode(source[c.start_byte:c.end_byte])
+                        type_str = raw.lstrip(":").strip()
                         break
+                if not type_str:
+                    raw_param = self._safe_decode(source[child.start_byte:child.end_byte])
+                    if ":" in raw_param:
+                        type_str = raw_param.split(":", 1)[1].strip()
+                if len(idents) >= 2:
+                    label = self._safe_decode(source[idents[0].start_byte:idents[0].end_byte])
+                    inner = self._safe_decode(source[idents[1].start_byte:idents[1].end_byte])
+                    params.append(f"{label} {inner}: {type_str}" if type_str else f"{label} {inner}")
+                elif len(idents) == 1:
+                    inner = self._safe_decode(source[idents[0].start_byte:idents[0].end_byte])
+                    params.append(f"{inner}: {type_str}" if type_str else inner)
+                else:
+                    params.append(self._safe_decode(source[child.start_byte:child.end_byte]))
             elif child.type == "type_annotation":
-                # Return type after ->
+                rt = None
                 for c in child.children:
                     if c.type in ("type_identifier", "user_type", "simple_identifier"):
-                        return_type = self._safe_decode(source[c.start_byte:c.end_byte])
+                        rt = self._safe_decode(source[c.start_byte:c.end_byte])
                         break
+                if not rt:
+                    raw = self._safe_decode(source[child.start_byte:child.end_byte])
+                    rt = raw.lstrip(":").strip()
+                if rt:
+                    return_type = rt
+            elif child.type == "->":
+                if idx + 1 < len(children):
+                    rt_node = children[idx + 1]
+                    if rt_node.type != "function_body":
+                        return_type = self._safe_decode(source[rt_node.start_byte:rt_node.end_byte]).strip()
 
         if not name:
             return None
@@ -2320,6 +2358,7 @@ class HybridExtractor:
             return_type=return_type,
             docstring=None,
             line_number=node.start_point[0] + 1,
+            language="swift",
         )
 
     def _extract_swift_class(self, node, source: bytes, defined_names: set[str], call_graph: CallGraphInfo) -> ClassInfo | None:
@@ -2330,7 +2369,8 @@ class HybridExtractor:
         for child in node.children:
             if child.type == "type_identifier":
                 name = self._safe_decode(source[child.start_byte:child.end_byte])
-            elif child.type == "class_body":
+            elif child.type in ("class_body", "enum_class_body"):
+                # class_body covers class/struct; enum_class_body covers enum
                 for member in child.children:
                     if member.type == "function_declaration":
                         method = self._extract_swift_function(member, source)

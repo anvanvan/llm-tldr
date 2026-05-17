@@ -554,7 +554,8 @@ def get_relevant_context(
         "python": ".py",
         "typescript": ".ts",
         "go": ".go",
-        "rust": ".rs"
+        "rust": ".rs",
+        "swift": ".swift",
     }.get(language, ".py")
 
     # NOTE: Removed module-file shortcut that conflicted with function lookup.
@@ -573,7 +574,8 @@ def get_relevant_context(
         "python": {".py"},
         "typescript": {".ts", ".tsx"},
         "go": {".go"},
-        "rust": {".rs"}
+        "rust": {".rs"},
+        "swift": {".swift"},
     }
     extensions = ext_map.get(language, {".py"})
 
@@ -611,6 +613,8 @@ def get_relevant_context(
                         return_type=cls.name,
                         docstring=cls.docstring,
                         line_number=cls.line_number,
+                        language=language,
+                        is_class_wrapper=(language == "swift"),
                     )
                     signatures[cls.name] = (str(file_path), class_as_func)
 
