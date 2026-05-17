@@ -4000,7 +4000,10 @@ def _index_swift_file(src_path: Path, rel_path: Path, module_name: str, simple_m
     def walk_tree(node):
         nonlocal current_type
 
-        if node.type in ("class_declaration", "protocol_declaration"):
+        if node.type in (
+            "class_declaration", "protocol_declaration",
+            "struct_declaration", "enum_declaration", "extension_declaration",
+        ):
             type_name = _get_swift_type_name(node, source)
             if type_name:
                 add_to_index(type_name)
@@ -4042,7 +4045,10 @@ def _extract_swift_file_calls(file_path: Path, root: Path) -> dict[str, list[tup
 
     def collect_definitions(node):
         nonlocal current_type
-        if node.type in ("class_declaration", "protocol_declaration"):
+        if node.type in (
+            "class_declaration", "protocol_declaration",
+            "struct_declaration", "enum_declaration", "extension_declaration",
+        ):
             type_name = _get_swift_type_name(node, source)
             if type_name:
                 defined_names.add(type_name)
@@ -4115,7 +4121,10 @@ def _extract_swift_file_calls(file_path: Path, root: Path) -> dict[str, list[tup
 
     def process_functions(node):
         nonlocal current_type_proc
-        if node.type in ("class_declaration", "protocol_declaration"):
+        if node.type in (
+            "class_declaration", "protocol_declaration",
+            "struct_declaration", "enum_declaration", "extension_declaration",
+        ):
             type_name = _get_swift_type_name(node, source)
             if type_name:
                 old_type = current_type_proc

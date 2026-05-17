@@ -2253,8 +2253,15 @@ class HybridExtractor:
                                 name_node = member.child_by_field_name("name")
                                 if name_node:
                                     names.add(self._safe_decode(source[name_node.start_byte:name_node.end_byte]))
-            # Recurse
-            if child.type == "source_file":
+            # Recurse into the same nested scopes _extract_swift_nodes walks so
+            # methods inside struct/extension/protocol/enum bodies are collected
+            # and _extract_swift_calls doesn't filter their call sites out.
+            if child.type in (
+                "source_file",
+                "struct_declaration", "extension_declaration",
+                "protocol_declaration", "protocol_body",
+                "enum_declaration",
+            ):
                 names.update(self._collect_swift_definitions(child, source))
         return names
 
