@@ -235,7 +235,7 @@ Semantic Search:
         default="python",
         choices=["python", "typescript", "javascript", "go", "rust", "java", "c",
                  "cpp", "ruby", "php", "kotlin", "swift", "csharp", "scala", "lua", "luau", "elixir"],
-        help="Language",
+        help="Language for call-graph context (Tier 3: python, typescript, go, rust, java, c, php)",
     )
 
     # tldr cfg <file> <function>

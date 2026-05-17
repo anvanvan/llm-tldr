@@ -536,7 +536,7 @@ def get_relevant_context(
         project: Path to project root
         entry_point: Function/method name (e.g., "Client.stream") or module path (e.g., "providers/anthropic")
         depth: How deep to traverse the call graph
-        language: python, typescript, go, or rust
+        language: python, typescript, go, rust, or java
         include_docstrings: Whether to include function docstrings
 
     Returns:
@@ -573,7 +573,8 @@ def get_relevant_context(
         "python": {".py"},
         "typescript": {".ts", ".tsx"},
         "go": {".go"},
-        "rust": {".rs"}
+        "rust": {".rs"},
+        "java": {".java"},
     }
     extensions = ext_map.get(language, {".py"})
 
