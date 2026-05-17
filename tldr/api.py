@@ -68,6 +68,7 @@ SUPPORTED_CONTEXT_EXT_MAP: dict[str, set[str]] = {
     "go": {".go"},
     "rust": {".rs"},
     "php": {".php"},
+    "swift": {".swift"},
 }
 SUPPORTED_CONTEXT_LANGUAGES: frozenset[str] = frozenset(SUPPORTED_CONTEXT_EXT_MAP.keys())
 from .cfg_extractor import (
@@ -623,6 +624,8 @@ def get_relevant_context(
                         return_type=cls.name,
                         docstring=cls.docstring,
                         line_number=cls.line_number,
+                        language=language,
+                        is_class_wrapper=(language == "swift"),
                     )
                     signatures[cls.name] = (str(file_path), class_as_func)
 

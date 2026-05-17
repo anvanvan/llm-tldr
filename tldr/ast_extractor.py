@@ -35,14 +35,20 @@ class FunctionInfo:
     decorators: list[str] = field(default_factory=list)
     line_number: int = 0
     language: str = ""
+    is_class_wrapper: bool = False
 
     def signature(self) -> str:
         """Return full signature string."""
+        if self.is_class_wrapper:
+            return f"class {self.name}"
         async_prefix = "async " if self.is_async else ""
         params_str = ", ".join(self.params)
         if self.language == "php":
             ret = f": {self.return_type}" if self.return_type else ""
             return f"{async_prefix}function {self.name}({params_str}){ret}"
+        if self.language == "swift":
+            ret = f" -> {self.return_type}" if self.return_type else ""
+            return f"{async_prefix}func {self.name}({params_str}){ret}"
         ret = f" -> {self.return_type}" if self.return_type else ""
         return f"{async_prefix}def {self.name}({params_str}){ret}"
 
