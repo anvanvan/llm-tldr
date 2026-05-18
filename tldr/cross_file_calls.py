@@ -3295,7 +3295,15 @@ def build_project_call_graph(
     if use_workspace_config:
         workspace_config = load_workspace_config(root)
 
-    func_index = build_function_index(root, language, workspace_config)
+    # Self-contained builders skip the eager full-project func_index scan.
+    self_contained_languages = {
+        "elixir", "swift", "ruby", "kotlin", "csharp",
+        "lua", "luau", "scala", "cpp",
+    }
+    if language in self_contained_languages:
+        func_index = None
+    else:
+        func_index = build_function_index(root, language, workspace_config)
 
     if language == "python":
         _build_python_call_graph(root, graph, func_index, workspace_config)
@@ -4329,11 +4337,10 @@ def _build_elixir_call_graph(
                         dst_file = module_to_file[resolved_fqn]
                         graph.add_edge(rel_path, caller_func, dst_file, fname)
                 elif call_type == "local":
-                    # Same-file bare call (no caller_mod context); emit as intra-file edge.
-                    if caller_mod:
+                    # Bare same-file call: only emit when target is a function
+                    # in the caller's module — avoids fake edges for imports/builtins.
+                    if caller_mod and target in module_funcs.get(caller_mod, set()):
                         graph.add_edge(rel_path, caller_func, rel_path, f"{caller_mod}.{target}")
-                    else:
-                        graph.add_edge(rel_path, caller_func, rel_path, target)
 
 
 # -----------------------------------------------------------------------------

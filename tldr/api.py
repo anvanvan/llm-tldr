@@ -593,7 +593,7 @@ def get_relevant_context(
         "lua": {".lua"},
         "luau": {".luau"},
         "scala": {".scala", ".sc"},
-        "cpp": {".cpp", ".cc", ".cxx", ".hpp", ".h"}
+        "cpp": {".cpp", ".cc", ".cxx", ".hpp", ".hh", ".hxx"}
     }
     extensions = ext_map.get(language, {".py"})
 
