@@ -661,6 +661,7 @@ def get_relevant_context(
         "lua": extract_lua_cfg,
         "luau": extract_luau_cfg,
         "elixir": extract_elixir_cfg,
+        "cpp": extract_cpp_cfg,
     }
     cfg_extractor_fn = cfg_extractors.get(language, extract_python_cfg)
 

@@ -4068,11 +4068,9 @@ def _generic_extract(
                 calls = extract_calls_in(node)
                 resolved = []
                 for ctype, target in calls:
-                    if ctype == "direct" and target in defined_names and target != n:
+                    if ctype == "direct" and target in defined_names:
+                        # Record self-references as intra-file (covers recursion).
                         resolved.append(("intra", target))
-                    elif ctype == "direct" and target == n:
-                        # skip self-name occurrence which is the declarator's own identifier
-                        pass
                     else:
                         resolved.append((ctype, target))
                 calls_by_func[n] = resolved
@@ -4330,6 +4328,12 @@ def _build_elixir_call_graph(
                     if resolved_fqn and fname in module_funcs.get(resolved_fqn, set()):
                         dst_file = module_to_file[resolved_fqn]
                         graph.add_edge(rel_path, caller_func, dst_file, fname)
+                elif call_type == "local":
+                    # Same-file bare call (no caller_mod context); emit as intra-file edge.
+                    if caller_mod:
+                        graph.add_edge(rel_path, caller_func, rel_path, f"{caller_mod}.{target}")
+                    else:
+                        graph.add_edge(rel_path, caller_func, rel_path, target)
 
 
 # -----------------------------------------------------------------------------
