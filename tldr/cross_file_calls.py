@@ -3311,6 +3311,24 @@ def build_project_call_graph(
         _build_c_call_graph(root, graph, func_index, workspace_config)
     elif language == "php":
         _build_php_call_graph(root, graph, func_index, workspace_config)
+    elif language == "elixir":
+        _build_elixir_call_graph(root, graph, workspace_config)
+    elif language == "swift":
+        _build_swift_call_graph(root, graph, workspace_config)
+    elif language == "ruby":
+        _build_ruby_call_graph(root, graph, workspace_config)
+    elif language == "kotlin":
+        _build_kotlin_call_graph(root, graph, workspace_config)
+    elif language == "csharp":
+        _build_csharp_call_graph(root, graph, workspace_config)
+    elif language == "lua":
+        _build_lua_call_graph(root, graph, workspace_config)
+    elif language == "luau":
+        _build_luau_call_graph(root, graph, workspace_config)
+    elif language == "scala":
+        _build_scala_call_graph(root, graph, workspace_config)
+    elif language == "cpp":
+        _build_cpp_call_graph(root, graph, workspace_config)
 
     return graph
 
@@ -3939,3 +3957,1013 @@ def _build_php_call_graph(
                                     if name == method:
                                         graph.add_edge(rel_path, caller_func, file_path, method)
                                         break
+
+
+# =============================================================================
+# Generic helpers for new-language call-graph builders.
+#
+# These builders are self-contained: they do NOT rely on build_function_index()
+# (which has no _index_<lang>_file for Ruby/Kotlin/C#/Lua/Luau/Scala/C++/Elixir/
+# Swift on upstream/main). Instead each builder constructs its own
+# global_defs map by re-walking each project file with the language's
+# extractor (which records defined_names as a side channel via a closure).
+# =============================================================================
+
+
+def _generic_extract(
+    file_path: Path,
+    parser,
+    def_node_types: set,
+    name_child_types: frozenset[str] = frozenset({"identifier", "simple_identifier"}),
+    call_node_types: frozenset[str] = frozenset({"call", "call_expression", "function_call"}),
+):
+    """
+    Generic tree-sitter walker: returns (defined_names: set[str],
+    calls_by_func: dict[str, list[(call_type, target)]]).
+
+    A function definition is any node whose type is in def_node_types and which
+    has a direct or grandchild identifier-like child for its name.
+    A call site is a node whose type is in call_node_types; the call target is
+    the text of its first identifier-like descendant (with simple normalization
+    for receiver.method / receiver::method / receiver:method).
+    """
+    try:
+        source = file_path.read_bytes()
+        tree = parser.parse(source)
+    except (FileNotFoundError, Exception):
+        return set(), {}
+
+    defined_names: set[str] = set()
+    calls_by_func: dict[str, list[tuple[str, str]]] = {}
+
+    def find_name(node):
+        # Return text of first direct child whose type is in name_child_types
+        for child in node.children:
+            if child.type in name_child_types:
+                return source[child.start_byte:child.end_byte].decode("utf-8", errors="replace")
+        return None
+
+    def extract_call_target(call_node):
+        # Find first identifier-like text; handle method-receiver shapes.
+        # Look for navigation/member/scoped_call structures.
+        # Default: the first identifier-like descendant text.
+        first_text = None
+        for child in call_node.children:
+            t = child.type
+            if t in name_child_types:
+                first_text = source[child.start_byte:child.end_byte].decode("utf-8", errors="replace")
+                return ("direct", first_text)
+            if t in ("field_expression", "scoped_identifier", "qualified_name",
+                     "navigation_expression", "member_expression",
+                     "method_index_expression", "dot_index_expression",
+                     "field_access", "scope_resolution",
+                     "member_access_expression"):
+                # qualified call obj.method or obj::method
+                txt = source[child.start_byte:child.end_byte].decode("utf-8", errors="replace")
+                # normalize :: and : separators to .
+                norm = txt.replace("::", ".").replace(":", ".")
+                # strip any whitespace
+                norm = norm.strip()
+                if "." in norm:
+                    return ("attr", norm)
+                return ("direct", norm)
+        # Fallback: walk descendants for first identifier-like
+        for child in call_node.children:
+            for sub in child.children:
+                if sub.type in name_child_types:
+                    first_text = source[sub.start_byte:sub.end_byte].decode("utf-8", errors="replace")
+                    return ("direct", first_text)
+        return None
+
+    def extract_calls_in(body_node) -> list[tuple[str, str]]:
+        calls = []
+
+        def visit(node):
+            if node.type in call_node_types:
+                t = extract_call_target(node)
+                if t:
+                    calls.append(t)
+            for child in node.children:
+                visit(child)
+
+        visit(body_node)
+        return calls
+
+    # Pass 1: collect all top-level definitions so forward references resolve to "intra".
+    def collect_defs(node):
+        if node.type in def_node_types:
+            n = find_name(node)
+            if n:
+                defined_names.add(n)
+        for child in node.children:
+            collect_defs(child)
+
+    collect_defs(tree.root_node)
+
+    # Pass 2: classify calls against the complete defined_names set.
+    def visit_all(node):
+        if node.type in def_node_types:
+            n = find_name(node)
+            if n:
+                calls = extract_calls_in(node)
+                resolved = []
+                for ctype, target in calls:
+                    if ctype == "direct" and target in defined_names and target != n:
+                        resolved.append(("intra", target))
+                    elif ctype == "direct" and target == n:
+                        # skip self-name occurrence which is the declarator's own identifier
+                        pass
+                    else:
+                        resolved.append((ctype, target))
+                calls_by_func[n] = resolved
+        for child in node.children:
+            visit_all(child)
+
+    visit_all(tree.root_node)
+    return defined_names, calls_by_func
+
+
+def _build_generic_call_graph(
+    root: Path,
+    graph: ProjectCallGraph,
+    language: str,
+    parser_factory,
+    available_flag: bool,
+    def_node_types: set,
+    workspace_config: Optional[WorkspaceConfig] = None,
+    name_child_types: set = frozenset({"identifier", "simple_identifier"}),
+    call_node_types: set = frozenset({"call", "call_expression", "function_call"}),
+):
+    """Generic builder used by Ruby/Kotlin/C#/Lua/Luau/Scala/C++."""
+    if not available_flag:
+        return
+
+    parser = parser_factory()
+
+    # Pass 1: walk all files, collect (file, defined_names, calls_by_func)
+    per_file: list[tuple[str, set, dict]] = []
+    global_defs: dict[str, str] = {}  # bare name -> rel_path
+
+    for src_file in scan_project(root, language, workspace_config):
+        src_path = Path(src_file)
+        rel_path = str(src_path.relative_to(root))
+        defs, calls_by_func = _generic_extract(
+            src_path, parser, def_node_types,
+            name_child_types=name_child_types,
+            call_node_types=call_node_types,
+        )
+        per_file.append((rel_path, defs, calls_by_func))
+        for name in defs:
+            global_defs.setdefault(name, rel_path)
+
+    # Pass 2: emit edges
+    for rel_path, defs, calls_by_func in per_file:
+        for caller_func, calls in calls_by_func.items():
+            for call_type, target in calls:
+                if call_type == "intra":
+                    graph.add_edge(rel_path, caller_func, rel_path, target)
+                elif call_type == "direct":
+                    if target in defs:
+                        graph.add_edge(rel_path, caller_func, rel_path, target)
+                    elif target in global_defs:
+                        graph.add_edge(rel_path, caller_func, global_defs[target], target)
+                elif call_type == "attr":
+                    # target is "a.b.c"; try last segment as method name
+                    parts = target.split(".")
+                    method = parts[-1]
+                    if method in defs:
+                        graph.add_edge(rel_path, caller_func, rel_path, method)
+                    elif method in global_defs:
+                        graph.add_edge(rel_path, caller_func, global_defs[method], method)
+
+
+def _extract_elixir_module_name(call_node, source: bytes):
+    """Extract the module name from an Elixir defmodule call node."""
+    for child in call_node.children:
+        if child.type == "arguments":
+            for arg_child in child.children:
+                if arg_child.is_named and arg_child.type == "alias":
+                    return source[arg_child.start_byte:arg_child.end_byte].decode("utf-8", errors="replace")
+    return None
+
+
+def _extract_elixir_func_name(call_node, source: bytes):
+    """Extract the function name from an Elixir def/defp call node."""
+    for child in call_node.children:
+        if child.type == "arguments":
+            for arg_child in child.children:
+                if arg_child.type == "call":
+                    for cc in arg_child.children:
+                        if cc.type == "identifier":
+                            return source[cc.start_byte:cc.end_byte].decode("utf-8", errors="replace")
+                elif arg_child.type == "identifier":
+                    return source[arg_child.start_byte:arg_child.end_byte].decode("utf-8", errors="replace")
+                elif arg_child.type == "binary_operator":
+                    for cc in arg_child.children:
+                        if cc.type == "identifier":
+                            return source[cc.start_byte:cc.end_byte].decode("utf-8", errors="replace")
+                        if cc.type == "call":
+                            for ccc in cc.children:
+                                if ccc.type == "identifier":
+                                    return source[ccc.start_byte:ccc.end_byte].decode("utf-8", errors="replace")
+    return None
+
+
+# -----------------------------------------------------------------------------
+# Elixir builder — simplified self-contained version.
+# Handles defmodule + def/defp; resolves Module.func() qualified calls by
+# bare name across the project.
+# -----------------------------------------------------------------------------
+
+def _extract_elixir_file_calls(file_path: Path, root: Path, parser=None) -> tuple[dict[str, set], dict[str, list[tuple[str, str]]]]:
+    """Returns ({module_name: set(defined_funcs)}, {caller_key: [(call_type, target)]}).
+
+    Single-pass implementation: collects definitions and extracts calls in one
+    tree walk. Note: calls within a function can only reference functions defined
+    earlier in the same module in this pass (forward references within a module
+    are classified as 'local' rather than 'intra').
+    """
+    if not TREE_SITTER_ELIXIR_AVAILABLE:
+        return {}, {}
+
+    try:
+        source = file_path.read_bytes()
+        if parser is None:
+            parser = _get_elixir_parser()
+        tree = parser.parse(source)
+    except (FileNotFoundError, Exception):
+        return {}, {}
+
+    defined: dict[str, set] = {}  # module fqn -> set of func names
+    calls_by_func: dict[str, list[tuple[str, str]]] = {}
+
+    def call_ident(node):
+        for child in node.children:
+            if child.type == "identifier":
+                return source[child.start_byte:child.end_byte].decode("utf-8", errors="replace")
+        return None
+
+    def extract_body_calls(body_node, local_defs: set) -> list[tuple[str, str]]:
+        calls: list[tuple[str, str]] = []
+        skip_keywords = {"def", "defp", "defmodule", "alias", "import", "use", "require",
+                        "if", "unless", "case", "cond", "with", "for", "try",
+                        "raise", "throw", "quote", "unquote"}
+
+        def visit(node):
+            if node.type == "call":
+                dot_child = None
+                bare_ident = None
+                for child in node.children:
+                    if child.type == "dot":
+                        dot_child = child
+                    elif child.type == "identifier" and dot_child is None:
+                        bare_ident = child
+                if dot_child is not None:
+                    alias_text = None
+                    fname = None
+                    for dc in dot_child.children:
+                        if dc.type == "alias":
+                            alias_text = source[dc.start_byte:dc.end_byte].decode("utf-8", errors="replace")
+                        elif dc.type == "identifier":
+                            fname = source[dc.start_byte:dc.end_byte].decode("utf-8", errors="replace")
+                    if alias_text and fname:
+                        calls.append(("qualified", f"{alias_text}.{fname}"))
+                elif bare_ident is not None:
+                    fname = source[bare_ident.start_byte:bare_ident.end_byte].decode("utf-8", errors="replace")
+                    if fname not in skip_keywords:
+                        if fname in local_defs:
+                            calls.append(("intra", fname))
+                        else:
+                            calls.append(("local", fname))
+            for child in node.children:
+                visit(child)
+
+        visit(body_node)
+        return calls
+
+    current_module = None
+
+    def visit_all(node):
+        nonlocal current_module
+        if node.type == "call":
+            ident = call_ident(node)
+            if ident == "defmodule":
+                modname = _extract_elixir_module_name(node, source)
+                if modname:
+                    fqn = f"{current_module}.{modname}" if current_module else modname
+                    defined.setdefault(fqn, set())
+                    old = current_module
+                    current_module = fqn
+                    for child in node.children:
+                        if child.type == "do_block":
+                            for dc in child.children:
+                                visit_all(dc)
+                    current_module = old
+                    return
+            if ident in ("def", "defp"):
+                fname = _extract_elixir_func_name(node, source)
+                if fname and current_module:
+                    defined.setdefault(current_module, set()).add(fname)
+                    key = f"{current_module}.{fname}"
+                    local = defined.get(current_module, set())
+                    for child in node.children:
+                        if child.type == "do_block":
+                            calls_by_func.setdefault(key, []).extend(extract_body_calls(child, local))
+                    return
+        for child in node.children:
+            visit_all(child)
+
+    visit_all(tree.root_node)
+    return defined, calls_by_func
+
+
+def _build_elixir_call_graph(
+    root: Path,
+    graph: ProjectCallGraph,
+    workspace_config: Optional[WorkspaceConfig] = None,
+):
+    """Build call graph for Elixir files (self-contained, no func_index dependency)."""
+    if not TREE_SITTER_ELIXIR_AVAILABLE:
+        return
+
+    parser = _get_elixir_parser()  # Create once; reuse across all files
+
+    # Pass 1: collect per-file defs + calls, build global module->file map
+    per_file: list[tuple[str, dict, dict]] = []
+    module_to_file: dict[str, str] = {}  # full module fqn -> rel_path
+    module_funcs: dict[str, set] = {}  # full module fqn -> defined funcs
+
+    for ex_file in scan_project(root, "elixir", workspace_config):
+        ex_path = Path(ex_file)
+        rel_path = str(ex_path.relative_to(root))
+        defined, calls_by_func = _extract_elixir_file_calls(ex_path, root, parser)
+        per_file.append((rel_path, defined, calls_by_func))
+        for mod_fqn, funcs in defined.items():
+            module_to_file.setdefault(mod_fqn, rel_path)
+            module_funcs.setdefault(mod_fqn, set()).update(funcs)
+
+    # Build alias lookup: last segment of a module name -> full fqn
+    last_segment_to_fqn: dict[str, str] = {}
+    for fqn in module_to_file:
+        last = fqn.rsplit(".", 1)[-1]
+        last_segment_to_fqn.setdefault(last, fqn)
+
+    # Pass 2: emit edges
+    for rel_path, defined, calls_by_func in per_file:
+        for caller_func, calls in calls_by_func.items():
+            # Caller's module fqn = caller_func minus last segment
+            caller_mod = caller_func.rsplit(".", 1)[0] if "." in caller_func else None
+            for call_type, target in calls:
+                if call_type == "intra":
+                    if caller_mod:
+                        graph.add_edge(rel_path, caller_func, rel_path, f"{caller_mod}.{target}")
+                    else:
+                        graph.add_edge(rel_path, caller_func, rel_path, target)
+                elif call_type == "qualified":
+                    mod_ref, fname = target.rsplit(".", 1)
+                    # Try to resolve mod_ref: direct fqn, or last-segment alias
+                    resolved_fqn = None
+                    if mod_ref in module_to_file:
+                        resolved_fqn = mod_ref
+                    elif mod_ref in last_segment_to_fqn:
+                        resolved_fqn = last_segment_to_fqn[mod_ref]
+                    if resolved_fqn and fname in module_funcs.get(resolved_fqn, set()):
+                        dst_file = module_to_file[resolved_fqn]
+                        graph.add_edge(rel_path, caller_func, dst_file, fname)
+
+
+# -----------------------------------------------------------------------------
+# Swift — simplified builder.
+# -----------------------------------------------------------------------------
+
+def _swift_func_name(node, source):
+    for child in node.children:
+        if child.type == "simple_identifier":
+            return source[child.start_byte:child.end_byte].decode("utf-8", errors="replace")
+    return None
+
+
+def _extract_swift_file_calls(file_path: Path, root: Path):
+    """Returns (defined_names: set, calls_by_func: dict[name, [(ctype, target)]])."""
+    if not TREE_SITTER_SWIFT_AVAILABLE:
+        return set(), {}
+
+    try:
+        source = file_path.read_bytes()
+        parser = _get_swift_parser()
+        tree = parser.parse(source)
+    except (FileNotFoundError, Exception):
+        return set(), {}
+
+    defined: set = set()
+    calls_by_func: dict[str, list[tuple[str, str]]] = {}
+
+    def collect_defs(node):
+        if node.type == "function_declaration":
+            n = _swift_func_name(node, source)
+            if n:
+                defined.add(n)
+        for child in node.children:
+            collect_defs(child)
+
+    collect_defs(tree.root_node)
+
+    def extract_call(call_node):
+        for child in call_node.children:
+            if child.type == "simple_identifier":
+                return ("bare", source[child.start_byte:child.end_byte].decode("utf-8", errors="replace"))
+            if child.type == "navigation_expression":
+                receiver = None
+                method = None
+                for sub in child.children:
+                    if sub.type == "simple_identifier" and receiver is None:
+                        receiver = source[sub.start_byte:sub.end_byte].decode("utf-8", errors="replace")
+                    elif sub.type == "navigation_suffix":
+                        for ns in sub.children:
+                            if ns.type == "simple_identifier":
+                                method = source[ns.start_byte:ns.end_byte].decode("utf-8", errors="replace")
+                if method:
+                    return ("attr", f"{receiver}.{method}" if receiver else method)
+        return None
+
+    def extract_calls_in(func_node) -> list[tuple[str, str]]:
+        calls = []
+
+        def visit(node):
+            if node.type == "function_declaration" and node is not func_node:
+                return
+            if node.type == "call_expression":
+                r = extract_call(node)
+                if r:
+                    kind, target = r
+                    if kind == "bare":
+                        if target in defined:
+                            calls.append(("intra", target))
+                        else:
+                            calls.append(("direct", target))
+                    else:
+                        calls.append(("attr", target))
+            for child in node.children:
+                visit(child)
+
+        visit(func_node)
+        return calls
+
+    def process(node):
+        if node.type == "function_declaration":
+            n = _swift_func_name(node, source)
+            if n:
+                calls_by_func[n] = extract_calls_in(node)
+        for child in node.children:
+            process(child)
+
+    process(tree.root_node)
+    return defined, calls_by_func
+
+
+def _build_swift_call_graph(
+    root: Path,
+    graph: ProjectCallGraph,
+    workspace_config: Optional[WorkspaceConfig] = None,
+):
+    """Build call graph for Swift files."""
+    if not TREE_SITTER_SWIFT_AVAILABLE:
+        return
+    per_file: list[tuple[str, set, dict]] = []
+    global_defs: dict[str, str] = {}
+    for swift_file in scan_project(root, "swift", workspace_config):
+        sp = Path(swift_file)
+        rel = str(sp.relative_to(root))
+        defs, calls = _extract_swift_file_calls(sp, root)
+        per_file.append((rel, defs, calls))
+        for n in defs:
+            global_defs.setdefault(n, rel)
+    for rel, defs, calls in per_file:
+        for caller, call_list in calls.items():
+            for ctype, target in call_list:
+                if ctype == "intra":
+                    graph.add_edge(rel, caller, rel, target)
+                elif ctype == "direct":
+                    if target in global_defs:
+                        graph.add_edge(rel, caller, global_defs[target], target)
+                elif ctype == "attr":
+                    method = target.rsplit(".", 1)[-1]
+                    if method in defs:
+                        graph.add_edge(rel, caller, rel, method)
+                    elif method in global_defs:
+                        graph.add_edge(rel, caller, global_defs[method], method)
+
+
+# -----------------------------------------------------------------------------
+# Ruby
+# -----------------------------------------------------------------------------
+
+def _extract_ruby_file_calls(file_path: Path, parser):
+    """Ruby extractor. Bare `foo` inside a method body parses as identifier
+    (not a call node) in tree-sitter Ruby — we treat any identifier whose
+    text matches a globally-defined method name as a call. `obj.method`
+    parses as `call` with a receiver."""
+    try:
+        source = file_path.read_bytes()
+        tree = parser.parse(source)
+    except (FileNotFoundError, Exception):
+        return set(), {}
+
+    def get_text(node):
+        return source[node.start_byte:node.end_byte].decode("utf-8", errors="replace")
+
+    defined: set = set()
+
+    def find_method_name(node):
+        for child in node.children:
+            if child.type == "identifier":
+                return get_text(child)
+        return None
+
+    def collect_defs(node):
+        if node.type in ("method", "singleton_method"):
+            n = find_method_name(node)
+            if n:
+                defined.add(n)
+        for child in node.children:
+            collect_defs(child)
+
+    collect_defs(tree.root_node)
+
+    calls_by_func: dict[str, list[tuple[str, str]]] = {}
+
+    def extract_calls_in(method_node):
+        calls = []
+        method_name = find_method_name(method_node)
+
+        def visit(node):
+            if node.type in ("method", "singleton_method") and node is not method_node:
+                return
+            if node.type == "call":
+                # call has children: receiver, ".", method (identifier)
+                receiver = None
+                method = None
+                for child in node.children:
+                    if child.type == "identifier":
+                        if receiver is None and method is None:
+                            # could be receiver or bare method
+                            # if next child is '.' it's receiver
+                            method = get_text(child)
+                        else:
+                            method = get_text(child)
+                    elif child.type in ("constant", "self"):
+                        receiver = get_text(child)
+                if method:
+                    calls.append(("attr" if receiver else "direct", method))
+                return
+            if node.type == "identifier":
+                txt = get_text(node)
+                # Bare identifier in a method body — treat as potential call.
+                # Builder resolves against global defs; skip the method's own
+                # name to avoid emitting an edge for the declarator identifier.
+                if txt != method_name:
+                    calls.append(("direct", txt))
+            for child in node.children:
+                visit(child)
+
+        # Walk only the body_statement children
+        for child in method_node.children:
+            if child.type == "body_statement":
+                visit(child)
+        return calls
+
+    def process(node):
+        if node.type in ("method", "singleton_method"):
+            n = find_method_name(node)
+            if n:
+                calls_by_func[n] = extract_calls_in(node)
+        for child in node.children:
+            process(child)
+
+    process(tree.root_node)
+    return defined, calls_by_func
+
+
+def _build_ruby_call_graph(
+    root: Path,
+    graph: ProjectCallGraph,
+    workspace_config: Optional[WorkspaceConfig] = None,
+):
+    """Build call graph for Ruby files.
+
+    Note (G-9): require_relative path resolution is `current_file.parent /
+    resolved_path` (Ruby semantics), but the simplified bare-name resolution
+    we use here doesn't require explicit import resolution — method names are
+    matched globally across the project.
+    """
+    if not TREE_SITTER_RUBY_AVAILABLE:
+        return
+    parser = _get_ruby_parser()
+    per_file = []
+    global_defs: dict[str, str] = {}
+    for rb_file in scan_project(root, "ruby", workspace_config):
+        rp = Path(rb_file)
+        rel = str(rp.relative_to(root))
+        defs, calls = _extract_ruby_file_calls(rp, parser)
+        per_file.append((rel, defs, calls))
+        for n in defs:
+            global_defs.setdefault(n, rel)
+    for rel, defs, calls in per_file:
+        for caller, clist in calls.items():
+            for ctype, target in clist:
+                if ctype == "direct":
+                    if target in defs:
+                        graph.add_edge(rel, caller, rel, target)
+                    elif target in global_defs:
+                        graph.add_edge(rel, caller, global_defs[target], target)
+                elif ctype == "attr":
+                    if target in defs:
+                        graph.add_edge(rel, caller, rel, target)
+                    elif target in global_defs:
+                        graph.add_edge(rel, caller, global_defs[target], target)
+
+
+# -----------------------------------------------------------------------------
+# Kotlin
+# -----------------------------------------------------------------------------
+
+def _build_kotlin_call_graph(
+    root: Path,
+    graph: ProjectCallGraph,
+    workspace_config: Optional[WorkspaceConfig] = None,
+):
+    _build_generic_call_graph(
+        root, graph, "kotlin", _get_kotlin_parser, TREE_SITTER_KOTLIN_AVAILABLE,
+        def_node_types={"function_declaration", "secondary_constructor"},
+        workspace_config=workspace_config,
+        name_child_types={"simple_identifier", "identifier"},
+        call_node_types={"call_expression"},
+    )
+
+
+# -----------------------------------------------------------------------------
+# C# (csharp)
+# -----------------------------------------------------------------------------
+
+def _build_csharp_call_graph(
+    root: Path,
+    graph: ProjectCallGraph,
+    workspace_config: Optional[WorkspaceConfig] = None,
+):
+    """C# call graph. C# method names are matched by bare name (T-7 awareness:
+    partial classes and namespaces produce same-name collisions; bare-name
+    matching mirrors Java's approach)."""
+    _build_generic_call_graph(
+        root, graph, "csharp", _get_csharp_parser, TREE_SITTER_CSHARP_AVAILABLE,
+        def_node_types={"method_declaration", "constructor_declaration", "local_function_statement"},
+        workspace_config=workspace_config,
+        name_child_types={"identifier"},
+        call_node_types={"invocation_expression"},
+    )
+
+
+# -----------------------------------------------------------------------------
+# Lua  — handles function declarations and table-method calls (`obj:method`).
+# Colon calls are normalized to dot form for graph edges.
+# -----------------------------------------------------------------------------
+
+def _extract_lua_file_calls(file_path: Path, parser):
+    if parser is None:
+        return set(), {}
+    try:
+        source = file_path.read_bytes()
+        tree = parser.parse(source)
+    except (FileNotFoundError, Exception):
+        return set(), {}
+
+    defined: set = set()
+    calls_by_func: dict[str, list[tuple[str, str]]] = {}
+
+    def get_text(node):
+        return source[node.start_byte:node.end_byte].decode("utf-8", errors="replace")
+
+    def find_func_name(node):
+        # function_declaration / local_function: child is "identifier" or
+        # "dot_index_expression" (M.greet) or "method_index_expression"
+        # (M:greet). Return last segment.
+        for child in node.children:
+            if child.type == "identifier":
+                return get_text(child)
+            if child.type in ("dot_index_expression", "method_index_expression"):
+                # last identifier child
+                ids = [c for c in child.children if c.type == "identifier"]
+                if ids:
+                    return get_text(ids[-1])
+        return None
+
+    def collect_defs(node):
+        if node.type in ("function_declaration", "local_function"):
+            n = find_func_name(node)
+            if n:
+                defined.add(n)
+        for child in node.children:
+            collect_defs(child)
+
+    collect_defs(tree.root_node)
+
+    def extract_call_target(call_node):
+        # call has a single "prefix" child which may be: identifier,
+        # dot_index_expression, method_index_expression
+        for child in call_node.children:
+            if child.type == "identifier":
+                return ("direct", get_text(child))
+            if child.type in ("dot_index_expression", "method_index_expression"):
+                ids = [c for c in child.children if c.type == "identifier"]
+                if ids:
+                    method = get_text(ids[-1])
+                    return ("attr", method)
+        return None
+
+    def extract_calls_in(body_node):
+        calls = []
+
+        def visit(node):
+            if node.type in ("function_declaration", "local_function") and node is not body_node:
+                return
+            if node.type in ("function_call", "call"):
+                r = extract_call_target(node)
+                if r:
+                    ctype, target = r
+                    if ctype == "direct":
+                        if target in defined:
+                            calls.append(("intra", target))
+                        else:
+                            calls.append(("direct", target))
+                    else:
+                        calls.append(("attr", target))
+            for child in node.children:
+                visit(child)
+
+        visit(body_node)
+        return calls
+
+    def process(node):
+        if node.type in ("function_declaration", "local_function"):
+            n = find_func_name(node)
+            if n:
+                calls_by_func[n] = extract_calls_in(node)
+        for child in node.children:
+            process(child)
+
+    process(tree.root_node)
+    return defined, calls_by_func
+
+
+def _build_lua_call_graph(
+    root: Path,
+    graph: ProjectCallGraph,
+    workspace_config: Optional[WorkspaceConfig] = None,
+):
+    if not TREE_SITTER_LUA_AVAILABLE:
+        return
+    parser = _get_lua_parser()
+    per_file = []
+    global_defs: dict[str, str] = {}
+    for lua_file in scan_project(root, "lua", workspace_config):
+        lp = Path(lua_file)
+        rel = str(lp.relative_to(root))
+        defs, calls = _extract_lua_file_calls(lp, parser)
+        per_file.append((rel, defs, calls))
+        for n in defs:
+            global_defs.setdefault(n, rel)
+    for rel, defs, calls in per_file:
+        for caller, clist in calls.items():
+            for ctype, target in clist:
+                if ctype == "intra":
+                    graph.add_edge(rel, caller, rel, target)
+                elif ctype == "direct":
+                    if target in global_defs:
+                        graph.add_edge(rel, caller, global_defs[target], target)
+                elif ctype == "attr":
+                    method = target  # already last segment
+                    if method in defs:
+                        graph.add_edge(rel, caller, rel, method)
+                    elif method in global_defs:
+                        graph.add_edge(rel, caller, global_defs[method], method)
+
+
+# -----------------------------------------------------------------------------
+# Luau — duplicate of Lua per T-3 (horizontal slice; manual propagation).
+# Luau tree-sitter grammar is a superset of Lua; node names are typically
+# identical. If divergence surfaces, fix here independently of Lua.
+# -----------------------------------------------------------------------------
+
+def _build_luau_call_graph(
+    root: Path,
+    graph: ProjectCallGraph,
+    workspace_config: Optional[WorkspaceConfig] = None,
+):
+    if not TREE_SITTER_LUAU_AVAILABLE:
+        return
+    parser = _get_luau_parser()
+    per_file = []
+    global_defs: dict[str, str] = {}
+    for lua_file in scan_project(root, "luau", workspace_config):
+        lp = Path(lua_file)
+        rel = str(lp.relative_to(root))
+        defs, calls = _extract_lua_file_calls(lp, parser)  # same extractor
+        per_file.append((rel, defs, calls))
+        for n in defs:
+            global_defs.setdefault(n, rel)
+    for rel, defs, calls in per_file:
+        for caller, clist in calls.items():
+            for ctype, target in clist:
+                if ctype == "intra":
+                    graph.add_edge(rel, caller, rel, target)
+                elif ctype == "direct":
+                    if target in global_defs:
+                        graph.add_edge(rel, caller, global_defs[target], target)
+                elif ctype == "attr":
+                    method = target
+                    if method in defs:
+                        graph.add_edge(rel, caller, rel, method)
+                    elif method in global_defs:
+                        graph.add_edge(rel, caller, global_defs[method], method)
+
+
+# -----------------------------------------------------------------------------
+# Scala — objects/defs.  apply/implicit limits are name-only; matches Java's
+# name-only approach.
+# -----------------------------------------------------------------------------
+
+def _build_scala_call_graph(
+    root: Path,
+    graph: ProjectCallGraph,
+    workspace_config: Optional[WorkspaceConfig] = None,
+):
+    _build_generic_call_graph(
+        root, graph, "scala", _get_scala_parser, TREE_SITTER_SCALA_AVAILABLE,
+        def_node_types={"function_definition", "function_declaration"},
+        workspace_config=workspace_config,
+        name_child_types={"identifier"},
+        call_node_types={"call_expression"},
+    )
+
+
+# -----------------------------------------------------------------------------
+# C++ — T-6: store BOTH bare `func` AND dotted `ns.func` in defined_names;
+# normalize `::` to `.` in call targets so the join succeeds either way.
+# Namespace resolution is name-only; overloaded symbols may produce multiple
+# edges; dot-form canonical with bare-name fallback.
+# -----------------------------------------------------------------------------
+
+def _extract_cpp_file_calls(file_path: Path, parser=None):
+    if not TREE_SITTER_CPP_AVAILABLE:
+        return set(), {}
+    try:
+        source = file_path.read_bytes()
+        if parser is None:
+            parser = _get_cpp_parser()
+        tree = parser.parse(source)
+    except (FileNotFoundError, Exception):
+        return set(), {}
+
+    defined: set = set()
+    calls_by_func: dict[str, list[tuple[str, str]]] = {}
+
+    def get_text(node):
+        return source[node.start_byte:node.end_byte].decode("utf-8", errors="replace")
+
+    current_ns: list[str] = []
+
+    def function_name_from_declarator(declarator):
+        """Walk declarator to find function name. Returns (bare_name, qualified_name_or_None)."""
+        # Common shapes:
+        #   function_declarator -> identifier or qualified_identifier
+        node = declarator
+        while node is not None:
+            if node.type == "identifier":
+                return get_text(node), None
+            if node.type == "qualified_identifier":
+                # contains namespace_identifier and identifier (last segment)
+                txt = get_text(node).replace("::", ".")
+                last = txt.rsplit(".", 1)[-1]
+                return last, txt
+            if node.type == "function_declarator":
+                # find child declarator
+                next_node = None
+                for child in node.children:
+                    if child.type in ("identifier", "qualified_identifier", "function_declarator"):
+                        next_node = child
+                        break
+                node = next_node
+                continue
+            # try first named child
+            named = [c for c in node.children if c.is_named]
+            if not named:
+                return None, None
+            node = named[0]
+        return None, None
+
+    def extract_call_target(call_node):
+        for child in call_node.children:
+            if child.type == "identifier":
+                return ("direct", get_text(child))
+            if child.type == "qualified_identifier":
+                txt = get_text(child).replace("::", ".")
+                return ("attr", txt)
+            if child.type == "field_expression":
+                txt = get_text(child)
+                norm = txt.replace("->", ".")
+                return ("attr", norm)
+        return None
+
+    def extract_calls_in(body_node):
+        calls = []
+
+        def visit(node):
+            if node.type == "function_definition" and node is not body_node:
+                return
+            if node.type == "call_expression":
+                r = extract_call_target(node)
+                if r:
+                    ctype, target = r
+                    if ctype == "direct":
+                        if target in defined:
+                            calls.append(("intra", target))
+                        else:
+                            calls.append(("direct", target))
+                    else:
+                        # T-6: target is already dot-normalized
+                        calls.append(("attr", target))
+            for child in node.children:
+                visit(child)
+
+        visit(body_node)
+        return calls
+
+    def visit_all(node):
+        nonlocal current_ns
+        if node.type == "namespace_definition":
+            name = None
+            for child in node.children:
+                if child.type == "namespace_identifier":
+                    name = get_text(child)
+                    break
+            old = current_ns
+            if name:
+                current_ns = current_ns + [name]
+            for child in node.children:
+                visit_all(child)
+            current_ns = old
+            return
+        if node.type == "function_definition":
+            for child in node.children:
+                if child.type == "function_declarator":
+                    bare, qualified = function_name_from_declarator(child)
+                    if bare:
+                        defined.add(bare)
+                        if qualified:
+                            defined.add(qualified)
+                        elif current_ns:
+                            defined.add(".".join(current_ns + [bare]))
+                        key = qualified if qualified else (".".join(current_ns + [bare]) if current_ns else bare)
+                        calls_by_func[key] = extract_calls_in(node)
+                    break
+        for child in node.children:
+            visit_all(child)
+
+    visit_all(tree.root_node)
+    return defined, calls_by_func
+
+
+def _build_cpp_call_graph(
+    root: Path,
+    graph: ProjectCallGraph,
+    workspace_config: Optional[WorkspaceConfig] = None,
+):
+    if not TREE_SITTER_CPP_AVAILABLE:
+        return
+    parser = _get_cpp_parser()  # Create once; reuse across all files
+    per_file = []
+    global_defs: dict[str, str] = {}
+    for cpp_file in scan_project(root, "cpp", workspace_config):
+        cp = Path(cpp_file)
+        rel = str(cp.relative_to(root))
+        defs, calls = _extract_cpp_file_calls(cp, parser)
+        per_file.append((rel, defs, calls))
+        for n in defs:
+            global_defs.setdefault(n, rel)
+    for rel, defs, calls in per_file:
+        for caller, clist in calls.items():
+            for ctype, target in clist:
+                if ctype == "intra":
+                    graph.add_edge(rel, caller, rel, target)
+                elif ctype == "direct":
+                    # try dot-form match first (T-6), then bare
+                    if target in global_defs:
+                        graph.add_edge(rel, caller, global_defs[target], target)
+                elif ctype == "attr":
+                    # target is dot-canonical "ns.func"
+                    if target in global_defs:
+                        graph.add_edge(rel, caller, global_defs[target], target)
+                    else:
+                        # bare-name fallback
+                        bare = target.rsplit(".", 1)[-1]
+                        if bare in global_defs:
+                            graph.add_edge(rel, caller, global_defs[bare], bare)

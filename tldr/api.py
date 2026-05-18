@@ -454,7 +454,17 @@ def _get_module_exports(
         "python": ".py",
         "typescript": ".ts",
         "go": ".go",
-        "rust": ".rs"
+        "rust": ".rs",
+        "c": ".c",
+        "elixir": ".ex",
+        "swift": ".swift",
+        "ruby": ".rb",
+        "kotlin": ".kt",
+        "csharp": ".cs",
+        "lua": ".lua",
+        "luau": ".luau",
+        "scala": ".scala",
+        "cpp": ".cpp"
     }
     ext = ext_map.get(language, ".py")
 
@@ -573,7 +583,17 @@ def get_relevant_context(
         "python": {".py"},
         "typescript": {".ts", ".tsx"},
         "go": {".go"},
-        "rust": {".rs"}
+        "rust": {".rs"},
+        "c": {".c", ".h"},
+        "elixir": {".ex", ".exs"},
+        "swift": {".swift"},
+        "ruby": {".rb"},
+        "kotlin": {".kt", ".kts"},
+        "csharp": {".cs"},
+        "lua": {".lua"},
+        "luau": {".luau"},
+        "scala": {".scala", ".sc"},
+        "cpp": {".cpp", ".cc", ".cxx", ".hpp", ".h"}
     }
     extensions = ext_map.get(language, {".py"})
 
