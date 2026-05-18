@@ -4052,6 +4052,11 @@ def _generic_extract(
                 if t:
                     calls.append(t)
             for child in node.children:
+                # Don't descend into nested definitions — visit_all walks them
+                # separately, and attributing their calls to the outer function
+                # would double-count.
+                if child.type in def_node_types:
+                    continue
                 visit(child)
 
         visit(body_node)
@@ -4335,7 +4340,7 @@ def _build_elixir_call_graph(
                         resolved_fqn = last_segment_to_fqn[mod_ref]
                     if resolved_fqn and fname in module_funcs.get(resolved_fqn, set()):
                         dst_file = module_to_file[resolved_fqn]
-                        graph.add_edge(rel_path, caller_func, dst_file, fname)
+                        graph.add_edge(rel_path, caller_func, dst_file, f"{resolved_fqn}.{fname}")
                 elif call_type == "local":
                     # Bare same-file call: only emit when target is a function
                     # in the caller's module — avoids fake edges for imports/builtins.
@@ -4531,8 +4536,11 @@ def _extract_ruby_file_calls(file_path: Path, parser):
                 txt = get_text(node)
                 # Bare identifier in a method body — treat as potential call.
                 # Builder resolves against global defs; skip the method's own
-                # name to avoid emitting an edge for the declarator identifier.
-                if txt != method_name:
+                # name and identifiers used as parameter names (false positives).
+                parent_type = node.parent.type if node.parent is not None else ""
+                if txt != method_name and parent_type not in (
+                    "method_parameters", "block_parameters", "lambda_parameters",
+                ):
                     calls.append(("direct", txt))
             for child in node.children:
                 visit(child)
