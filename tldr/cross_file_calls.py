@@ -4536,10 +4536,19 @@ def _extract_ruby_file_calls(file_path: Path, parser):
                 txt = get_text(node)
                 # Bare identifier in a method body — treat as potential call.
                 # Builder resolves against global defs; skip the method's own
-                # name and identifiers used as parameter names (false positives).
-                parent_type = node.parent.type if node.parent is not None else ""
-                if txt != method_name and parent_type not in (
-                    "method_parameters", "block_parameters", "lambda_parameters",
+                # name, parameter names, and assignment LHS (false positives).
+                parent = node.parent
+                parent_type = parent.type if parent is not None else ""
+                is_lhs = (
+                    parent_type in ("assignment", "operator_assignment")
+                    and parent.child_by_field_name("left") is node
+                ) or parent_type == "left_assignment_list"
+                if (
+                    txt != method_name
+                    and parent_type not in (
+                        "method_parameters", "block_parameters", "lambda_parameters",
+                    )
+                    and not is_lhs
                 ):
                     calls.append(("direct", txt))
             for child in node.children:
