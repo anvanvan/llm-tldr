@@ -4590,12 +4590,7 @@ def _build_ruby_call_graph(
     for rel, defs, calls in per_file:
         for caller, clist in calls.items():
             for ctype, target in clist:
-                if ctype == "direct":
-                    if target in defs:
-                        graph.add_edge(rel, caller, rel, target)
-                    elif target in global_defs:
-                        graph.add_edge(rel, caller, global_defs[target], target)
-                elif ctype == "attr":
+                if ctype in ("direct", "attr"):
                     if target in defs:
                         graph.add_edge(rel, caller, rel, target)
                     elif target in global_defs:
