@@ -276,7 +276,7 @@ The bug is obvious. Line 28 uses `user` without going through the null check pat
 
 ## Supported Languages
 
-Python, TypeScript, JavaScript, Go, Rust, Java, C, C++, Ruby, PHP, C#, Kotlin, Scala, Swift, Lua, Elixir
+Python, TypeScript, JavaScript, Go, Rust, Java, C, C++, Ruby, PHP, C#, Kotlin, Scala, Swift, Lua, Luau, Elixir
 
 Language is auto-detected or specify with `--lang`.
 

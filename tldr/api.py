@@ -479,6 +479,16 @@ def _get_module_exports(
         "rust": [".rs"],
         "php": [".php"],
         "java": [".java"],
+        "c": [".c", ".h"],
+        "elixir": [".ex", ".exs"],
+        "swift": [".swift"],
+        "ruby": [".rb"],
+        "kotlin": [".kt", ".kts"],
+        "csharp": [".cs"],
+        "lua": [".lua"],
+        "luau": [".luau"],
+        "scala": [".scala", ".sc"],
+        "cpp": [".cpp", ".cc", ".cxx", ".hpp", ".hh", ".hxx"],
     }
     extensions = ext_map.get(language, [".py"])
 
@@ -590,7 +600,26 @@ def get_relevant_context(
     extractor = HybridExtractor()
     signatures: dict[str, tuple[str, FunctionInfo]] = {}  # func_name -> (file, info)
 
-    extensions = SUPPORTED_CONTEXT_EXT_MAP.get(language, {".py"})
+    ext_map = {
+        "python": {".py"},
+        "typescript": {".ts", ".tsx"},
+        "javascript": {".js", ".jsx", ".mjs", ".cjs"},
+        "go": {".go"},
+        "rust": {".rs"},
+        "php": {".php"},
+        "java": {".java"},
+        "c": {".c", ".h"},
+        "elixir": {".ex", ".exs"},
+        "swift": {".swift"},
+        "ruby": {".rb"},
+        "kotlin": {".kt", ".kts"},
+        "csharp": {".cs"},
+        "lua": {".lua"},
+        "luau": {".luau"},
+        "scala": {".scala", ".sc"},
+        "cpp": {".cpp", ".cc", ".cxx", ".hpp", ".hh", ".hxx"},
+    }
+    extensions = ext_map.get(language, {".py"})
 
     # Also cache file sources for CFG extraction
     file_sources: dict[str, str] = {}
@@ -663,6 +692,7 @@ def get_relevant_context(
         "lua": extract_lua_cfg,
         "luau": extract_luau_cfg,
         "elixir": extract_elixir_cfg,
+        "cpp": extract_cpp_cfg,
     }
     cfg_extractor_fn = cfg_extractors.get(language, extract_python_cfg)
 
