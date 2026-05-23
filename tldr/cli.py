@@ -59,7 +59,14 @@ def detect_language_from_extension(file_path: str) -> str:
         Language name (defaults to 'python' if unknown)
     """
     ext = Path(file_path).suffix.lower()
-    return EXTENSION_TO_LANGUAGE.get(ext, 'python')
+    tag = EXTENSION_TO_LANGUAGE.get(ext, 'python')
+    # R-2: Bug-004 expanded EXTENSION_TO_LANGUAGE with non-code tags
+    # ('shell', 'markdown', 'toml', ...). Callers feed this result to CFG/DFG/
+    # slice extractors which only understand ALL_LANGUAGES members. Filter
+    # non-code tags back to 'python' to restore the pre-fix fallback contract.
+    if tag not in ALL_LANGUAGES:
+        return 'python'
+    return tag
 
 
 def _show_first_run_tip():
