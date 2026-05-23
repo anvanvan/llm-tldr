@@ -142,18 +142,74 @@ CALL_GRAPH_LANGUAGES: frozenset[str] = frozenset(
 
 @dataclass
 class ProjectCallGraph:
-    """Cross-file call graph with edges as (src_file, src_func, dst_file, dst_func)."""
+    """Cross-file call graph with edges as (src_file, src_func, dst_file, dst_func).
+
+    Optionally carries a side-table mapping each edge to a 1-indexed source line
+    number of the call site (the line in src_file where src_func calls dst_func).
+    Populated only by builders that capture line info (currently the Ruby
+    builder for top-level call sites — bug 006). Other builders that
+    do not record lines leave the table empty; ``lines_for_edge`` then returns
+    ``None`` for those edges and downstream code (analysis._build_caller_tree)
+    omits the ``line`` key. This keeps the change backward-compatible.
+    """
 
     _edges: set[tuple[str, str, str, str]] = field(default_factory=set)
+    _edge_lines: dict[tuple[str, str, str, str], int] = field(default_factory=dict)
+    # Side-channel for "orphan" defined functions — those defined in the
+    # project but never participating in any real call edge. Tracked here
+    # (instead of via synthetic sentinel edges) so downstream consumers
+    # (impact_analysis, architecture_analysis, `tldr calls` JSON dump) do
+    # not see fake symbols. Populated by language builders (currently Ruby).
+    _orphan_funcs: set[tuple[str, str]] = field(default_factory=set)
 
     def add_edge(self, src_file: str, src_func: str, dst_file: str, dst_func: str):
         """Add a call edge from src_file:src_func to dst_file:dst_func."""
         self._edges.add((src_file, src_func, dst_file, dst_func))
 
+    def register_orphan_func(self, file: str, func: str) -> None:
+        """Register a defined function that has no callers or outbound edges.
+
+        Used by language builders to flag entry-point-like top-level defs so
+        impact_analysis can return a valid (zero-caller) result for them
+        rather than 'not found'. Stored separately from edges so analyses
+        that iterate over edges (architecture, `tldr calls` JSON) do not
+        observe synthetic symbols.
+        """
+        self._orphan_funcs.add((file, func))
+
+    @property
+    def orphan_funcs(self) -> set[tuple[str, str]]:
+        """Defined funcs with no real edges (file, func) — see register_orphan_func."""
+        return self._orphan_funcs
+
+    def add_edge_with_line(
+        self,
+        src_file: str,
+        src_func: str,
+        dst_file: str,
+        dst_func: str,
+        line: int | None,
+    ):
+        """Add a call edge and record the 1-indexed source line of the call site.
+
+        ``line`` may be ``None`` (no line info available); in that case behaves
+        like ``add_edge``. First recorded line wins for any given edge tuple.
+        """
+        edge = (src_file, src_func, dst_file, dst_func)
+        self._edges.add(edge)
+        if line is not None:
+            self._edge_lines.setdefault(edge, line)
+
     @property
     def edges(self) -> set[tuple[str, str, str, str]]:
         """Return all edges as a set of tuples."""
         return self._edges
+
+    def lines_for_edge(
+        self, edge: tuple[str, str, str, str]
+    ) -> int | None:
+        """Return the recorded 1-indexed call-site line for an edge, or None."""
+        return self._edge_lines.get(edge)
 
     def __contains__(self, edge: tuple[str, str, str, str]) -> bool:
         """Check if an edge exists in the graph."""
@@ -5060,58 +5116,81 @@ def _extract_ruby_file_calls(file_path: Path, parser):
 
     collect_defs(tree.root_node)
 
-    calls_by_func: dict[str, list[tuple[str, str]]] = {}
+    # Call entries are 3-tuples (ctype, target, line) where ``line`` is the
+    # 1-indexed source line of the call site (tree-sitter's start_point.row is
+    # 0-indexed, so we add 1).
+    calls_by_func: dict[str, list[tuple[str, str, int]]] = {}
+
+    def _walk_ruby_calls(node, calls_out, skip_def_types=(), exclude_name=None):
+        """Walk a subtree and append (ctype, target, line) call entries.
+
+        Args:
+            node: Tree-sitter node to walk.
+            calls_out: List to which extracted call entries are appended.
+            skip_def_types: Node types whose subtrees are skipped entirely
+                (e.g. ``("method", "class")`` for top-level scans).
+            exclude_name: Bare identifier name to ignore (used to skip a
+                method's own name inside its body).
+        """
+        if node.type in skip_def_types:
+            return
+        if node.type == "call":
+            # call has children: receiver, ".", method (identifier)
+            receiver = None
+            method = None
+            for child in node.children:
+                if child.type == "identifier":
+                    if receiver is None and method is None:
+                        # could be receiver or bare method
+                        # if next child is '.' it's receiver
+                        method = get_text(child)
+                    else:
+                        method = get_text(child)
+                elif child.type in ("constant", "self"):
+                    receiver = get_text(child)
+            if method:
+                calls_out.append((
+                    "attr" if receiver else "direct",
+                    method,
+                    node.start_point[0] + 1,
+                ))
+            return
+        if node.type == "identifier":
+            txt = get_text(node)
+            # Bare identifier — treat as potential call.
+            # Builder resolves against global defs; skip the method's own
+            # name (exclude_name), parameter names, and assignment LHS
+            # (false positives).
+            parent = node.parent
+            parent_type = parent.type if parent is not None else ""
+            is_lhs = (
+                parent_type in ("assignment", "operator_assignment")
+                and parent.child_by_field_name("left") is node
+            ) or parent_type == "left_assignment_list"
+            if (
+                txt != exclude_name
+                and parent_type not in (
+                    "method_parameters", "block_parameters", "lambda_parameters",
+                )
+                and not is_lhs
+            ):
+                calls_out.append(("direct", txt, node.start_point[0] + 1))
+        for child in node.children:
+            _walk_ruby_calls(child, calls_out, skip_def_types, exclude_name)
 
     def extract_calls_in(method_node):
         calls = []
         method_name = find_method_name(method_node)
-
-        def visit(node):
-            if node.type in ("method", "singleton_method") and node is not method_node:
-                return
-            if node.type == "call":
-                # call has children: receiver, ".", method (identifier)
-                receiver = None
-                method = None
-                for child in node.children:
-                    if child.type == "identifier":
-                        if receiver is None and method is None:
-                            # could be receiver or bare method
-                            # if next child is '.' it's receiver
-                            method = get_text(child)
-                        else:
-                            method = get_text(child)
-                    elif child.type in ("constant", "self"):
-                        receiver = get_text(child)
-                if method:
-                    calls.append(("attr" if receiver else "direct", method))
-                return
-            if node.type == "identifier":
-                txt = get_text(node)
-                # Bare identifier in a method body — treat as potential call.
-                # Builder resolves against global defs; skip the method's own
-                # name, parameter names, and assignment LHS (false positives).
-                parent = node.parent
-                parent_type = parent.type if parent is not None else ""
-                is_lhs = (
-                    parent_type in ("assignment", "operator_assignment")
-                    and parent.child_by_field_name("left") is node
-                ) or parent_type == "left_assignment_list"
-                if (
-                    txt != method_name
-                    and parent_type not in (
-                        "method_parameters", "block_parameters", "lambda_parameters",
-                    )
-                    and not is_lhs
-                ):
-                    calls.append(("direct", txt))
-            for child in node.children:
-                visit(child)
-
-        # Walk only the body_statement children
+        # Walk only the body_statement children; skip nested defs other than
+        # the method node itself (handled by the type guard inside the walker).
         for child in method_node.children:
             if child.type == "body_statement":
-                visit(child)
+                _walk_ruby_calls(
+                    child,
+                    calls,
+                    skip_def_types=("method", "singleton_method"),
+                    exclude_name=method_name,
+                )
         return calls
 
     def process(node):
@@ -5123,6 +5202,29 @@ def _extract_ruby_file_calls(file_path: Path, parser):
             process(child)
 
     process(tree.root_node)
+
+    # Program-scope (top-level) call sites: any `call` / bare-`identifier`
+    # that lives directly under `program` (or inside a non-def container at
+    # top level — e.g. an `if`/`begin` block) needs a caller bucket too, or
+    # the edge-emission loop in `_build_ruby_call_graph` can never attribute
+    # it. We synthesise a "<top-level>" bucket per file holding these targets;
+    # nested `method`/`singleton_method`/`class`/`module` subtrees are
+    # skipped (they already get their own buckets via `process` above —
+    # avoiding the double-counting that commit c4fa922 was about).
+    toplevel_calls: list[tuple[str, str, int]] = []
+
+    def visit_toplevel(node):
+        _walk_ruby_calls(
+            node,
+            toplevel_calls,
+            skip_def_types=("method", "singleton_method", "class", "module"),
+        )
+
+    for child in tree.root_node.children:
+        visit_toplevel(child)
+    if toplevel_calls:
+        calls_by_func["<top-level>"] = toplevel_calls
+
     return defined, calls_by_func
 
 
@@ -5150,14 +5252,51 @@ def _build_ruby_call_graph(
         per_file.append((rel, defs, calls))
         for n in defs:
             global_defs.setdefault(n, rel)
+    # Track which defined functions participate in any real edge.  Defs that
+    # never appear (no callers, no resolvable outbound calls) are "orphan
+    # top-level defs" — impact_analysis (which only consults graph.edges)
+    # would otherwise return a "not found" error for them.  We record these
+    # in a side-channel (`graph._orphan_funcs`) so impact_analysis can
+    # surface them as zero-caller entry points WITHOUT polluting `edges`
+    # with synthetic symbols (which previously leaked into `tldr calls`
+    # JSON and architecture_analysis output).
+    referenced: set[tuple[str, str]] = set()
     for rel, defs, calls in per_file:
         for caller, clist in calls.items():
-            for ctype, target in clist:
+            for entry in clist:
+                # Tolerate legacy 2-tuples for forward-compat with any caller
+                # that monkey-patches this extractor; production code now emits
+                # 3-tuples (ctype, target, line).
+                if len(entry) == 3:
+                    ctype, target, line = entry
+                else:
+                    ctype, target = entry  # type: ignore[misc]
+                    line = None
                 if ctype in ("direct", "attr"):
                     if target in defs:
-                        graph.add_edge(rel, caller, rel, target)
+                        graph.add_edge_with_line(rel, caller, rel, target, line)
+                        # Mark both caller (if it's a real def) and callee as
+                        # referenced so a caller-only def is not double-counted
+                        # as an orphan. Caller "<top-level>" is synthetic and
+                        # is never in `defs`, so the `caller in defs` guard
+                        # naturally excludes it.
+                        if caller in defs:
+                            referenced.add((rel, caller))
+                        referenced.add((rel, target))
                     elif target in global_defs:
-                        graph.add_edge(rel, caller, global_defs[target], target)
+                        graph.add_edge_with_line(
+                            rel, caller, global_defs[target], target, line
+                        )
+                        if caller in defs:
+                            referenced.add((rel, caller))
+                        referenced.add((global_defs[target], target))
+    # Register defined functions that never appeared as either caller or
+    # callee of any real edge as "orphan funcs" via the side-channel.
+    for rel, defs, _calls in per_file:
+        for name in defs:
+            if (rel, name) in referenced:
+                continue
+            graph.register_orphan_func(rel, name)
 
 
 # -----------------------------------------------------------------------------

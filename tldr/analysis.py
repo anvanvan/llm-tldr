@@ -157,11 +157,37 @@ def impact_analysis(
                 },
                 "total_targets": len(callers_only),
             }
+
+        # Last resort: check the orphan-funcs side-channel for defs that
+        # participate in no real edge (registered by language builders that
+        # want to treat top-level defs as entry points without polluting
+        # `edges` with synthetic sentinel symbols).
+        orphan_funcs = getattr(call_graph, "orphan_funcs", None) or set()
+        orphan_matches = {
+            FunctionRef(file=f, name=n)
+            for (f, n) in orphan_funcs
+            if _matches_target(n) and (target_file is None or target_file in f)
+        }
+        if orphan_matches:
+            return {
+                "targets": {
+                    str(ref): {
+                        "function": ref.name,
+                        "file": ref.file,
+                        "caller_count": 0,
+                        "callers": [],
+                        "truncated": False,
+                        "note": "Entry point - never called by other code in graph",
+                    }
+                    for ref in orphan_matches
+                },
+                "total_targets": len(orphan_matches),
+            }
         return {"error": f"Function '{target_func}' not found in call graph"}
 
     results = {}
     for target in targets:
-        tree = _build_caller_tree(target, reverse, max_depth, set())
+        tree = _build_caller_tree(target, reverse, max_depth, set(), call_graph)
         results[str(target)] = tree
 
     return {"targets": results, "total_targets": len(targets)}
@@ -172,8 +198,14 @@ def _build_caller_tree(
     reverse: dict[FunctionRef, list[FunctionRef]],
     depth: int,
     visited: set,
+    call_graph: "ProjectCallGraph | None" = None,
 ) -> dict:
-    """Recursively build caller tree."""
+    """Recursively build caller tree.
+
+    Args:
+        call_graph: Optional ProjectCallGraph to extract per-edge line numbers.
+            If provided, enables surfacing call-site source lines in the result.
+    """
     callers = reverse.get(func, [])
 
     # Base case: truncate at depth 0 or if we've seen this node
@@ -196,8 +228,18 @@ def _build_caller_tree(
         "truncated": False,
     }
 
+    # If the call_graph exposes per-edge line numbers (some builders capture
+    # the call-site source line; others don't), surface that as a ``line`` key
+    # on each caller subtree. Backward-compatible: builders without line info
+    # return None from ``lines_for_edge`` and we omit the key.
+    lookup_line = getattr(call_graph, "lines_for_edge", None) if call_graph is not None else None
+
     for caller in callers:
-        subtree = _build_caller_tree(caller, reverse, depth - 1, visited.copy())
+        subtree = _build_caller_tree(caller, reverse, depth - 1, visited.copy(), call_graph)
+        if lookup_line is not None:
+            line = lookup_line((caller.file, caller.name, func.file, func.name))
+            if line is not None:
+                subtree["line"] = line
         tree["callers"].append(subtree)
 
     return tree
@@ -235,6 +277,7 @@ def dead_code_analysis(
     entry_patterns = [
         "main",
         "__main__",
+        "<top-level>",
         "cli",
         "app",
         "run",
