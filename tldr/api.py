@@ -14,6 +14,10 @@ Usage:
     # Returns LLM-ready string with call graph, signatures, complexity
 """
 
+import json as _json
+import logging as _logging
+import os as _os
+import time as _time
 from collections import defaultdict
 from dataclasses import dataclass, field
 from itertools import chain
@@ -28,38 +32,9 @@ from .ast_extractor import (
     extract_file as _extract_file_impl,
 )
 
-# Re-export for public API
-__all__ = [
-    # Dataclasses from ast_extractor
-    "CallGraphInfo",
-    "ClassInfo",
-    "FunctionInfo",
-    "ImportInfo",
-    # Main API functions
-    "get_relevant_context",
-    "get_imports",
-    "get_intra_file_calls",
-    "extract_file",
-    "extract_file_with_code",
-    "get_dfg_context",
-    "get_pdg_context",
-    "get_slice",
-    "query",
-    # Cross-file functions
-    "build_project_call_graph",
-    "scan_project_files",
-    "build_function_index",
-    # Project navigation functions
-    "get_file_tree",
-    "search",
-    "Selection",
-    "get_code_structure",
-    # P5 #21: Content-hash deduplication
-    "ContentHashedIndex",
-    # Language support constants
-    "SUPPORTED_CONTEXT_LANGUAGES",
-    "SUPPORTED_CONTEXT_EXT_MAP",
-]
+
+_logger = _logging.getLogger(__name__)
+
 
 # Languages supported by get_relevant_context (ext_map used for file scanning)
 SUPPORTED_CONTEXT_EXT_MAP: dict[str, set[str]] = {
@@ -73,6 +48,39 @@ SUPPORTED_CONTEXT_EXT_MAP: dict[str, set[str]] = {
     "java": {".java"},
 }
 SUPPORTED_CONTEXT_LANGUAGES: frozenset[str] = frozenset(SUPPORTED_CONTEXT_EXT_MAP.keys())
+
+# Authoritative extension map for all supported languages (used by get_module,
+# get_relevant_context, and scan_project_files to avoid duplication).
+_EXT_MAP_ALL_LANGUAGES: dict[str, set[str]] = {
+    "python": {".py"},
+    "typescript": {".ts", ".tsx"},
+    "javascript": {".js", ".jsx", ".mjs", ".cjs"},
+    "go": {".go"},
+    "rust": {".rs"},
+    "php": {".php"},
+    "java": {".java"},
+    "c": {".c", ".h"},
+    "elixir": {".ex", ".exs"},
+    "swift": {".swift"},
+    "ruby": {".rb"},
+    "kotlin": {".kt", ".kts"},
+    "csharp": {".cs"},
+    "lua": {".lua"},
+    "luau": {".luau"},
+    "scala": {".scala", ".sc"},
+    "cpp": {".cpp", ".cc", ".cxx", ".hpp", ".hh", ".hxx"},
+}
+
+# Bug 004: non-code suffixes that the semantic indexer must include so that
+# build/config/doc files (.sh scripts, pyproject.toml, .yaml workflows, etc.)
+# appear in semantic search results. Kept in module scope so other call sites
+# (e.g. semantic._process_file_for_extraction) can share the same set.
+NON_CODE_EXTENSIONS: set[str] = {
+    ".sh", ".zsh", ".bash",
+    ".toml", ".yaml", ".yml", ".json",
+    ".md", ".rst", ".txt",
+}
+
 from .cfg_extractor import (
     CFGBlock,  # Re-exported for type hints
     CFGEdge,  # Re-exported for type hints
@@ -188,8 +196,23 @@ from .pdg_extractor import (
     extract_typescript_pdg,
 )
 
-# Explicit exports for public API
+# Explicit exports for public API (single authoritative list)
 __all__ = [
+    # Dataclasses from ast_extractor (re-exported for API consumers)
+    "CallGraphInfo",
+    "ClassInfo",
+    "FunctionInfo",
+    "ImportInfo",
+    # Main API functions
+    "get_relevant_context",
+    "get_relevant_context_multi",
+    "query",
+    "FunctionContext",
+    "RelevantContext",
+    "get_imports",
+    "get_intra_file_calls",
+    "extract_file",
+    "extract_file_with_code",
     # Layer 3: CFG types and functions
     "CFGBlock",
     "CFGEdge",
@@ -201,20 +224,45 @@ __all__ = [
     # Layer 5: PDG functions
     "get_pdg_context",
     "get_slice",
-    # Main API
-    "get_relevant_context",
-    "query",
-    "FunctionContext",
-    "RelevantContext",
-    "extract_file_with_code",
     # Cross-file functions
     "build_project_call_graph",
     "scan_project_files",
-    "get_imports",
     "build_function_index",
+    # Project navigation functions
+    "get_file_tree",
+    "search",
+    "Selection",
+    "get_code_structure",
+    # Content-hash deduplication
+    "ContentHashedIndex",
+    # Language support constants
+    "SUPPORTED_CONTEXT_LANGUAGES",
+    "SUPPORTED_CONTEXT_EXT_MAP",
     # Security exceptions
     "PathTraversalError",
 ]
+
+
+def _serialize_call_graph_to_cache(
+    cache_file: Path, call_graph, languages: list, timestamp: float | None = None
+) -> None:
+    """Serialize a ProjectCallGraph to JSON cache format.
+
+    Args:
+        cache_file: Path to write cache to.
+        call_graph: ProjectCallGraph instance with an ``edges`` iterable.
+        languages: List of language strings to store in the cache.
+        timestamp: Unix timestamp (defaults to current time).
+    """
+    cache_data = {
+        "edges": [
+            {"from_file": e[0], "from_func": e[1], "to_file": e[2], "to_func": e[3]}
+            for e in call_graph.edges
+        ],
+        "languages": languages,
+        "timestamp": timestamp if timestamp is not None else _time.time(),
+    }
+    cache_file.write_text(_json.dumps(cache_data, indent=2))
 
 
 # =============================================================================
@@ -473,26 +521,7 @@ def _get_module_exports(
     Returns:
         RelevantContext with all functions/classes from the module
     """
-    ext_map = {
-        "python": [".py"],
-        "typescript": [".ts", ".tsx"],
-        "javascript": [".js", ".jsx", ".mjs", ".cjs"],
-        "go": [".go"],
-        "rust": [".rs"],
-        "php": [".php"],
-        "java": [".java"],
-        "c": [".c", ".h"],
-        "elixir": [".ex", ".exs"],
-        "swift": [".swift"],
-        "ruby": [".rb"],
-        "kotlin": [".kt", ".kts"],
-        "csharp": [".cs"],
-        "lua": [".lua"],
-        "luau": [".luau"],
-        "scala": [".scala", ".sc"],
-        "cpp": [".cpp", ".cc", ".cxx", ".hpp", ".hh", ".hxx"],
-    }
-    extensions = ext_map.get(language, [".py"])
+    extensions = _EXT_MAP_ALL_LANGUAGES.get(language, {".py"})
 
     # Try to find the module file
     # module_path "providers/anthropic" -> providers/anthropic.py
@@ -578,13 +607,54 @@ def get_relevant_context(
         project: Path to project root
         entry_point: Function/method name (e.g., "Client.stream") or module path (e.g., "providers/anthropic")
         depth: How deep to traverse the call graph
-        language: python, typescript, javascript, go, rust, php, or java
+        language: python, typescript, javascript, go, rust, php, java, swift, c, cpp, ruby, kotlin, elixir, csharp, lua, luau, or scala
         include_docstrings: Whether to include function docstrings
 
     Returns:
         RelevantContext with functions reachable from entry_point
     """
     project = Path(project)
+
+    ext_map = _EXT_MAP_ALL_LANGUAGES
+
+    # Single-pass tree walk: detect available languages AND collect all
+    # non-hidden source files grouped by suffix.  A second rglob for the
+    # signature-indexing loop below is then unnecessary (O(n) → O(n)).
+    available_langs: set = set()
+    files_by_ext: dict[str, list[Path]] = {}
+    for fp in project.rglob("*"):
+        try:
+            rel = fp.relative_to(project)
+            if any(p.startswith(".") for p in rel.parts):
+                continue
+        except ValueError:
+            pass  # file outside project root — keep it
+        ext = fp.suffix
+        for lang, exts in ext_map.items():
+            if ext in exts:
+                available_langs.add(lang)
+                break
+        if ext:
+            files_by_ext.setdefault(ext, []).append(fp)
+
+    # R-7: track whether `language` was auto-detected (i.e. substituted because
+    # the caller's value wasn't present in the project). Cache writes below are
+    # gated on this flag so that an auto-detect that picked the wrong language
+    # in a polyglot repo doesn't poison the on-disk call_graph.json for a later
+    # explicit-lang caller.
+    language_auto_detected = False
+    if language not in available_langs:
+        for candidate in (
+            "python", "typescript", "javascript", "go", "rust", "java",
+            "php", "swift", "c", "cpp", "csharp", "kotlin", "scala",
+            "ruby", "elixir", "lua", "luau",
+        ):
+            if candidate == language:
+                continue
+            if candidate in available_langs:
+                language = candidate
+                language_auto_detected = True
+                break
 
     # Module query mode: path with / and no . (e.g., "providers/anthropic")
     if "/" in entry_point and "." not in entry_point:
@@ -598,84 +668,101 @@ def get_relevant_context(
     # Build cross-file call graph
     call_graph = build_project_call_graph(str(project), language=language)
 
+    # Persist call graph to .tldr/cache/ so subsequent invocations (and CLI
+    # commands that look for cached graphs) see the same data the API just
+    # computed. This mirrors the cache-write behaviour of cli._get_or_build_graph.
+    # Skip the write when the cached file is recent (< 1 hour) to avoid
+    # repeated serialization on rapid-fire queries in the same session.
+    # R-7: skip the write entirely when the language was auto-detected — the
+    # auto-detect heuristic can pick the wrong language in polyglot repos, and
+    # we don't want to overwrite a cache built from an explicit-lang invocation.
+    if not language_auto_detected:
+        try:
+            cache_dir = project / ".tldr" / "cache"
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            cache_file = cache_dir / "call_graph.json"
+            _write_cache = True
+            if cache_file.exists():
+                cache_age = _time.time() - _os.path.getmtime(cache_file)
+                if cache_age < 21600:  # skip write if cache is < 6 hours old
+                    # C-5: the 6-hour skip is per-language. A prior invocation
+                    # with a different --lang must not block the current
+                    # language from refreshing the cache.
+                    try:
+                        cached_payload = _json.loads(cache_file.read_text())
+                        cached_languages = cached_payload.get("languages") or []
+                    except (OSError, _json.JSONDecodeError, ValueError):
+                        cached_languages = []
+                    if language in cached_languages:
+                        _write_cache = False
+            if _write_cache:
+                _serialize_call_graph_to_cache(cache_file, call_graph, [language])
+        except (OSError, _json.JSONDecodeError) as exc:
+            # Best-effort cache write; never block context resolution, but
+            # surface the failure so users can diagnose disk/permission issues.
+            _logger.warning(
+                "call_graph.json cache write failed for %s (%s: %s)",
+                project, type(exc).__name__, exc,
+            )
+
     # Index all signatures
     extractor = HybridExtractor()
     signatures: dict[str, tuple[str, FunctionInfo]] = {}  # func_name -> (file, info)
 
-    ext_map = {
-        "python": {".py"},
-        "typescript": {".ts", ".tsx"},
-        "javascript": {".js", ".jsx", ".mjs", ".cjs"},
-        "go": {".go"},
-        "rust": {".rs"},
-        "php": {".php"},
-        "java": {".java"},
-        "c": {".c", ".h"},
-        "elixir": {".ex", ".exs"},
-        "swift": {".swift"},
-        "ruby": {".rb"},
-        "kotlin": {".kt", ".kts"},
-        "csharp": {".cs"},
-        "lua": {".lua"},
-        "luau": {".luau"},
-        "scala": {".scala", ".sc"},
-        "cpp": {".cpp", ".cc", ".cxx", ".hpp", ".hh", ".hxx"},
-    }
     extensions = ext_map.get(language, {".py"})
 
     # Also cache file sources for CFG extraction
     file_sources: dict[str, str] = {}
 
-    for file_path in project.rglob("*"):
-        # Check for hidden paths relative to project root, not absolute path
+    # Reuse the pre-collected file list from the single-pass walk above instead
+    # of doing a second project.rglob("*") traversal.
+    candidate_paths: list[Path] = []
+    for ext in extensions:
+        candidate_paths.extend(files_by_ext.get(ext, []))
+
+    for file_path in candidate_paths:
         try:
-            rel_path = file_path.relative_to(project)
-            is_hidden = any(p.startswith('.') for p in rel_path.parts)
-        except ValueError:
-            is_hidden = False  # Not relative to project, allow it
-        if file_path.suffix in extensions and not is_hidden:
-            try:
-                source = file_path.read_text()
-                file_sources[str(file_path)] = source
+            source = file_path.read_text()
+            file_sources[str(file_path)] = source
 
-                info = extractor.extract(str(file_path))
-                for func in info.functions:
-                    # Primary key: module.function (e.g., "claude_spawn.spawn_agent")
-                    module_name = file_path.stem  # "claude_spawn" from "claude_spawn.py"
-                    qualified_key = f"{module_name}.{func.name}"
-                    signatures[qualified_key] = (str(file_path), func)
+            info = extractor.extract(str(file_path))
+            for func in info.functions:
+                # Primary key: module.function (e.g., "claude_spawn.spawn_agent")
+                module_name = file_path.stem  # "claude_spawn" from "claude_spawn.py"
+                qualified_key = f"{module_name}.{func.name}"
+                signatures[qualified_key] = (str(file_path), func)
 
-                    # Also store unqualified for backward compat (first wins)
-                    if func.name not in signatures:
-                        signatures[func.name] = (str(file_path), func)
-                for cls in info.classes:
-                    # Index class itself as callable (dataclasses, constructors)
-                    # Create a pseudo-FunctionInfo for the class
-                    class_as_func = FunctionInfo(
-                        name=cls.name,
-                        params=[],  # Could extract __init__ params if needed
-                        return_type=cls.name,
-                        docstring=cls.docstring,
-                        line_number=cls.line_number,
-                        language=language,
-                        is_class_wrapper=(language == "swift"),
-                    )
-                    signatures[cls.name] = (str(file_path), class_as_func)
+                # Also store unqualified for backward compat (first wins)
+                if func.name not in signatures:
+                    signatures[func.name] = (str(file_path), func)
+            for cls in info.classes:
+                # Index class itself as callable (dataclasses, constructors)
+                # Create a pseudo-FunctionInfo for the class
+                class_as_func = FunctionInfo(
+                    name=cls.name,
+                    params=[],  # Could extract __init__ params if needed
+                    return_type=cls.name,
+                    docstring=cls.docstring,
+                    line_number=cls.line_number,
+                    language=language,
+                    is_class_wrapper=(language == "swift"),
+                )
+                signatures[cls.name] = (str(file_path), class_as_func)
 
-                    for method in cls.methods:
-                        # Store as ClassName.method
-                        key = f"{cls.name}.{method.name}"
-                        signatures[key] = (str(file_path), method)
-                        # Also store ClassName::method alias (PHP convention)
-                        if language == "php":
-                            cc_key = f"{cls.name}::{method.name}"
-                            signatures[cc_key] = (str(file_path), method)
-                        # Also store just method name (for call graph join)
-                        # Only if not already taken by a standalone function
-                        if method.name not in signatures:
-                            signatures[method.name] = (str(file_path), method)
-            except Exception:
-                pass  # Skip files that fail to parse
+                for method in cls.methods:
+                    # Store as ClassName.method
+                    key = f"{cls.name}.{method.name}"
+                    signatures[key] = (str(file_path), method)
+                    # Also store ClassName::method alias (PHP convention)
+                    if language == "php":
+                        cc_key = f"{cls.name}::{method.name}"
+                        signatures[cc_key] = (str(file_path), method)
+                    # Also store just method name (for call graph join)
+                    # Only if not already taken by a standalone function
+                    if method.name not in signatures:
+                        signatures[method.name] = (str(file_path), method)
+        except Exception:
+            pass  # Skip files that fail to parse
 
     # CFG extractor based on language
     cfg_extractors = {
@@ -698,8 +785,10 @@ def get_relevant_context(
     }
     cfg_extractor_fn = cfg_extractors.get(language, extract_python_cfg)
 
-    # Build adjacency list from call graph edges
+    # Build forward adjacency list from call graph edges.
     # Edge format: (caller_file, caller_func, callee_file, callee_func)
+    # The reverse adjacency is deferred until after BFS so that it is built
+    # only for the targets we actually query (memory savings for large graphs).
     adjacency: dict[str, list[str]] = defaultdict(list)
     for edge in call_graph.edges:
         caller_file, caller_func, callee_file, callee_func = edge
@@ -805,10 +894,150 @@ def get_relevant_context(
                 if callee not in visited and current_depth < depth:
                     queue.append((callee, current_depth + 1))
 
+    # Cross-file caller resolution: surface direct callers of the entry point
+    # (and of any matching qualified variant). The forward BFS above only
+    # walks callees; without this pass, an entry point that is *called from*
+    # other files would appear as an isolated node.
+    if depth >= 1:
+        # set[(file_path_str, func_name_str)] — element-type contract is a
+        # 2-tuple of strings; never add a bare str. Normalises any Path that
+        # may leak from upstream call-graph edges via str() at the add site.
+        caller_names_seen: set[tuple[str, str]] = {
+            (str(ctx.file), ctx.name) for ctx in result_functions
+        }
+        caller_targets: set[str] = {entry_point}
+        # Also include any qualified variants of entry_point we already resolved
+        for ctx in list(result_functions):
+            tail = ctx.name.rsplit(".", 1)[-1]
+            caller_targets.add(tail)
+            caller_targets.add(ctx.name)
+
+        # Build reverse adjacency on-demand: only index edges whose callee is
+        # one of the targets we will query, reducing memory for large graphs.
+        reverse_adjacency: dict[str, list[tuple[str, str]]] = defaultdict(list)
+        for edge in call_graph.edges:
+            _, caller_func, _, callee_func = edge
+            if callee_func in caller_targets:
+                reverse_adjacency[callee_func].append((edge[0], caller_func))
+
+        for target in list(caller_targets):
+            for caller_file, caller_func in reverse_adjacency.get(target, []):
+                # Skip self-edges (caller == target)
+                if caller_func == target:
+                    continue
+                # Try to resolve a richer signature/line number from the index
+                caller_resolved = resolve_func_name(caller_func)
+                if caller_resolved:
+                    for resolved_name, (file_path, func_info) in caller_resolved:
+                        file_path_str = str(file_path)
+                        key = (file_path_str, resolved_name)
+                        if key in caller_names_seen:
+                            continue
+                        caller_names_seen.add(key)
+                        result_functions.append(FunctionContext(
+                            name=resolved_name,
+                            file=file_path_str,
+                            line=func_info.line_number,
+                            signature=func_info.signature(),
+                            docstring=func_info.docstring if include_docstrings else None,
+                            calls=adjacency.get(func_info.name, []),
+                        ))
+                else:
+                    # Synthesise a minimal entry from the edge metadata when
+                    # the caller wasn't found in the signature index.
+                    abs_caller_file = (
+                        str(project / caller_file)
+                        if not Path(caller_file).is_absolute()
+                        else str(caller_file)
+                    )
+                    key = (abs_caller_file, caller_func)
+                    if key in caller_names_seen:
+                        continue
+                    caller_names_seen.add(key)
+                    result_functions.append(FunctionContext(
+                        name=caller_func,
+                        file=abs_caller_file,
+                        line=0,
+                        signature=f"def {caller_func}(...)",
+                        calls=[target],
+                    ))
+
     return RelevantContext(
         entry_point=entry_point,
         depth=depth,
         functions=result_functions
+    )
+
+
+def get_relevant_context_multi(
+    project: str | Path,
+    entry_point: str,
+    depth: int = 2,
+    languages: list[str] | tuple[str, ...] = ("python",),
+    include_docstrings: bool = True,
+) -> RelevantContext:
+    """Probe each language in order; return first non-error hit.
+
+    First-hit-wins — in polyglot projects where multiple languages define
+    the same name (e.g., both Python and TypeScript have ``process_data``),
+    returns the first language that resolves. Probe order is caller-controlled
+    via the ``languages`` parameter.
+
+    Note: each per-language probe delegates to :func:`get_relevant_context`,
+    which performs its own internal auto-detect when the requested language
+    has no files in the project. As a result, a force-probed language can be
+    silently overridden by the auto-detected one (e.g., Swift probe in a
+    Python-only project will resolve via Python). Callers needing strict
+    per-language semantics should pre-filter ``languages`` to those actually
+    present in the project.
+
+    On all-miss, returns a :class:`RelevantContext` whose ``error`` lists the
+    languages probed (in input order). For an empty ``languages`` argument,
+    returns immediately with a clean "no supported languages probed" error
+    (no malformed ``(probed: )`` output).
+
+    Args:
+        project: Path to project root.
+        entry_point: Function/method name (e.g., ``"ClassName.method"`` or
+            ``"function_name"``).
+        depth: How deep to traverse the call graph.
+        languages: Ordered iterable of languages to probe. First non-error
+            hit wins. Defaults to ``("python",)``.
+        include_docstrings: Whether to include function docstrings in results.
+
+    Returns:
+        :class:`RelevantContext` from the first language that resolves, or
+        an error-only ``RelevantContext`` if every language misses.
+    """
+    if not languages:
+        return RelevantContext(
+            entry_point=entry_point,
+            depth=depth,
+            error=(
+                f"Function '{entry_point}' not found in project "
+                f"(no supported languages probed)"
+            ),
+        )
+
+    for lang in languages:
+        ctx = get_relevant_context(
+            project,
+            entry_point,
+            depth=depth,
+            language=lang,
+            include_docstrings=include_docstrings,
+        )
+        if not ctx.error:
+            return ctx  # first hit wins
+
+    probed = ", ".join(languages)
+    return RelevantContext(
+        entry_point=entry_point,
+        depth=depth,
+        error=(
+            f"Function '{entry_point}' not found in project "
+            f"(probed: {probed})"
+        ),
     )
 
 
@@ -1774,6 +2003,11 @@ class Selection:
         return len(self._selected)
 
 
+# NON_CODE_EXTENSIONS moved to module top (near _EXT_MAP_ALL_LANGUAGES) per
+# review C-9. Identity preserved — `from tldr.api import NON_CODE_EXTENSIONS`
+# call sites (e.g. semantic._process_file_for_extraction) are unchanged.
+
+
 def _build_file_entry(info_dict: dict, path: str) -> dict:
     """Build a file entry dict from an extracted info dict and a path label."""
     functions = [f["name"] for f in info_dict.get("functions", [])]
@@ -1793,6 +2027,27 @@ def _build_file_entry(info_dict: dict, path: str) -> dict:
     }
 
 
+def _build_empty_file_entry_skeleton(path: str) -> dict:
+    """Build the base file entry structure with empty lists."""
+    return {
+        "path": path,
+        "functions": [],
+        "classes": [],
+        "methods": [],
+        "imports": [],
+    }
+
+
+def _build_non_code_file_entry(path: str) -> dict:
+    """Build a file entry dict for a non-code file (.sh, .md, .toml, ...).
+
+    Non-code files have no functions, classes, or imports to extract; downstream
+    semantic emission (Gate 2) treats this empty entry as a signal to produce
+    one whole-file EmbeddingUnit.
+    """
+    return _build_empty_file_entry_skeleton(path)
+
+
 def get_code_structure(
     root: str | Path,
     language: str = "python",
@@ -1800,7 +2055,7 @@ def get_code_structure(
     ignore_spec=None,
 ) -> dict:
     """
-    Get code structure (codemaps) for all files in a project.
+    Get code structure (codemaps) for all code and non-code files in a project.
 
     Args:
         root: Root directory to analyze
@@ -1809,7 +2064,10 @@ def get_code_structure(
         ignore_spec: Optional pathspec.PathSpec for gitignore-style patterns
 
     Returns:
-        Dict with codemap structure:
+        Dict with codemap structure. Code files include functions/classes/imports.
+        Non-code files (.sh, .md, .toml, .yaml, .yml, .json, .rst, .txt) appear
+        with empty functions/classes/methods/imports lists, and are processed
+        whole-file by the semantic indexer:
         {
             "root": "/path/to/project",
             "files": [
@@ -1819,6 +2077,13 @@ def get_code_structure(
                     "classes": ["MyClass"],
                     "imports": ["os", "sys"]
                 },
+                {
+                    "path": "build.sh",
+                    "functions": [],
+                    "classes": [],
+                    "methods": [],
+                    "imports": []
+                },
                 ...
             ]
         }
@@ -1826,40 +2091,38 @@ def get_code_structure(
     root = Path(root)
 
     # Get extension map for language
-    ext_map = {
-        "python": {".py"},
-        "typescript": {".ts", ".tsx"},
-        "javascript": {".js", ".jsx", ".mjs", ".cjs"},
-        "go": {".go"},
-        "rust": {".rs"},
-        "java": {".java"},
-        "c": {".c", ".h"},
-        "cpp": {".cpp", ".cc", ".cxx", ".hpp"},
-        "swift": {".swift"},
-        "kotlin": {".kt", ".kts"},
-        "scala": {".scala"},
-        "ruby": {".rb"},
-        "php": {".php"},
-        "csharp": {".cs"},
-        "elixir": {".ex", ".exs"},
-        "lua": {".lua"},
-        "luau": {".luau"},
-    }
-
-    extensions = ext_map.get(language, {".py"})
+    code_extensions = _EXT_MAP_ALL_LANGUAGES.get(language, {".py"})
+    # Bug 004 fix (Gate 1): non-code build/config/doc files are also indexed so
+    # that downstream semantic search can rank them. They are recognized for
+    # every code language; the matching emission path in semantic.py
+    # (Gate 2) produces a single whole-file EmbeddingUnit per non-code file.
+    extensions = code_extensions | NON_CODE_EXTENSIONS
 
     result = {"root": str(root), "language": language, "files": []}
 
-    # Handle single-file input: rglob("*") on a file returns empty iterator
+    # Handle single-file input: rglob("*") on a file returns empty iterator.
+    # Use the file's basename so downstream consumers see a meaningful path in
+    # metadata.json (qualified_name, display). Downstream extractors that need
+    # to read the file reconstruct full_path via project.parent / file_path
+    # when project itself is a file (see _process_file_for_extraction). Storing
+    # "." here previously caused IsADirectoryError on platforms where the
+    # resolved path collapses to the parent directory (bug-004 R-5).
     if root.is_file():
-        if root.suffix in extensions:
+        file_path = root.name
+        if root.suffix in NON_CODE_EXTENSIONS:
+            # Non-code file: emit a minimal entry without invoking the AST extractor.
+            result["files"].append(_build_non_code_file_entry(file_path))
+        elif root.suffix in code_extensions:
             try:
                 info = _extract_file_impl(str(root))
-                result["files"].append(_build_file_entry(info.to_dict(), root.name))
+                result["files"].append(_build_file_entry(info.to_dict(), file_path))
             except Exception:
                 pass
         return result
 
+    # R-4 (Bug 004 awareness): non-code files (.sh/.md/.toml/...) now share the
+    # `max_results` budget with code files. In doc-heavy repos at the default
+    # cap of 100 this can starve Python/TS entries — raise `--max` if needed.
     count = 0
     for file_path in root.rglob("*"):
         if count >= max_results:
@@ -1882,10 +2145,20 @@ def get_code_structure(
         if ignore_spec and ignore_spec.match_file(rel_path):
             continue
 
+        rel_path_str = str(rel_path)
+
+        if file_path.suffix in NON_CODE_EXTENSIONS:
+            # Non-code file: emit a minimal entry without invoking the AST extractor.
+            # _extract_file_impl has no extractor for these suffixes and would fail
+            # silently, dropping the file. Semantic.py emits a whole-file unit instead.
+            result["files"].append(_build_non_code_file_entry(rel_path_str))
+            count += 1
+            continue
+
         try:
             info = _extract_file_impl(str(file_path))
             result["files"].append(
-                _build_file_entry(info.to_dict(), str(file_path.relative_to(root)))
+                _build_file_entry(info.to_dict(), rel_path_str)
             )
             count += 1
         except Exception:

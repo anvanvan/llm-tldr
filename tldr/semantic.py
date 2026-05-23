@@ -45,6 +45,12 @@ except ImportError:
 ALL_LANGUAGES = ["python", "typescript", "javascript", "go", "rust", "java", "c", "cpp", "ruby", "php", "kotlin", "swift", "csharp", "scala", "lua", "luau", "elixir"]
 
 from tldr.cross_file_calls import CALL_GRAPH_LANGUAGES  # single source of truth
+from tldr.api import NON_CODE_EXTENSIONS  # single source of truth for non-code suffixes
+from tldr.dirty_flag import _normalize_file_path  # shared path normalization utility
+
+# Cap embedded text per non-code file. Well above the BGE 512-token truncation
+# window but bounded so pathological large config/log files don't bloat the index.
+_NON_CODE_PREVIEW_CHARS = 8000
 
 # Extension-to-language map (defined here to avoid circular import with cli.py)
 EXTENSION_TO_LANGUAGE = {
@@ -78,6 +84,31 @@ EXTENSION_TO_LANGUAGE = {
     '.mjs': 'javascript',
     '.cjs': 'javascript',
     '.hxx': 'cpp',
+    # Bug 004 (Gate 3): non-code extensions mapped to stand-in "language" tags
+    # so _detect_project_languages returns a non-empty set for sh-only / doc-only
+    # repos. These tags are NOT in ALL_LANGUAGES and are dispatched separately
+    # (see NON_CODE_LANGUAGE_TAGS below); get_code_structure falls back to its
+    # default code_extensions ({".py"}) and unions in NON_CODE_EXTENSIONS, so the
+    # non-code files are still enumerated and reach _process_file_for_extraction
+    # Gate 2.
+    '.sh': 'shell',
+    '.bash': 'shell',
+    '.zsh': 'shell',
+    '.toml': 'toml',
+    '.yaml': 'yaml',
+    '.yml': 'yaml',
+    '.json': 'json',
+    '.md': 'markdown',
+    '.rst': 'rst',
+    '.txt': 'text',
+}
+
+# Bug 004 (Gate 3): stand-in "language" tags for non-code files. When a project
+# has only non-code files (or `--lang all` is requested over such a tree),
+# _detect_project_languages returns these tags so build_semantic_index dispatches
+# extract_units_from_project at least once and reaches Gate 2.
+NON_CODE_LANGUAGE_TAGS: set[str] = {
+    "shell", "toml", "yaml", "json", "markdown", "rst", "text",
 }
 
 _HF_NOISE_SUPPRESSIONS = {
@@ -182,21 +213,23 @@ def _find_project_root(start_path: Path) -> Path:
 
 @dataclass
 class EmbeddingUnit:
-    """A code unit (function/method/class) for embedding.
+    """A unit (function/method/class/file) for embedding.
 
-    Contains information from all 5 TLDR layers:
+    For code units, contains information from all 5 TLDR layers:
     - L1: signature, docstring
     - L2: calls, called_by
     - L3: cfg_summary
     - L4: dfg_summary
     - L5: dependencies
+
+    For non-code files, contains whole-file preview and basic metadata.
     """
     name: str
     qualified_name: str
     file: str
     line: int
     language: str
-    unit_type: str  # "function" | "method" | "class"
+    unit_type: str  # "function" | "method" | "class" | "file"
     signature: str
     docstring: str
     calls: List[str] = field(default_factory=list)
@@ -917,17 +950,59 @@ def _process_file_for_extraction(
     units = []
     project = Path(project_path)
     file_path = file_info.get("path", "")
-    full_path = project / file_path
+    # Bug 004 R-5: when project_path is a single file (passed through from
+    # build_semantic_index's scan_path), get_code_structure stores root.name as
+    # file_path. Reconstruct full_path from the parent in that case; otherwise
+    # the standard `project / file_path` directory-relative join.
+    if project.is_file():
+        full_path = project.parent / file_path
+    else:
+        full_path = project / file_path
 
     if not full_path.exists():
         return units
 
     try:
-        # Read file content ONCE
-        content = full_path.read_text()
+        # Read file content ONCE.
+        # C-7: use utf-8-sig so a UTF-8 BOM (U+FEFF) is stripped instead of
+        # polluting the embedding preview / first source line.
+        # C-8: best-effort fallback to latin-1 for non-UTF-8 legacy config
+        # files (common in older .yaml/.toml/.ini) so we don't silently drop
+        # them via the broad except below.
+        try:
+            content = full_path.read_text(encoding="utf-8-sig")
+        except UnicodeDecodeError:
+            content = full_path.read_text(encoding="latin-1")
         lines = content.split('\n')
     except Exception as e:
         logger.warning(f"Failed to read {file_path}: {e}")
+        return units
+
+    # Gate 2 (Bug 004): non-code files (.sh, .md, .toml, .yaml, .yml, .json,
+    # .rst, .txt, .zsh, .bash) have no functions/classes for the AST loop below
+    # to emit. Gate 1 in api.py already includes them in structure["files"] via
+    # _build_non_code_file_entry (empty functions/classes/methods/imports). Emit
+    # one whole-file EmbeddingUnit so they appear in semantic search results.
+    if full_path.suffix in NON_CODE_EXTENSIONS:
+        basename = full_path.name
+        preview = content[:_NON_CODE_PREVIEW_CHARS]
+        unit = EmbeddingUnit(
+            name=basename,
+            qualified_name=file_path,
+            file=file_path,
+            line=1,
+            language="text",
+            unit_type="file",
+            signature=basename,
+            docstring="",
+            calls=[],
+            called_by=[],
+            cfg_summary="",
+            dfg_summary="",
+            dependencies="",
+            code_preview=preview,
+        )
+        units.append(unit)
         return units
 
     # Parse AST once for all function info
@@ -1286,11 +1361,17 @@ def _get_progress_console():
         return None
 
 
-def _detect_project_languages(project_path: Path, respect_ignore: bool = True) -> List[str]:
-    """Scan project files to detect present languages."""
+def _scan_project_language_set(project_path: Path, respect_ignore: bool = True) -> set:
+    """Walk the project tree once and return the set of detected language tags.
+
+    Internal helper shared by ``_detect_project_languages`` (code-only contract)
+    and ``_detect_project_language_tags`` (broader contract used by the semantic
+    indexer). Returned set may include both ``ALL_LANGUAGES`` members and
+    ``NON_CODE_LANGUAGE_TAGS`` stand-ins (shell, markdown, toml, ...).
+    """
     from tldr.tldrignore import load_ignore_patterns, should_ignore
 
-    found_languages = set()
+    found_languages: set = set()
     spec = load_ignore_patterns(project_path) if respect_ignore else None
 
     for root, dirs, files in os.walk(project_path):
@@ -1308,10 +1389,85 @@ def _detect_project_languages(project_path: Path, respect_ignore: bool = True) -
              if ext in EXTENSION_TO_LANGUAGE:
                  found_languages.add(EXTENSION_TO_LANGUAGE[ext])
 
-    # Return sorted list intersect with ALL_LANGUAGES to ensure validity
-    # Sort with call-graph-supported languages first so resolve_language picks them
-    valid = list(found_languages & set(ALL_LANGUAGES))
-    return sorted(valid, key=lambda l: (0 if l in CALL_GRAPH_LANGUAGES else 1, l))
+    return found_languages
+
+
+def _detect_project_languages(project_path: Path, respect_ignore: bool = True) -> List[str]:
+    """Scan project files to detect present code languages.
+
+    Returns ONLY languages that are members of ``ALL_LANGUAGES`` (the pre-Bug-004
+    contract). Non-code stand-in tags such as ``"shell"``, ``"markdown"``,
+    ``"toml"`` etc. are intentionally NOT returned here — callers in cli.py and
+    diagnostics.py feed the result into ``resolve_language`` / ``build_project_call_graph``
+    / ``_resolve_context_languages`` which only understand ``ALL_LANGUAGES``
+    members. Non-code-aware callers (the semantic indexer) should use
+    ``_detect_project_language_tags`` instead.
+
+    Args:
+        project_path: Path to project root to scan.
+        respect_ignore: If True, respect .tldrignore patterns.
+
+    Returns:
+        List of detected code languages, call-graph-supported ones first.
+    """
+    found_languages = _scan_project_language_set(project_path, respect_ignore=respect_ignore)
+    code_langs = found_languages & set(ALL_LANGUAGES)
+
+    # Sort code languages with call-graph-supported ones first so resolve_language
+    # picks them; this preserves the pre-Bug-004 ordering invariant for code-only
+    # projects.
+    return sorted(
+        code_langs,
+        key=lambda l: (0 if l in CALL_GRAPH_LANGUAGES else 1, l),
+    )
+
+
+# Bug 004 (Gate 3) sentinel: when a project contains only non-code files, the
+# semantic indexer dispatches a single extraction pass under this tag. It is
+# NOT a real language — ``get_code_structure`` falls back to ``{".py"}`` for
+# code_extensions and unions in ``NON_CODE_EXTENSIONS``, so only the non-code
+# files are enumerated (the directory has no .py files by hypothesis).
+NON_CODE_DISPATCH_SENTINEL = "_noncode"
+
+
+def _detect_project_language_tags(project_path: Path, respect_ignore: bool = True) -> List[str]:
+    """Scan project files for the semantic indexer's broader dispatch contract.
+
+    Unlike ``_detect_project_languages`` (which returns only ALL_LANGUAGES
+    members), this returns:
+
+      - ``[code_lang_1, code_lang_2, ...]`` when at least one code language is
+        present (non-code files are picked up via ``NON_CODE_EXTENSIONS`` union
+        inside ``get_code_structure`` during each code-language pass; the
+        semantic indexer dedupes by ``qualified_name`` across passes).
+      - ``[NON_CODE_DISPATCH_SENTINEL]`` (a single tag) when only non-code files
+        are present — avoids the C-4 triple-indexing case where multiple
+        non-code language stand-ins (shell, markdown, toml, ...) each triggered
+        a redundant dispatch pass.
+      - ``[]`` when the project contains no recognized files at all.
+
+    Args:
+        project_path: Path to project root to scan.
+        respect_ignore: If True, respect .tldrignore patterns.
+
+    Returns:
+        Ordered list of dispatch tags for ``build_semantic_index``.
+    """
+    found_languages = _scan_project_language_set(project_path, respect_ignore=respect_ignore)
+    code_langs = found_languages & set(ALL_LANGUAGES)
+    non_code_langs = found_languages & NON_CODE_LANGUAGE_TAGS
+
+    sorted_code = sorted(
+        code_langs,
+        key=lambda l: (0 if l in CALL_GRAPH_LANGUAGES else 1, l),
+    )
+
+    if sorted_code:
+        return sorted_code
+    if non_code_langs:
+        # Single sentinel pass — see NON_CODE_DISPATCH_SENTINEL docstring.
+        return [NON_CODE_DISPATCH_SENTINEL]
+    return []
 
 
 def build_semantic_index(
@@ -1379,7 +1535,7 @@ def build_semantic_index(
 
             if lang == "all":
                 status.update("[bold green]Scanning project languages...")
-                target_languages = _detect_project_languages(scan_path, respect_ignore=respect_ignore)
+                target_languages = _detect_project_language_tags(scan_path, respect_ignore=respect_ignore)
                 if not target_languages:
                     console.print("[yellow]No supported languages detected in project[/yellow]")
                     return 0
@@ -1395,7 +1551,7 @@ def build_semantic_index(
             status.update(f"[bold green]Extracted {len(units)} code units")
     else:
         if lang == "all":
-            target_languages = _detect_project_languages(scan_path, respect_ignore=respect_ignore)
+            target_languages = _detect_project_language_tags(scan_path, respect_ignore=respect_ignore)
             if not target_languages:
                 return 0
             units = []
@@ -1403,6 +1559,20 @@ def build_semantic_index(
                 units.extend(extract_units_from_project(str(scan_path), lang=lang_name, respect_ignore=respect_ignore))
         else:
             units = extract_units_from_project(str(scan_path), lang=lang, respect_ignore=respect_ignore)
+
+    # Bug 004 (C-3): when multiple code languages are dispatched under `--lang all`,
+    # each pass unions NON_CODE_EXTENSIONS into get_code_structure, so the same
+    # non-code file (e.g. build.sh) gets emitted N times. Dedupe by qualified_name
+    # to ensure each file/function appears at most once in the FAISS index.
+    if units:
+        seen_qn: set = set()
+        deduped: List[EmbeddingUnit] = []
+        for u in units:
+            if u.qualified_name in seen_qn:
+                continue
+            seen_qn.add(u.qualified_name)
+            deduped.append(u)
+        units = deduped
 
     if not units:
         return 0
@@ -1479,6 +1649,31 @@ def build_semantic_index(
     return len(units)
 
 
+def _compute_path_filter(scan_path: Path, project_root: Path) -> Optional[str]:
+    """Compute a directory-bounded path filter for semantic search.
+
+    For directories, returns a POSIX-normalized relative path with trailing
+    "/" to prevent prefix collisions (e.g., "docs/" vs "docs2/"). For files,
+    returns the exact relative path (no trailing slash) so the caller can do
+    an exact-match comparison. Returns None if scan_path is the project root
+    or does not exist.
+    """
+    if scan_path == project_root:
+        return None
+    try:
+        rel = scan_path.relative_to(project_root)
+    except ValueError:
+        return None
+    rel_str = rel.as_posix()
+    if rel_str and rel_str != ".":
+        # C-5: file paths must be exact-matched (no trailing slash), since
+        # "scripts/build.sh/" would never prefix-match a stored unit.file.
+        if scan_path.is_file():
+            return rel_str
+        return rel_str.rstrip("/") + "/"
+    return None
+
+
 def semantic_search(
     project_path: str,
     query: str,
@@ -1527,6 +1722,34 @@ def semantic_search(
     if not metadata_file.exists():
         raise FileNotFoundError(f"Metadata not found at {metadata_file}. Run build_semantic_index first.")
 
+    # Compute --path filter (relative to project_root). When the user passes
+    # `--path docs/`, results must be scoped to files under that subdirectory.
+    # When --path resolves to the project root itself (the default `.`), no
+    # filter is applied. unit["file"] is stored as a path relative to the
+    # project root by extract_units_from_project, so we compare against the
+    # relative form of scan_path. Path filter is a string prefix with a
+    # trailing "/" appended to avoid prefix collisions (e.g. "docs" matching
+    # "docs2/foo.md"). Missing scan_path -> empty results + stderr hint.
+    if not scan_path.exists():
+        print(
+            f"warning: --path {project_path!r} does not exist (resolved to {scan_path}); "
+            f"returning zero results.",
+            file=sys.stderr,
+        )
+        return []
+    if scan_path != project_root:
+        # Validate scan_path is inside the project before computing filter.
+        try:
+            scan_path.relative_to(project_root)
+        except ValueError:
+            print(
+                f"warning: --path {project_path!r} (resolved {scan_path}) is outside "
+                f"project root {project_root}; returning zero results.",
+                file=sys.stderr,
+            )
+            return []
+    path_filter = _compute_path_filter(scan_path, project_root)
+
     # Load index and metadata
     index = faiss.read_index(str(index_file))
     metadata = json.loads(metadata_file.read_text())
@@ -1542,9 +1765,30 @@ def semantic_search(
     query_embedding = compute_embedding(query_text, model_name=model, device=device)
     query_embedding = query_embedding.reshape(1, -1)
 
-    # Search -- request more results when filtering by language
+    # Search -- request more results when filtering (by language and/or path),
+    # since post-filtering can drop a large fraction of the FAISS candidates.
     filter_lang = language if language and language != "all" else None
-    search_k = min(k * 3 if filter_lang else k, len(units))
+    # Normalize path_filter to posix-style once before the loop so we don't
+    # repeat the replace() call for every candidate unit on Windows.
+    path_filter_posix = _normalize_file_path(path_filter) if path_filter else None
+    # C-5: when scan_path is a file, _compute_path_filter returns the exact
+    # rel_str (no trailing slash) and we must do an exact match instead of a
+    # prefix match. Detect "file mode" by the absence of a trailing slash.
+    path_filter_is_file = (
+        path_filter_posix is not None and not path_filter_posix.endswith("/")
+    )
+    # Adaptive over-fetch: path filtering in large monorepos can drop 95%+ of
+    # FAISS candidates (a small subdirectory vs. the full index). Use a higher
+    # multiplier when path filtering is active than for language-only filtering.
+    if path_filter_posix is not None and filter_lang is not None:
+        over_fetch_multiplier = 10  # both filters active: be generous
+    elif path_filter_posix is not None:
+        over_fetch_multiplier = 6   # path filter alone can be very selective
+    elif filter_lang is not None:
+        over_fetch_multiplier = 3   # language filter: moderate selectivity
+    else:
+        over_fetch_multiplier = 1
+    search_k = min(k * over_fetch_multiplier, len(units))
     scores, indices = index.search(query_embedding, search_k)
 
     # Build results
@@ -1557,6 +1801,18 @@ def semantic_search(
 
         if filter_lang and unit.get("language") != filter_lang:
             continue
+
+        if path_filter_posix is not None:
+            unit_file = unit.get("file", "")
+            # Normalize stored unit path to posix-style so the comparison works
+            # uniformly on Windows-built indices too.
+            unit_file_posix = _normalize_file_path(unit_file)
+            if path_filter_is_file:
+                # Exact-match mode (C-5): --path was a file, not a directory.
+                if unit_file_posix != path_filter_posix:
+                    continue
+            elif not unit_file_posix.startswith(path_filter_posix):
+                continue
 
         result = {
             "name": unit["name"],
