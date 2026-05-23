@@ -543,6 +543,7 @@ class HybridExtractor:
                             docstring=prev_comment,
                             is_async=is_async,
                             line_number=child.start_point[0] + 1,
+                            end_line=child.end_point[0] + 1,
                         ))
                         # Extract calls for inferred-name functions (CommonJS exports, object literals)
                         if defined_names:
@@ -683,6 +684,7 @@ class HybridExtractor:
             docstring=None,
             is_async=is_async,
             line_number=node.start_point[0] + 1,
+            end_line=node.end_point[0] + 1,
         )
 
     def _extract_ts_class(
@@ -744,6 +746,7 @@ class HybridExtractor:
             docstring=class_docstring,
             methods=methods,
             line_number=node.start_point[0] + 1,
+            end_line=node.end_point[0] + 1,
         )
 
     # === Go Extraction ===
@@ -913,6 +916,7 @@ class HybridExtractor:
             return_type=return_type,
             docstring=None,
             line_number=node.start_point[0] + 1,
+            end_line=node.end_point[0] + 1,
         )
 
     def _extract_go_method(self, node, source: bytes) -> FunctionInfo | None:
@@ -952,6 +956,7 @@ class HybridExtractor:
             docstring=None,
             is_method=True,
             line_number=node.start_point[0] + 1,
+            end_line=node.end_point[0] + 1,
         )
 
     def _extract_go_params(self, node, source: bytes) -> list[str]:
@@ -1006,6 +1011,7 @@ class HybridExtractor:
                                         docstring=None,
                                         is_method=True,
                                         line_number=iface_child.start_point[0] + 1,
+                                        end_line=iface_child.end_point[0] + 1,
                                     ))
 
         if not name:
@@ -1017,6 +1023,7 @@ class HybridExtractor:
             docstring=None,
             methods=methods,
             line_number=node.start_point[0] + 1,
+            end_line=node.end_point[0] + 1,
         )
 
     # === Rust Extraction ===
@@ -1156,6 +1163,7 @@ class HybridExtractor:
             docstring=None,
             is_async=is_async,
             line_number=node.start_point[0] + 1,
+            end_line=node.end_point[0] + 1,
         )
 
     def _extract_rust_params(self, node, source: bytes) -> list[str]:
@@ -1188,6 +1196,7 @@ class HybridExtractor:
             docstring=None,
             methods=[],
             line_number=node.start_point[0] + 1,
+            end_line=node.end_point[0] + 1,
         )
 
     def _extract_rust_trait(self, node, source: bytes) -> ClassInfo | None:
@@ -1210,6 +1219,7 @@ class HybridExtractor:
                             docstring=None,
                             is_method=True,
                             line_number=item.start_point[0] + 1,
+                            end_line=item.end_point[0] + 1,
                         ))
 
         if not name:
@@ -1415,6 +1425,7 @@ class HybridExtractor:
             docstring=None,
             methods=methods,
             line_number=node.start_point[0] + 1,
+            end_line=node.end_point[0] + 1,
         )
 
     def _extract_java_interface(self, node, source: bytes) -> ClassInfo | None:
@@ -1448,6 +1459,7 @@ class HybridExtractor:
             docstring=None,
             methods=methods,
             line_number=node.start_point[0] + 1,
+            end_line=node.end_point[0] + 1,
         )
 
     def _extract_java_method(self, node, source: bytes) -> FunctionInfo | None:
@@ -1474,6 +1486,7 @@ class HybridExtractor:
             docstring=None,
             is_method=True,
             line_number=node.start_point[0] + 1,
+            end_line=node.end_point[0] + 1,
         )
 
     def _extract_java_constructor(self, node, source: bytes, class_name: str) -> FunctionInfo | None:
@@ -1494,6 +1507,7 @@ class HybridExtractor:
             docstring=None,
             is_method=True,
             line_number=node.start_point[0] + 1,
+            end_line=node.end_point[0] + 1,
         )
 
     def _extract_java_params(self, node, source: bytes) -> list[str]:
@@ -1659,6 +1673,7 @@ class HybridExtractor:
             docstring=None,
             is_method=False,
             line_number=node.start_point[0] + 1,
+            end_line=node.end_point[0] + 1,
         )
 
     def _extract_c_params(self, node, source: bytes) -> list[str]:
@@ -1823,6 +1838,7 @@ class HybridExtractor:
             docstring=None,
             is_method=False,
             line_number=node.start_point[0] + 1,
+            end_line=node.end_point[0] + 1,
         )
 
     def _extract_cpp_params(self, node, source: bytes) -> list[str]:
@@ -1953,6 +1969,7 @@ class HybridExtractor:
             docstring=None,
             is_method=True,
             line_number=node.start_point[0] + 1,
+            end_line=node.end_point[0] + 1,
         )
 
     def _extract_ruby_params(self, node, source: bytes) -> list[str]:
@@ -1994,6 +2011,7 @@ class HybridExtractor:
             bases=[superclass] if superclass else [],
             docstring=None,
             line_number=node.start_point[0] + 1,
+            end_line=node.end_point[0] + 1,
         )
 
     def _extract_ruby_require(self, node, source: bytes) -> ImportInfo | None:
@@ -2148,6 +2166,7 @@ class HybridExtractor:
             return_type=return_type,
             docstring=None,
             line_number=node.start_point[0] + 1,
+            end_line=node.end_point[0] + 1,
         )
 
     def _extract_kotlin_params(self, node, source: bytes) -> list[str]:
@@ -2187,6 +2206,7 @@ class HybridExtractor:
             bases=[],
             docstring=None,
             line_number=node.start_point[0] + 1,
+            end_line=node.end_point[0] + 1,
         )
 
     def _extract_kotlin_import(self, node, source: bytes) -> ImportInfo | None:
@@ -2394,6 +2414,7 @@ class HybridExtractor:
             return_type=return_type,
             docstring=None,
             line_number=node.start_point[0] + 1,
+            end_line=node.end_point[0] + 1,
             language="swift",
         )
 
@@ -2434,6 +2455,7 @@ class HybridExtractor:
             bases=[],
             docstring=None,
             line_number=node.start_point[0] + 1,
+            end_line=node.end_point[0] + 1,
         )
 
     def _extract_swift_import(self, node, source: bytes) -> ImportInfo | None:
@@ -2535,6 +2557,7 @@ class HybridExtractor:
             return_type=return_type,
             docstring=None,
             line_number=node.start_point[0] + 1,
+            end_line=node.end_point[0] + 1,
         )
 
     def _extract_csharp_params(self, node, source: bytes) -> list[str]:
@@ -2572,6 +2595,7 @@ class HybridExtractor:
             bases=[],
             docstring=None,
             line_number=node.start_point[0] + 1,
+            end_line=node.end_point[0] + 1,
         )
 
     def _extract_csharp_import(self, node, source: bytes) -> ImportInfo | None:
@@ -2689,6 +2713,7 @@ class HybridExtractor:
             return_type=return_type,
             docstring=None,
             line_number=node.start_point[0] + 1,
+            end_line=node.end_point[0] + 1,
         )
 
     def _extract_scala_params(self, node, source: bytes) -> list[str]:
@@ -2729,6 +2754,7 @@ class HybridExtractor:
             bases=[],
             docstring=None,
             line_number=node.start_point[0] + 1,
+            end_line=node.end_point[0] + 1,
         )
 
     def _extract_scala_import(self, node, source: bytes) -> ImportInfo | None:
@@ -2871,6 +2897,7 @@ class HybridExtractor:
             return_type=None,  # Lua is dynamically typed
             docstring=None,
             line_number=node.start_point[0] + 1,
+            end_line=node.end_point[0] + 1,
         )
 
     def _extract_lua_params(self, node, source: bytes) -> list[str]:
@@ -3051,6 +3078,7 @@ class HybridExtractor:
             return_type=None,  # Could extract from type annotations but keeping minimal
             docstring=None,
             line_number=node.start_point[0] + 1,
+            end_line=node.end_point[0] + 1,
         )
 
     def _extract_luau_params(self, node, source: bytes) -> list[str]:
@@ -3235,6 +3263,7 @@ class HybridExtractor:
             return_type=None,
             docstring=None,
             line_number=node.start_point[0] + 1,
+            end_line=node.end_point[0] + 1,
         )
 
     # === PHP Extraction ===
@@ -3397,6 +3426,7 @@ class HybridExtractor:
             docstring=None,
             methods=methods,
             line_number=node.start_point[0] + 1,
+            end_line=node.end_point[0] + 1,
             type_keyword=type_keyword,
             parent_base=parent_base,
         ), deferred_calls
@@ -3425,6 +3455,7 @@ class HybridExtractor:
             docstring=None,
             is_method=is_method,
             line_number=node.start_point[0] + 1,
+            end_line=node.end_point[0] + 1,
             language="php",
         )
 

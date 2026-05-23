@@ -40,6 +40,7 @@ __all__ = [
     "get_imports",
     "get_intra_file_calls",
     "extract_file",
+    "extract_file_with_code",
     "get_dfg_context",
     "get_pdg_context",
     "get_slice",
@@ -205,6 +206,7 @@ __all__ = [
     "query",
     "FunctionContext",
     "RelevantContext",
+    "extract_file_with_code",
     # Cross-file functions
     "build_project_call_graph",
     "scan_project_files",
@@ -1290,6 +1292,25 @@ def get_intra_file_calls(file_path: str) -> dict:
     }
 
 
+def _load_module_info(file_path: str, base_path: str | None = None):
+    """Validate the path and extract module info — shared preamble for
+    :func:`extract_file` and :func:`extract_file_with_code`.
+
+    Returns a ``(path, module_info)`` tuple. Raises ``FileNotFoundError``
+    if the path does not exist and ``PathTraversalError`` / ``ValueError``
+    via :func:`_validate_path_containment`.
+    """
+    # Security: Validate path containment
+    _validate_path_containment(file_path, base_path)
+
+    path = Path(file_path)
+    if not path.exists():
+        raise FileNotFoundError(f"File not found: {file_path}")
+
+    module_info = _extract_file_impl(file_path)
+    return path, module_info
+
+
 def extract_file(file_path: str, base_path: str | None = None) -> dict:
     """
     Extract code structure from any supported file.
@@ -1308,8 +1329,11 @@ def extract_file(file_path: str, base_path: str | None = None) -> dict:
         - language: Detected language (e.g., "python")
         - docstring: Module-level docstring if present
         - imports: List of import dicts
-        - functions: List of function dicts with signatures
-        - classes: List of class dicts with methods
+        - functions: List of function dicts with signatures (each includes
+          an ``end_line`` key giving the symbol's last source line, or 0
+          when the underlying extractor cannot determine it)
+        - classes: List of class dicts with methods (also includes
+          ``end_line`` on each class and method)
         - call_graph: Dict with calls and called_by relationships
 
     Raises:
@@ -1322,15 +1346,160 @@ def extract_file(file_path: str, base_path: str | None = None) -> dict:
         >>> print(info["functions"][0]["signature"])
         'def my_function(x: int) -> str'
     """
-    # Security: Validate path containment
-    _validate_path_containment(file_path, base_path)
-
-    path = Path(file_path)
-    if not path.exists():
-        raise FileNotFoundError(f"File not found: {file_path}")
-
-    module_info = _extract_file_impl(file_path)
+    _, module_info = _load_module_info(file_path, base_path)
     return module_info.to_dict()
+
+
+def _inject_method_code_spans(classes: list, method_end: dict, _span) -> None:
+    """Inject 'code' spans on all methods in the given filtered classes."""
+    for c in classes:
+        for m in c.get("methods", []):
+            m_end = method_end.get(
+                (c.get("name"), m.get("name"), m.get("line_number")), 0
+            )
+            m_code = _span(m.get("line_number") or 0, m_end)
+            if m_code is not None:
+                m["code"] = m_code
+
+
+def extract_file_with_code(
+    file_path: str,
+    function: str | None = None,
+    method: str | None = None,
+    class_: str | None = None,
+    base_path: str | None = None,
+) -> dict:
+    """
+    Extract code structure and inject a 'code' (source span) field on
+    symbols matched by ``function`` / ``method`` / ``class_`` filters.
+
+    Same return shape as :func:`extract_file`, plus a ``code`` key on
+    each matched function / method / class dict whose extractor populated
+    ``end_line``. Bare extraction (no filter) is left unchanged — callers
+    that want metadata only should keep using :func:`extract_file`.
+
+    Args:
+        file_path: Path to the file to analyze
+        function: Name of a top-level function to filter to (and enrich)
+        method: ``Class.method`` selector to filter to (and enrich)
+        class_: Class name to filter to (enriches the class and its methods)
+        base_path: Optional base directory for path containment validation
+
+    Returns:
+        Dict with the same shape as :func:`extract_file` (including the
+        ``end_line`` key on every function / method / class dict), plus a
+        ``code`` field on matches whose ``end_line`` is known.
+    """
+    path, module_info = _load_module_info(file_path, base_path)
+    result = module_info.to_dict()
+
+    if not (function or method or class_):
+        return result
+
+    # Build {(name, line_number): end_line} maps from the dataclasses
+    # so we can look up end_line without exposing it in to_dict().
+    func_end = {(f.name, f.line_number): f.end_line for f in module_info.functions}
+    class_end = {(c.name, c.line_number): c.end_line for c in module_info.classes}
+    method_end = {
+        (c.name, m.name, m.line_number): m.end_line
+        for c in module_info.classes
+        for m in c.methods
+    }
+
+    try:
+        source_lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except (OSError, UnicodeError):
+        source_lines = None
+
+    def _span(start: int, end: int) -> str | None:
+        if source_lines is None or start <= 0 or end <= 0 or end < start:
+            return None
+        lo = start - 1
+        hi = min(end, len(source_lines))
+        if lo >= len(source_lines):
+            return None
+        return "\n".join(source_lines[lo:hi])
+
+    # Apply class filter
+    if class_:
+        result["classes"] = [
+            c for c in result.get("classes", [])
+            if c.get("name") == class_
+        ]
+    elif method:
+        parts = method.split(".", 1)
+        if len(parts) == 2:
+            class_name, method_name = parts
+            filtered = []
+            for c in result.get("classes", []):
+                if c.get("name") == class_name:
+                    c_copy = dict(c)
+                    c_copy["methods"] = [
+                        m for m in c.get("methods", [])
+                        if m.get("name") == method_name
+                    ]
+                    filtered.append(c_copy)
+            result["classes"] = filtered
+        else:
+            result["classes"] = []
+    elif function:
+        # When the filter is `function=NAME` and NAME matches no top-level
+        # function, fall back to searching classes[].methods[] so the named
+        # symbol still surfaces. The containing class is retained with the
+        # method list narrowed to just the matching entries.
+        top_level_match = any(
+            f.get("name") == function
+            for f in result.get("functions", [])
+        )
+        if top_level_match:
+            result["classes"] = []
+        else:
+            filtered = []
+            for c in result.get("classes", []):
+                matching_methods = [
+                    m for m in c.get("methods", [])
+                    if m.get("name") == function
+                ]
+                if matching_methods:
+                    c_copy = dict(c)
+                    c_copy["methods"] = matching_methods
+                    filtered.append(c_copy)
+            result["classes"] = filtered
+    else:
+        result["classes"] = []
+
+    # Apply function filter
+    if function:
+        result["functions"] = [
+            f for f in result.get("functions", [])
+            if f.get("name") == function
+        ]
+    elif class_ or method:
+        # Class or method filter implies the caller wants only the named
+        # class/method; clear top-level functions for a minimal result.
+        # (CLI bare-extract path does not call this function and is unaffected.)
+        result["functions"] = []
+
+    # Inject 'code' on filtered matches whose extractor knows end_line.
+    if function:
+        for f in result.get("functions", []):
+            end = func_end.get((f.get("name"), f.get("line_number")), 0)
+            code = _span(f.get("line_number") or 0, end)
+            if code is not None:
+                f["code"] = code
+        # If `function` fell back to a class method, inject method code spans too.
+        _inject_method_code_spans(result.get("classes", []), method_end, _span)
+    if class_:
+        for c in result.get("classes", []):
+            end = class_end.get((c.get("name"), c.get("line_number")), 0)
+            code = _span(c.get("line_number") or 0, end)
+            if code is not None:
+                c["code"] = code
+        _inject_method_code_spans(result.get("classes", []), method_end, _span)
+    elif method:
+        _inject_method_code_spans(result.get("classes", []), method_end, _span)
+
+    return result
 
 
 # =============================================================================

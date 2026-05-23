@@ -36,6 +36,7 @@ class FunctionInfo:
     line_number: int = 0
     language: str = ""
     is_class_wrapper: bool = False
+    end_line: int = 0
 
     def signature(self) -> str:
         """Return full signature string."""
@@ -64,6 +65,7 @@ class ClassInfo:
     line_number: int = 0
     type_keyword: str = "class"
     parent_base: str | None = None
+    end_line: int = 0
 
     def signature(self) -> str:
         """Return class definition signature."""
@@ -154,6 +156,7 @@ class ModuleInfo:
                 {
                     "name": c.name,
                     "line_number": c.line_number,
+                    "end_line": c.end_line,
                     "signature": c.signature(),
                     "bases": c.bases,
                     "docstring": c.docstring,
@@ -162,6 +165,7 @@ class ModuleInfo:
                         {
                             "name": m.name,
                             "line_number": m.line_number,
+                            "end_line": m.end_line,
                             "signature": m.signature(),
                             "params": m.params,
                             "return_type": m.return_type,
@@ -178,6 +182,7 @@ class ModuleInfo:
                 {
                     "name": f.name,
                     "line_number": f.line_number,
+                    "end_line": f.end_line,
                     "signature": f.signature(),
                     "params": f.params,
                     "return_type": f.return_type,
@@ -341,6 +346,7 @@ class PythonASTExtractor:
             docstring=ast.get_docstring(node),
             decorators=decorators,
             line_number=node.lineno,
+            end_line=getattr(node, "end_lineno", 0) or 0,
         )
 
         # Extract methods and nested classes
@@ -378,6 +384,7 @@ class PythonASTExtractor:
                             is_async=method.is_async,
                             decorators=[f"nested_in:{qualified_name}.{nested_class.name}"] + method.decorators,
                             line_number=method.line_number,
+                            end_line=method.end_line,
                         )
                         module_info.functions.append(nested_method)
 
@@ -426,6 +433,7 @@ class PythonASTExtractor:
             is_async=isinstance(node, ast.AsyncFunctionDef),
             decorators=decorators,
             line_number=node.lineno,
+            end_line=getattr(node, "end_lineno", 0) or 0,
         )
 
     def _extract_params(self, args: ast.arguments) -> list[str]:

@@ -704,59 +704,31 @@ Semantic Search:
             print(json.dumps(result, indent=2))
 
         elif args.command == "extract":
-            result = extract_file(args.file)
-
             # Apply filters if specified
             filter_class = getattr(args, "filter_class", None)
             filter_function = getattr(args, "filter_function", None)
             filter_method = getattr(args, "filter_method", None)
 
             if filter_class or filter_function or filter_method:
-                # Filter classes
-                if filter_class:
-                    result["classes"] = [
-                        c for c in result.get("classes", [])
-                        if c.get("name") == filter_class
-                    ]
-                elif filter_method:
-                    # Parse Class.method syntax
-                    parts = filter_method.split(".", 1)
-                    if len(parts) == 2:
-                        class_name, method_name = parts
-                        filtered_classes = []
-                        for c in result.get("classes", []):
-                            if c.get("name") == class_name:
-                                # Filter to only the requested method
-                                c_copy = dict(c)
-                                c_copy["methods"] = [
-                                    m for m in c.get("methods", [])
-                                    if m.get("name") == method_name
-                                ]
-                                filtered_classes.append(c_copy)
-                        result["classes"] = filtered_classes
-                else:
-                    # No class filter, clear classes
-                    result["classes"] = []
-
-                # Filter functions
-                if filter_function:
-                    result["functions"] = [
-                        f for f in result.get("functions", [])
-                        if f.get("name") == filter_function
-                    ]
-                elif not filter_method:
-                    # No function filter (and not method filter), clear functions if class filter active
-                    if filter_class:
-                        result["functions"] = []
-
-            if not (filter_class or filter_function or filter_method):
-                # Bare extract dumps every symbol's metadata to stdout. For
-                # large files this overwhelms callers (especially LLM agents)
-                # who misread the dump as targeted output. Advise on filter
-                # flags via stderr when the file has more than 5 symbols.
+                # Filtered extract: use the helper that also injects a
+                # 'code' (source span) field on matched symbols whose
+                # extractor populated end_line.
+                from .api import extract_file_with_code
+                result = extract_file_with_code(
+                    args.file,
+                    function=filter_function,
+                    method=filter_method,
+                    class_=filter_class,
+                )
+            else:
+                # Bare extract: metadata only, with warning for large files.
+                result = extract_file(args.file)
                 n_symbols = (
                     len(result.get("functions", []))
-                    + sum(len(c.get("methods", [])) for c in result.get("classes", []))
+                    + sum(
+                        len(c.get("methods", []))
+                        for c in result.get("classes", [])
+                    )
                     + len(result.get("classes", []))
                 )
                 if n_symbols > 5:  # Threshold for warning on bare extract with many symbols
@@ -764,6 +736,7 @@ Semantic Search:
                         f"tldr: extract dumped {n_symbols} symbols' metadata from {args.file}.\n"
                         f"      Pass --function NAME / --method Class.method / --class Name to filter.\n"
                     )
+
             print(json.dumps(result, indent=2))
 
         elif args.command == "context":
