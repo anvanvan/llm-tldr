@@ -694,6 +694,13 @@ Semantic Search:
                 max_files=args.max_files,
                 ignore_spec=ignore_spec,
             )
+            if not result and r"\|" in args.pattern:
+                print(
+                    r"Hint: pattern contains '\|' which ERE treats as a literal "
+                    r"backslash-pipe, not alternation. Use a bare '|' for "
+                    r"alternation (e.g. 'foo|bar').",
+                    file=sys.stderr,
+                )
             print(json.dumps(result, indent=2))
 
         elif args.command == "extract":
