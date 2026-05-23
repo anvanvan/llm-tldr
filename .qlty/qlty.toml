@@ -82,3 +82,12 @@ name = "ruff"
 [[plugin]]
 name = "bandit"
 
+[[plugin]]
+name = "knip"
+
+[[plugin]]
+name = "clippy"
+
+[[plugin]]
+name = "eslint"
+

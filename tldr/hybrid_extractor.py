@@ -13,6 +13,7 @@ Output is unified across all extractors.
 import json
 import logging
 import os
+import re
 from pathlib import Path
 from typing import Any
 
@@ -364,7 +365,9 @@ class HybridExtractor:
     def _extract_pygments(self, file_path: Path) -> ModuleInfo:
         """Extract using Pygments (signatures only)."""
         try:
-            signatures_text = self._pygments_extractor.get_signatures(str(file_path))
+            signatures_text = self._pygments_extractor.get_signatures(
+                str(file_path), linenos=True
+            )
             signatures = self._parse_signatures(signatures_text)
         except Exception as e:
             logger.warning(f"Pygments extraction failed for {file_path}: {e}")
@@ -374,16 +377,19 @@ class HybridExtractor:
         # Pygments doesn't give us enough info to distinguish classes from functions
         # so we put everything in functions
         detected_lang = self._detect_language(file_path)
-        functions = [
-            FunctionInfo(
-                name=sig.split("(")[0].strip() if "(" in sig else sig,
-                params=self._extract_params_from_sig(sig),
-                return_type=None,
-                docstring=None,
-                language=detected_lang,
+        functions = []
+        for sig in signatures:
+            sig_text, line_number = self._strip_line_suffix(sig)
+            functions.append(
+                FunctionInfo(
+                    name=sig_text.split("(")[0].strip() if "(" in sig_text else sig_text,
+                    params=self._extract_params_from_sig(sig_text),
+                    return_type=None,
+                    docstring=None,
+                    language=detected_lang,
+                    line_number=line_number,
+                )
             )
-            for sig in signatures
-        ]
 
         return ModuleInfo(
             file_path=str(file_path),
@@ -3621,6 +3627,19 @@ class HybridExtractor:
             for line in lines
             if line.strip() and not line.startswith("#") and not line.startswith("```")
         ]
+
+    _LINE_SUFFIX_RE = re.compile(r"\s*\(line\s+(\d+)\)\s*$")
+
+    def _strip_line_suffix(self, sig: str) -> tuple[str, int]:
+        """Strip a trailing ``(line N)`` marker from a Pygments signature.
+
+        Returns ``(sig_without_suffix, line_number)``. When no suffix is
+        present, ``line_number`` is 0 (matching FunctionInfo's default).
+        """
+        m = self._LINE_SUFFIX_RE.search(sig)
+        if not m:
+            return sig, 0
+        return sig[: m.start()].rstrip(), int(m.group(1))
 
     def _extract_params_from_sig(self, sig: str) -> list[str]:
         """Extract params from signature string."""

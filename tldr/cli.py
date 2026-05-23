@@ -30,7 +30,7 @@ if os.name == 'nt':
         pass
 
 from . import __version__
-from .api import SUPPORTED_CONTEXT_LANGUAGES
+from .api import SUPPORTED_CONTEXT_LANGUAGES, _serialize_call_graph_to_cache
 from .semantic import ALL_LANGUAGES, EXTENSION_TO_LANGUAGE
 
 
@@ -67,6 +67,91 @@ def detect_language_from_extension(file_path: str) -> str:
     if tag not in ALL_LANGUAGES:
         return 'python'
     return tag
+
+
+def get_cached_languages(project_path: str | Path) -> list[str] | None:
+    """Read cached languages from .tldr/languages.json if available.
+
+    Returns the list of cached languages re-sorted with call-graph-supported
+    languages first (consistent with _detect_project_languages sort), or None
+    if no cache exists or the cache cannot be read.
+    """
+    lang_cache = Path(project_path) / ".tldr" / "languages.json"
+    if lang_cache.exists():
+        try:
+            data = json.loads(lang_cache.read_text())
+            langs = data.get("languages")
+            if langs:
+                # Re-sort with call-graph-supported languages first
+                # to stay consistent with _detect_project_languages sort
+                from tldr.cross_file_calls import CALL_GRAPH_LANGUAGES
+                langs = sorted(langs, key=lambda l: (0 if l in CALL_GRAPH_LANGUAGES else 1, l))
+            return langs
+        except (json.JSONDecodeError, OSError):
+            pass
+    return None
+
+
+class NoSupportedContextLanguagesError(Exception):
+    """Raised when language detection finds source files but none of the detected
+    languages are in SUPPORTED_CONTEXT_LANGUAGES (e.g., a Ruby+Elixir project).
+    """
+
+    def __init__(self, detected: list[str], supported: list[str]):
+        self.detected = detected
+        self.supported = supported
+        super().__init__(
+            f"no supported context languages in project "
+            f"(found: {', '.join(detected) or '<none>'}; "
+            f"supported: {', '.join(supported)})"
+        )
+
+
+def _resolve_context_languages(
+    lang_arg: str,
+    project_path: "str | Path",
+    respect_ignore: bool = True,
+) -> list[str]:
+    """Convert lang_arg + project_path into the ordered list of languages to
+    probe for the `context` command.
+
+    Branches:
+      - "all"  → sorted(SUPPORTED_CONTEXT_LANGUAGES) unconditionally.
+      - "auto" → languages cached for the project (or detected if no cache),
+                 filtered to SUPPORTED_CONTEXT_LANGUAGES. If detection found
+                 languages but none are supported, raises
+                 NoSupportedContextLanguagesError. If truly empty, returns
+                 ["python"] (consistent with resolve_language fallback).
+      - explicit (e.g., "swift") → [lang_arg].
+    """
+    if lang_arg == "all":
+        return sorted(SUPPORTED_CONTEXT_LANGUAGES)
+
+    if lang_arg == "auto":
+        cached = get_cached_languages(project_path) or []
+        if not cached:
+            from .semantic import _detect_project_languages
+            cached = _detect_project_languages(
+                project_path, respect_ignore=respect_ignore
+            ) or []
+        present = [l for l in cached if l in SUPPORTED_CONTEXT_LANGUAGES]
+        if cached and not present:
+            raise NoSupportedContextLanguagesError(
+                detected=cached,
+                supported=sorted(SUPPORTED_CONTEXT_LANGUAGES),
+            )
+        if not cached:
+            return ["python"]
+        return present
+
+    # Argparse `choices=` already restricts lang_arg to "all", "auto", or a
+    # supported language. The "all" and "auto" branches return above, so by
+    # the time we get here lang_arg must be in SUPPORTED_CONTEXT_LANGUAGES.
+    assert lang_arg in SUPPORTED_CONTEXT_LANGUAGES, (
+        f"_resolve_context_languages: unexpected lang_arg={lang_arg!r}; "
+        f"argparse choices should have rejected this upstream."
+    )
+    return [lang_arg]
 
 
 def _show_first_run_tip():
@@ -219,8 +304,10 @@ Semantic Search:
     ctx_p.add_argument(
         "--lang",
         default="auto",
-        choices=["auto", *sorted(SUPPORTED_CONTEXT_LANGUAGES)],
-        help="Language for call-graph context (auto=detect; supported: python, typescript, javascript, go, rust, php, swift, java)",
+        choices=["auto", "all", *sorted(SUPPORTED_CONTEXT_LANGUAGES)],
+        help="Language for call-graph context (auto=detect languages in project; "
+             "all=probe every supported language regardless of detection; "
+             "or specify one: python, typescript, javascript, go, rust, php, swift, java)",
     )
 
     # tldr cfg <file> <function>
@@ -516,15 +603,9 @@ Semantic Search:
                             graph = patch_call_graph(graph, str(abs_file), str(project), lang=lang)
 
                     # Update cache with patched graph
-                    cache_data = {
-                        "edges": [
-                            {"from_file": e[0], "from_func": e[1], "to_file": e[2], "to_func": e[3]}
-                            for e in graph.edges
-                        ],
-                        "languages": cache_langs if cache_langs else [lang],
-                        "timestamp": time.time(),
-                    }
-                    cache_file.write_text(json.dumps(cache_data, indent=2))
+                    _serialize_call_graph_to_cache(
+                        cache_file, graph, cache_langs if cache_langs else [lang]
+                    )
 
                     # Clear dirty flag
                     clear_dirty(project)
@@ -539,15 +620,7 @@ Semantic Search:
 
         # Save to cache
         cache_dir.mkdir(parents=True, exist_ok=True)
-        cache_data = {
-            "edges": [
-                {"from_file": e[0], "from_func": e[1], "to_file": e[2], "to_func": e[3]}
-                for e in graph.edges
-            ],
-            "languages": [lang],
-            "timestamp": time.time(),
-        }
-        cache_file.write_text(json.dumps(cache_data, indent=2))
+        _serialize_call_graph_to_cache(cache_file, graph, [lang])
 
         # Clear any dirty flag since we just rebuilt
         clear_dirty(project)
@@ -568,23 +641,6 @@ Semantic Search:
             use_gitignore=True,
             cli_patterns=cli_patterns if cli_patterns else None,
         )
-
-    def get_cached_languages(project_path: str | Path) -> list[str] | None:
-        """Read cached languages from .tldr/languages.json if available."""
-        lang_cache = Path(project_path) / ".tldr" / "languages.json"
-        if lang_cache.exists():
-            try:
-                data = json.loads(lang_cache.read_text())
-                langs = data.get("languages")
-                if langs:
-                    # Re-sort with call-graph-supported languages first
-                    # to stay consistent with _detect_project_languages sort
-                    from tldr.cross_file_calls import CALL_GRAPH_LANGUAGES
-                    langs = sorted(langs, key=lambda l: (0 if l in CALL_GRAPH_LANGUAGES else 1, l))
-                return langs
-            except (json.JSONDecodeError, OSError):
-                pass
-        return None
 
     def _resolve_device(args_device: str | None) -> str | None:
         """Resolve compute device: CLI arg > TLDR_DEVICE env > None (auto-pick).
@@ -747,16 +803,21 @@ Semantic Search:
             print(json.dumps(result, indent=2))
 
         elif args.command == "context":
-            lang = resolve_language(args.lang, args.project)
-            if lang not in SUPPORTED_CONTEXT_LANGUAGES:
-                print(
-                    f"Warning: language '{lang}' is not supported by context command. "
-                    f"Supported languages: {', '.join(sorted(SUPPORTED_CONTEXT_LANGUAGES))}",
-                    file=sys.stderr,
+            from .api import get_relevant_context_multi
+            project_path = Path(args.project).resolve()
+            respect_ignore = not getattr(args, "no_ignore", False)
+            try:
+                languages = _resolve_context_languages(
+                    args.lang, project_path, respect_ignore=respect_ignore,
                 )
+            except NoSupportedContextLanguagesError as e:
+                print(f"Error: {e}", file=sys.stderr)
                 sys.exit(1)
-            ctx = get_relevant_context(
-                args.project, args.entry, depth=args.depth, language=lang
+            ctx = get_relevant_context_multi(
+                project_path,
+                args.entry,
+                depth=args.depth,
+                languages=languages,
             )
             if ctx.error:
                 print(ctx.to_llm_string(), file=sys.stderr)

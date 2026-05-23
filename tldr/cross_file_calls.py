@@ -4,18 +4,20 @@ Cross-file call graph resolution.
 Builds a project-wide call graph that resolves function calls across files
 by analyzing import statements and matching call sites to definitions.
 
-Supports: Python (.py), TypeScript (.ts, .tsx), Go (.go), and Rust (.rs)
+Supports: Python, TypeScript, JavaScript, Go, Rust, Java, C, C++, Ruby, PHP,
+Swift, Kotlin, C#, Scala, Lua, Luau, and Elixir.
 
 Key functions:
 - scan_project(root, language) - find all source files in a project
-- parse_imports(file) - extract import statements from a file
+- parse_imports(file, language) - extract import statements from a file
 - build_function_index(root, language) - map {module.func: file_path} for all functions
-- resolve_calls(file, index) - match call sites to definitions
+- resolve_calls(file, index, language) - match call sites to definitions
 - build_project_call_graph(root, language) - orchestrate all to build complete graph
 """
 
 import ast
 import os
+import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterator, Optional
@@ -101,6 +103,28 @@ try:
     TREE_SITTER_SWIFT_AVAILABLE = True
 except ImportError:
     pass
+
+def _warn_swift_unavailable_once() -> None:
+    """Emit a Python warning when tree_sitter_swift is missing.
+
+    Swift call-graph and import extraction silently degrade to empty results
+    when the optional ``tree_sitter_swift`` dependency is not installed.
+    This helper surfaces that degradation as a ``RuntimeWarning`` so callers
+    and end users get an actionable diagnostic.
+
+    Implementation note: relies on Python's default warning-filter
+    de-duplication (``"once"`` per message+category+module) to deliver a
+    single emission per process under normal use, while still re-emitting
+    under ``warnings.simplefilter("always")`` (used by tests). A module-level
+    flag would block the second emission under "always" and break diagnostics.
+    """
+    warnings.warn(
+        "tree_sitter_swift is not installed; Swift import and call-graph "
+        "extraction will return empty results. Install the optional "
+        "'tree_sitter_swift' package to enable Swift support.",
+        RuntimeWarning,
+        stacklevel=2,
+    )
 
 # Tree-sitter support for C#
 TREE_SITTER_CSHARP_AVAILABLE = False
@@ -2045,6 +2069,7 @@ def parse_swift_imports(file_path: str | Path) -> list[dict]:
         - import struct Foundation.Date -> module='Foundation.Date', kind='struct'
     """
     if not TREE_SITTER_SWIFT_AVAILABLE:
+        _warn_swift_unavailable_once()
         return []
 
     file_path = Path(file_path)
@@ -2261,8 +2286,12 @@ def build_function_index(
             _index_php_file(src_path, rel_path, module_name, simple_module, index)
         elif language == "elixir":
             _index_elixir_file(src_path, rel_path, module_name, simple_module, index)
-        elif language == "swift":
-            _index_swift_file(src_path, rel_path, module_name, simple_module, index)
+        # Swift is handled via the self-contained builder path
+        # (see ``self_contained_languages`` set in build_project_call_graph),
+        # so build_function_index is never invoked for it. The previous
+        # ``elif language == "swift": _index_swift_file(...)`` branch called
+        # a function that was never defined — a latent NameError if anyone
+        # removed Swift from self_contained_languages. Branch deleted.
 
     return index
 
@@ -4972,6 +5001,7 @@ def _swift_func_name(node, source):
 def _extract_swift_file_calls(file_path: Path, root: Path):
     """Returns (defined_names: set, calls_by_func: dict[name, [(ctype, target)]])."""
     if not TREE_SITTER_SWIFT_AVAILABLE:
+        _warn_swift_unavailable_once()
         return set(), {}
 
     try:
@@ -5054,6 +5084,7 @@ def _build_swift_call_graph(
 ):
     """Build call graph for Swift files."""
     if not TREE_SITTER_SWIFT_AVAILABLE:
+        _warn_swift_unavailable_once()
         return
     per_file: list[tuple[str, set, dict]] = []
     global_defs: dict[str, str] = {}

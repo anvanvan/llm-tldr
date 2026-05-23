@@ -8,12 +8,16 @@ from pygments_tldr.util import ClassNotFound
 
 
 class SignatureExtractor():
-    def get_signatures(self, filename):
+    def get_signatures(self, filename, linenos=False):
         """
         Extracts function signatures from the provided code.
+
+        When ``linenos=True`` each signature is suffixed with ``(line N)`` so
+        callers (notably the Pygments fallback in hybrid_extractor) can recover
+        the source line without falling back to the default ``line_number=0``.
         """
         # Parse command line options
-        show_linenos = False
+        show_linenos = linenos
         full_document = False
 
         # Check if file exists
