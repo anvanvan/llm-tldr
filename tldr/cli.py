@@ -197,7 +197,7 @@ Semantic Search:
     )
 
     # tldr extract <file> [--class X] [--function Y] [--method Class.method]
-    extract_p = subparsers.add_parser("extract", help="Extract full file info")
+    extract_p = subparsers.add_parser("extract", help="Extract full file info (warns if bare on >5 symbols)")
     extract_p.add_argument("file", help="File to analyze")
     extract_p.add_argument("--class", dest="filter_class", help="Filter to specific class")
     extract_p.add_argument("--function", dest="filter_function", help="Filter to specific function")
@@ -749,6 +749,21 @@ Semantic Search:
                     if filter_class:
                         result["functions"] = []
 
+            if not (filter_class or filter_function or filter_method):
+                # Bare extract dumps every symbol's metadata to stdout. For
+                # large files this overwhelms callers (especially LLM agents)
+                # who misread the dump as targeted output. Advise on filter
+                # flags via stderr when the file has more than 5 symbols.
+                n_symbols = (
+                    len(result.get("functions", []))
+                    + sum(len(c.get("methods", [])) for c in result.get("classes", []))
+                    + len(result.get("classes", []))
+                )
+                if n_symbols > 5:  # Threshold for warning on bare extract with many symbols
+                    sys.stderr.write(
+                        f"tldr: extract dumped {n_symbols} symbols' metadata from {args.file}.\n"
+                        f"      Pass --function NAME / --method Class.method / --class Name to filter.\n"
+                    )
             print(json.dumps(result, indent=2))
 
         elif args.command == "context":
