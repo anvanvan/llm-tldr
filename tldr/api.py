@@ -1197,9 +1197,20 @@ def get_relevant_context_multi(
     which performs its own internal auto-detect when the requested language
     has no files in the project. As a result, a force-probed language can be
     silently overridden by the auto-detected one (e.g., Swift probe in a
-    Python-only project will resolve via Python). Callers needing strict
+    Python-only project will resolve via Python).
+
+    More subtly, even when the force-probed language IS present in the project
+    and the entry symbol's name appears in that language's source files,
+    :func:`get_relevant_context`'s internal auto-detect may still promote a
+    different language for the resolving file (for instance, when a project
+    has both Python and TypeScript copies of the symbol). In that case the
+    returned :class:`RelevantContext` reflects the auto-detected language for
+    the file actually resolved, not the language this function was asked to
+    probe. The probe order here only governs which language is *tried first*,
+    not which language ultimately resolves the file. Callers needing strict
     per-language semantics should pre-filter ``languages`` to those actually
-    present in the project.
+    present in the project and avoid relying on the input ``languages`` order
+    as a guarantee of the resolved language.
 
     On all-miss, returns a :class:`RelevantContext` whose ``error`` lists the
     languages probed (in input order). For an empty ``languages`` argument,

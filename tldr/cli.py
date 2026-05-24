@@ -31,6 +31,7 @@ if os.name == 'nt':
 
 from . import __version__
 from .api import SUPPORTED_CONTEXT_LANGUAGES, _serialize_call_graph_to_cache
+from .cross_file_calls import CALL_GRAPH_LANGUAGES
 from .semantic import ALL_LANGUAGES, EXTENSION_TO_LANGUAGE
 
 
@@ -47,6 +48,11 @@ LANG_CHOICES = ["auto", *ALL_LANGUAGES]
 LANG_CHOICES_WITH_ALL = [*LANG_CHOICES, "all"]
 
 # SUPPORTED_CONTEXT_LANGUAGES is now imported from api.py (single source of truth)
+
+# Choices accepted by `tldr context --lang`: 'auto', 'all', or any explicit
+# supported language. Lifted to module scope so the argparse subparser stays
+# readable and the choices list is reusable for tests/tooling.
+CONTEXT_LANG_CHOICES = ["auto", "all", *sorted(SUPPORTED_CONTEXT_LANGUAGES)]
 
 
 def detect_language_from_extension(file_path: str) -> str:
@@ -84,7 +90,6 @@ def get_cached_languages(project_path: str | Path) -> list[str] | None:
             if langs:
                 # Re-sort with call-graph-supported languages first
                 # to stay consistent with _detect_project_languages sort
-                from tldr.cross_file_calls import CALL_GRAPH_LANGUAGES
                 langs = sorted(langs, key=lambda l: (0 if l in CALL_GRAPH_LANGUAGES else 1, l))
             return langs
         except (json.JSONDecodeError, OSError):
@@ -97,11 +102,18 @@ class NoSupportedContextLanguagesError(Exception):
     languages are in SUPPORTED_CONTEXT_LANGUAGES (e.g., a Ruby+Elixir project).
     """
 
-    def __init__(self, detected: list[str], supported: list[str]):
+    def __init__(
+        self,
+        detected: list[str],
+        supported: list[str],
+        project_path: str | Path | None = None,
+    ):
         self.detected = detected
-        self.supported = supported
+        self.supported = frozenset(supported)
+        self.project_path = project_path
+        loc = f"'{project_path}'" if project_path is not None else "project"
         super().__init__(
-            f"no supported context languages in project "
+            f"no supported context languages in {loc} "
             f"(found: {', '.join(detected) or '<none>'}; "
             f"supported: {', '.join(supported)})"
         )
@@ -109,7 +121,7 @@ class NoSupportedContextLanguagesError(Exception):
 
 def _resolve_context_languages(
     lang_arg: str,
-    project_path: "str | Path",
+    project_path: str | Path,
     respect_ignore: bool = True,
 ) -> list[str]:
     """Convert lang_arg + project_path into the ordered list of languages to
@@ -128,29 +140,29 @@ def _resolve_context_languages(
         return sorted(SUPPORTED_CONTEXT_LANGUAGES)
 
     if lang_arg == "auto":
-        cached = get_cached_languages(project_path) or []
-        if not cached:
+        detected = get_cached_languages(project_path) or []
+        if not detected:
             from .semantic import _detect_project_languages
-            cached = _detect_project_languages(
+            detected = _detect_project_languages(
                 project_path, respect_ignore=respect_ignore
             ) or []
-        present = [l for l in cached if l in SUPPORTED_CONTEXT_LANGUAGES]
-        if cached and not present:
+        supported = [l for l in detected if l in SUPPORTED_CONTEXT_LANGUAGES]
+        if detected and not supported:
             raise NoSupportedContextLanguagesError(
-                detected=cached,
+                detected=detected,
                 supported=sorted(SUPPORTED_CONTEXT_LANGUAGES),
+                project_path=project_path,
             )
-        if not cached:
-            return ["python"]
-        return present
+        return supported or ["python"]
 
     # Argparse `choices=` already restricts lang_arg to "all", "auto", or a
     # supported language. The "all" and "auto" branches return above, so by
     # the time we get here lang_arg must be in SUPPORTED_CONTEXT_LANGUAGES.
-    assert lang_arg in SUPPORTED_CONTEXT_LANGUAGES, (
-        f"_resolve_context_languages: unexpected lang_arg={lang_arg!r}; "
-        f"argparse choices should have rejected this upstream."
-    )
+    if lang_arg not in SUPPORTED_CONTEXT_LANGUAGES:
+        raise ValueError(
+            f"_resolve_context_languages: unexpected lang_arg={lang_arg!r}; "
+            "argparse choices should have rejected this upstream."
+        )
     return [lang_arg]
 
 
@@ -304,7 +316,7 @@ Semantic Search:
     ctx_p.add_argument(
         "--lang",
         default="auto",
-        choices=["auto", "all", *sorted(SUPPORTED_CONTEXT_LANGUAGES)],
+        choices=CONTEXT_LANG_CHOICES,
         help="Language for call-graph context (auto=detect languages in project; "
              "all=probe every supported language regardless of detection; "
              "or specify one: python, typescript, javascript, go, rust, php, swift, java)",
@@ -663,24 +675,24 @@ Semantic Search:
         return None
 
     def resolve_language(lang_arg: str, project_path: str | Path) -> str:
-        """Resolve 'auto' to actual language. Returns 'all' unchanged for multi-lang commands."""
+        """Resolve 'auto' to actual language (single language for non-context commands).
+
+        Returns 'all' unchanged for multi-lang commands; otherwise picks the first
+        language from _resolve_context_languages to maintain backward compatibility.
+        """
         if lang_arg == "all":
             return "all"
-        project_path = Path(project_path).resolve()
-        if lang_arg == "auto":
-            # Try cache first, then detect if no cache
-            cached = get_cached_languages(project_path)
-            if cached:
-                return cached[0]
-            # No cache - detect languages
-            from .semantic import _detect_project_languages
-            respect_ignore = not getattr(args, 'no_ignore', False)
-            langs = _detect_project_languages(project_path, respect_ignore=respect_ignore)
-            if langs:
-                return langs[0]
-            print(f"Warning: no source files detected in '{project_path}', defaulting to python", file=sys.stderr)
+        respect_ignore = not getattr(args, 'no_ignore', False)
+        try:
+            languages = _resolve_context_languages(
+                lang_arg, Path(project_path).resolve(), respect_ignore=respect_ignore
+            )
+            return languages[0] if languages else "python"
+        except NoSupportedContextLanguagesError:
+            # For single-language commands, fall back to python if no supported langs found
+            # (different from context command which exits with error)
+            print("Warning: no supported languages detected, defaulting to python", file=sys.stderr)
             return "python"
-        return lang_arg
 
     try:
         if args.command == "tree":
