@@ -4242,6 +4242,10 @@ def _build_rust_call_graph(
         # Get calls from this file
         calls_by_func = _extract_rust_file_calls(rs_path, root)
 
+        # Note: edges stored dot-form; display conversion (dot→::) happens at
+        # output sites in api.py (RelevantContext.to_llm_string) and cli.py
+        # (calls/arch JSON branches) via _rust_display_name. Keep lookup keys
+        # dot-form here so resolve_func_name normalization stays consistent.
         for caller_func, calls in calls_by_func.items():
             for call_type, call_target in calls:
                 if call_type == 'intra':

@@ -37,6 +37,11 @@ from .ast_extractor import (
 _logger = _logging.getLogger(__name__)
 
 
+def _rust_display_name(name: str) -> str:
+    """Convert dot-separated Rust qualified names to ``::`` syntax for display."""
+    return name.replace(".", "::")
+
+
 # Languages supported by get_relevant_context (ext_map used for file scanning)
 SUPPORTED_CONTEXT_EXT_MAP: dict[str, set[str]] = {
     "python": {".py"},
@@ -473,12 +478,16 @@ class RelevantContext:
                on success. When set, other fields should be treated as metadata only.
         note: Optional hint about qualified-name fallback or multi-candidate match.
               Prepended to the formatted output only on success (when error is None).
+        language: Source language (e.g. 'rust', 'python'); gates Rust display
+                  conversion (dot→::) in to_llm_string. None on error or when
+                  no single language is resolved.
     """
     entry_point: str
     depth: int
     functions: list[FunctionContext] = field(default_factory=list)
     error: str | None = None
     note: str | None = None  # qualified-name-fallback hint, prepended on success only
+    language: str | None = None  # source language; gates Rust display conversion (dot→::)
 
     def to_llm_string(self) -> str:
         """Format for LLM injection."""
@@ -496,10 +505,12 @@ class RelevantContext:
             # Indentation based on call depth
             indent = "  " * min(i, self.depth)
 
-            # Function header
+            # Function header — Rust display: dot→:: gated on self.language
             short_file = Path(func.file).name if func.file else "?"
-            lines.append(f"{indent}📍 {func.name} ({short_file}:{func.line})")
-            lines.append(f"{indent}   {func.signature}")
+            display_name = _rust_display_name(func.name) if self.language == "rust" else func.name
+            display_sig = _rust_display_name(func.signature) if self.language == "rust" else func.signature
+            lines.append(f"{indent}📍 {display_name} ({short_file}:{func.line})")
+            lines.append(f"{indent}   {display_sig}")
 
             # Docstring (truncated)
             if func.docstring:
@@ -511,9 +522,13 @@ class RelevantContext:
                 complexity_marker = "🔥" if func.cyclomatic and func.cyclomatic > 10 else ""
                 lines.append(f"{indent}   ⚡ complexity: {func.cyclomatic or '?'} ({func.blocks} blocks) {complexity_marker}")
 
-            # Calls
+            # Calls — Rust display: dot→:: per-callee gated on self.language
             if func.calls:
-                calls_str = ", ".join(func.calls[:5])
+                display_calls = [
+                    _rust_display_name(c) if self.language == "rust" else c
+                    for c in func.calls[:5]
+                ]
+                calls_str = ", ".join(display_calls)
                 if len(func.calls) > 5:
                     calls_str += f" (+{len(func.calls)-5} more)"
                 lines.append(f"{indent}   → calls: {calls_str}")
@@ -739,7 +754,8 @@ def _get_module_exports(
     return RelevantContext(
         entry_point=module_path,
         depth=0,
-        functions=functions
+        functions=functions,
+        language=language,
     )
 
 
@@ -1086,7 +1102,8 @@ def get_relevant_context(
                 return RelevantContext(
                     entry_point=entry_point,
                     depth=depth,
-                    error=f"Function '{entry_point}' not found in project.{suffix}"
+                    error=f"Function '{entry_point}' not found in project.{suffix}",
+                    language=language,
                 )
 
             # Callee not found in signatures during BFS, still include stub
@@ -1175,7 +1192,8 @@ def get_relevant_context(
     return RelevantContext(
         entry_point=entry_point,
         depth=depth,
-        functions=result_functions
+        functions=result_functions,
+        language=language,
     )
 
 
@@ -1238,6 +1256,7 @@ def get_relevant_context_multi(
                 f"Function '{entry_point}' not found in project "
                 f"(no supported languages probed)"
             ),
+            language=None,  # No language probed; error context only
         )
 
     # Guard (B-4): only extract the marker when it follows the known
@@ -1278,6 +1297,7 @@ def get_relevant_context_multi(
         entry_point=entry_point,
         depth=depth,
         error=error,
+        language=None,  # All probes failed
     )
 
 

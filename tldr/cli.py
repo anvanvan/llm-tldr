@@ -30,9 +30,18 @@ if os.name == 'nt':
         pass
 
 from . import __version__
-from .api import SUPPORTED_CONTEXT_LANGUAGES, _serialize_call_graph_to_cache
+# Dual-gate idiom: api.py uses self.language=='rust' (RelevantContext owns language);
+# cli.py uses .endswith('.rs') (edge tuples have no language object).
+from .api import SUPPORTED_CONTEXT_LANGUAGES, _serialize_call_graph_to_cache, _rust_display_name
 from .cross_file_calls import CALL_GRAPH_LANGUAGES
 from .semantic import ALL_LANGUAGES, EXTENSION_TO_LANGUAGE
+
+_RUBY_ORPHAN_SENTINEL = "__ruby_orphan__"
+
+
+def _is_orphan_sentinel(func_name: str) -> bool:
+    """Check if func_name is a Ruby orphan sentinel marker."""
+    return func_name == _RUBY_ORPHAN_SENTINEL
 
 
 def _get_subprocess_detach_kwargs():
@@ -864,18 +873,26 @@ Semantic Search:
             # Check for cached graph and dirty files for incremental update
             lang = resolve_language(args.lang, args.path)
             graph = _get_or_build_graph(args.path, lang, build_project_call_graph)
-            result = {
-                "edges": [
-                    {
-                        "from_file": e[0],
-                        "from_func": e[1],
-                        "to_file": e[2],
-                        "to_func": e[3],
-                    }
-                    for e in graph.edges
-                ],
-                "count": len(graph.edges),
-            }
+            # Filter _RUBY_ORPHAN_SENTINEL edges on both e[1] (from_func) and
+            # e[3] (to_func) positions before emission.
+            filtered_edges = [
+                e for e in graph.edges
+                if not _is_orphan_sentinel(e[1]) and not _is_orphan_sentinel(e[3])
+            ]
+            # Rust display: dot→:: for .rs edges.  Per-edge .endswith(".rs")
+            # guards handle all lang values uniformly: pure-Rust (all edges
+            # convert), mixed (only .rs-side converts), and non-Rust (no edges
+            # match the guard, all pass through unchanged).
+            formatted_edges = [
+                {
+                    "from_file": e[0],
+                    "from_func": _rust_display_name(e[1]) if e[0].endswith(".rs") else e[1],
+                    "to_file": e[2],
+                    "to_func": _rust_display_name(e[3]) if e[2].endswith(".rs") else e[3],
+                }
+                for e in filtered_edges
+            ]
+            result = {"edges": formatted_edges, "count": len(filtered_edges)}
             print(json.dumps(result, indent=2))
 
         elif args.command == "impact":
@@ -903,6 +920,18 @@ Semantic Search:
         elif args.command == "arch":
             lang = resolve_language(args.lang, args.path)
             result = analyze_architecture(args.path, language=lang)
+            # Rust display: dot→:: in arch function fields for .rs files; skip
+            # _RUBY_ORPHAN_SENTINEL entries BEFORE the .rs guard.
+            for layer_key in ("entry_layer", "leaf_layer"):
+                processed = []
+                for entry in result.get(layer_key, []):
+                    if _is_orphan_sentinel(entry.get("file", "")):
+                        continue
+                    if entry.get("file", "").endswith(".rs"):
+                        entry["function"] = _rust_display_name(entry["function"])
+                    processed.append(entry)
+                if layer_key in result:
+                    result[layer_key] = processed
             print(json.dumps(result, indent=2))
 
         elif args.command == "imports":

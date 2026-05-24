@@ -158,31 +158,6 @@ def impact_analysis(
                 "total_targets": len(callers_only),
             }
 
-        # Last resort: check the orphan-funcs side-channel for defs that
-        # participate in no real edge (registered by language builders that
-        # want to treat top-level defs as entry points without polluting
-        # `edges` with synthetic sentinel symbols).
-        orphan_funcs = getattr(call_graph, "orphan_funcs", None) or set()
-        orphan_matches = {
-            FunctionRef(file=f, name=n)
-            for (f, n) in orphan_funcs
-            if _matches_target(n) and (target_file is None or target_file in f)
-        }
-        if orphan_matches:
-            return {
-                "targets": {
-                    str(ref): {
-                        "function": ref.name,
-                        "file": ref.file,
-                        "caller_count": 0,
-                        "callers": [],
-                        "truncated": False,
-                        "note": "Entry point - never called by other code in graph",
-                    }
-                    for ref in orphan_matches
-                },
-                "total_targets": len(orphan_matches),
-            }
         return {"error": f"Function '{target_func}' not found in call graph"}
 
     results = {}
