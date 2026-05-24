@@ -96,6 +96,9 @@ def cached_structure(db: SalsaDB, project: str, language: str, max_results: int)
 def cached_context(db: SalsaDB, project: str, entry: str, language: str, depth: int) -> dict:
     """Cached relevant context - memoized by SalsaDB."""
     from tldr.api import get_relevant_context
+    # Cache-aliasing note (G-2): RelevantContext instances cached here MUST NOT
+    # be mutated post-write — including the `note` field added for qualified-
+    # name fallback. Future callers should treat the cached result as immutable.
     result = get_relevant_context(project, entry, language=language, depth=depth)
     return {"status": "ok", "result": result}
 

@@ -14,6 +14,7 @@ Usage:
     # Returns LLM-ready string with call graph, signatures, complexity
 """
 
+import difflib as _difflib
 import json as _json
 import logging as _logging
 import os as _os
@@ -70,6 +71,11 @@ _EXT_MAP_ALL_LANGUAGES: dict[str, set[str]] = {
     "scala": {".scala", ".sc"},
     "cpp": {".cpp", ".cc", ".cxx", ".hpp", ".hh", ".hxx"},
 }
+
+# Namespace separators recognised by the qualified-name fallback helpers.
+# Order matters: "::" is checked before "/" before "." so that the rightmost
+# match among the highest-precedence separator wins in _strip_namespace_qualifier.
+_NAMESPACE_SEPARATORS: tuple[str, ...] = ("::", "/", ".")
 
 # Bug 004: non-code suffixes that the semantic indexer must include so that
 # build/config/doc files (.sh scripts, pyproject.toml, .yaml workflows, etc.)
@@ -454,16 +460,32 @@ class FunctionContext:
 
 @dataclass
 class RelevantContext:
-    """The full context returned by get_relevant_context."""
+    """The full context returned by get_relevant_context.
+
+    Represents either a successful lookup with functions reachable from an
+    entry point, or an error condition with a diagnostic message.
+
+    Attributes:
+        entry_point: The requested function/method or module name.
+        depth: Call graph traversal depth used in the lookup.
+        functions: List of FunctionContext objects (empty on error).
+        error: Diagnostic message if the entry point was not found, or None
+               on success. When set, other fields should be treated as metadata only.
+        note: Optional hint about qualified-name fallback or multi-candidate match.
+              Prepended to the formatted output only on success (when error is None).
+    """
     entry_point: str
     depth: int
     functions: list[FunctionContext] = field(default_factory=list)
     error: str | None = None
+    note: str | None = None  # qualified-name-fallback hint, prepended on success only
 
     def to_llm_string(self) -> str:
         """Format for LLM injection."""
         if self.error:
             return f"Error: {self.error}"
+
+        prefix = f"Note: {self.note}\n\n" if self.note else ""
 
         lines = [
             f"## Code Context: {self.entry_point} (depth={self.depth})",
@@ -501,7 +523,135 @@ class RelevantContext:
         # Footer with stats
         result = "\n".join(lines)
         token_estimate = len(result) // 4
-        return result + f"\n---\n📊 {len(self.functions)} functions | ~{token_estimate} tokens"
+        return prefix + result + f"\n---\n📊 {len(self.functions)} functions | ~{token_estimate} tokens"
+
+
+def _strip_namespace_qualifier(name: str) -> str | None:
+    """Strip a qualified-name prefix and return the trailing bare segment.
+
+    Walks separators ``"::"``, ``"/"``, ``"."`` and picks the rightmost matching
+    one across the whole string (so ``"a/b.c"`` yields ``"c"`` and
+    ``"providers/anthropic.stream"`` yields ``"stream"``). Returns ``None`` when
+    no recognized separator is present or when the trailing segment would be
+    empty.
+
+    Empty leading segments are rejected for ``"."`` and ``"/"`` (e.g. ``".foo"``
+    → ``None``) but ALLOWED for ``"::"`` (e.g. ``"::foo"`` → ``"foo"``) so
+    root-namespace forms like ``::std::vec::Vec`` collapse correctly.
+
+    Defensive note: this helper strips ``"::"`` even though ``resolve_func_name``
+    already normalizes ``"::"`` → ``"."`` upstream; callers that bypass
+    ``resolve_func_name`` still get correct behaviour.
+    """
+    if not name:
+        return None
+    # Find the rightmost separator position across the recognized set.
+    best_pos = -1
+    best_sep = ""
+    for sep in _NAMESPACE_SEPARATORS:
+        pos = name.rfind(sep)
+        if pos > best_pos:
+            best_pos = pos
+            best_sep = sep
+    if best_pos < 0:
+        return None
+    trailing = name[best_pos + len(best_sep):]
+    if not trailing:
+        return None
+    leading = name[:best_pos]
+    # "::" allows empty leading (root-namespace); "." and "/" do not.
+    if not leading and best_sep != "::":
+        return None
+    return trailing
+
+
+def _first_namespace_strip(name: str) -> str | None:
+    """Return the trailing segment after the LEFTMOST applicable separator.
+
+    Companion to ``_strip_namespace_qualifier`` used to compute the intermediate
+    hop when rendering chain notes. Separator order is ``"::"`` → ``"/"`` →
+    ``"."``; the first one whose ``find`` succeeds is used (leftmost-find, so we
+    take the trailing segment after the leftmost occurrence of that separator).
+    """
+    if not name:
+        return None
+    for sep in _NAMESPACE_SEPARATORS:
+        pos = name.find(sep)
+        if pos < 0:
+            continue
+        trailing = name[pos + len(sep):]
+        leading = name[:pos]
+        if not trailing:
+            continue
+        if not leading and sep != "::":
+            continue
+        return trailing
+    return None
+
+
+def _fuzzy_suggest(
+    name: str,
+    fallback_name: str | None,
+    candidates: list[str],
+    n: int = 3,
+    cutoff: float = 0.6,
+) -> list[str]:
+    """Try fuzzy match on fallback segment first, then on original name.
+
+    Returns the first non-empty match list.
+    """
+    if fallback_name and fallback_name != name:
+        close = _difflib.get_close_matches(fallback_name, candidates, n=n, cutoff=cutoff)
+        if close:
+            return close
+    return _difflib.get_close_matches(name, candidates, n=n, cutoff=cutoff)
+
+
+def _format_fallback_note(
+    original: str,
+    resolved_keys: list[str],
+    fallback: str,
+) -> str:
+    """Format a single-hop fallback note.
+
+    ``resolved_keys`` is the list of signatures-dict keys that the bare
+    ``fallback`` name matched (per G-5: the note shows the REAL index key, not
+    the bare lookup argument). When there is exactly one match the rendered
+    form is ``"matched bare name; {original!r} resolved to {resolved_keys[0]!r}
+    (qualified form not in index)"``; multiple matches enumerate every
+    resolved key and instruct the caller to disambiguate.
+    """
+    if len(resolved_keys) == 1:
+        return (
+            f"matched bare name; {original!r} resolved to {resolved_keys[0]!r} "
+            f"(qualified form not in index)"
+        )
+    keys_csv = ", ".join(repr(k) for k in resolved_keys)
+    return (
+        f"matched {len(resolved_keys)} candidates for bare name {fallback!r}: "
+        f"{keys_csv} — disambiguate with --project subpath or full path"
+    )
+
+
+# Note (B-5/T-2): the chain note describes the input's namespace structure
+# (the intermediate hop derived from the leftmost separator); it is NOT a
+# trace of actual lookup attempts. The fallback path jumps directly to the
+# terminal bare segment and the intermediate is rendered for diagnostic clarity.
+def _format_chain_note(
+    original: str,
+    intermediate: str,
+    final_resolved: str,
+) -> str:
+    """Format a multi-hop chain note.
+
+    Shape: ``"matched bare name; {original!r} resolved via {intermediate!r} to
+    {final_resolved!r} (qualified form not in index)"`` — locks in the
+    ``resolved via`` substring asserted by AC-10.
+    """
+    return (
+        f"matched bare name; {original!r} resolved via {intermediate!r} to "
+        f"{final_resolved!r} (qualified form not in index)"
+    )
 
 
 def _get_module_exports(
@@ -871,12 +1021,72 @@ def get_relevant_context(
                     if callee not in visited and current_depth < depth:
                         queue.append((callee, current_depth + 1))
         else:
-            # Entry point not found — return error instead of phantom stub
+            # Entry point not found — try qualified-name fallback, then fuzzy
+            # suggest, then return error instead of a phantom stub.
             if func_name == entry_point and current_depth == 0:
+                # Step 1: qualified-name fallback. _strip_namespace_qualifier
+                # returns the multi-hop bare segment (e.g.
+                # "providers/anthropic.stream" → "stream").
+                fallback_name = _strip_namespace_qualifier(entry_point)
+                if fallback_name and fallback_name != entry_point:
+                    resolved_list = resolve_func_name(fallback_name)
+                    if resolved_list:
+                        # The bare name resolves to one or more index keys.
+                        # Recurse into get_relevant_context with the bare name so
+                        # the full pipeline (signatures, call graph, BFS) is
+                        # reused; on return, patch the .note describing why we
+                        # fell back. RelevantContext is intentionally a non-
+                        # frozen dataclass; mutating `note` on the returned
+                        # instance avoids both a second BFS and an internal
+                        # _resolved_list parameter.
+                        result = get_relevant_context(
+                            project,
+                            fallback_name,
+                            depth=depth,
+                            language=language,
+                            include_docstrings=include_docstrings,
+                        )
+                        if result.error is None:
+                            resolved_keys = [k for k, _ in resolved_list]
+                            intermediate = _first_namespace_strip(entry_point)
+                            # Chain-rendering applies only when the bare name is
+                            # unambiguous (single resolved key). When multi-
+                            # candidate AND multi-hop coincide, ambiguity wins:
+                            # fall through to _format_fallback_note so the user
+                            # sees the candidate list rather than a hop note
+                            # that silently drops the disambiguation.
+                            if (
+                                intermediate
+                                and intermediate != fallback_name
+                                and len(resolved_keys) == 1
+                            ):
+                                # Two-hop chain: per T-2 decision render
+                                # 'resolved via {intermediate} to {final}'.
+                                result.note = _format_chain_note(
+                                    entry_point, intermediate, fallback_name
+                                )
+                            else:
+                                result.note = _format_fallback_note(
+                                    entry_point, resolved_keys, fallback_name
+                                )
+                            _logger.debug(
+                                "context fallback: %r → %r (matched %d signatures)",
+                                entry_point,
+                                fallback_name,
+                                len(resolved_keys),
+                            )
+                            return result
+
+                # Step 2: fuzzy suggest. Try the bare segment first (G-7) so
+                # typos that span both qualifier and bare are caught, then fall
+                # back to the original entry_point.
+                candidate_names = sorted({info.name for _, info in signatures.values()})
+                close = _fuzzy_suggest(entry_point, fallback_name, candidate_names)
+                suffix = f" Did you mean: {', '.join(close)}?" if close else ""
                 return RelevantContext(
                     entry_point=entry_point,
                     depth=depth,
-                    error=f"Function '{entry_point}' not found in project"
+                    error=f"Function '{entry_point}' not found in project.{suffix}"
                 )
 
             # Callee not found in signatures during BFS, still include stub
@@ -1019,6 +1229,15 @@ def get_relevant_context_multi(
             ),
         )
 
+    # Guard (B-4): only extract the marker when it follows the known
+    # per-language probe suffix "not found in project." so that a legitimate
+    # entry_point literally containing "Did you mean:" cannot trigger a false
+    # positive. Bound (B-3): truncate the hint at the next newline so any
+    # future trailing context appended to the error doesn't bleed into it.
+    _marker = "Did you mean:"
+    _probe_anchor = "not found in project."
+    first_fuzzy: str | None = None
+    probed_langs: list[str] = []
     for lang in languages:
         ctx = get_relevant_context(
             project,
@@ -1029,15 +1248,25 @@ def get_relevant_context_multi(
         )
         if not ctx.error:
             return ctx  # first hit wins
+        probed_langs.append(lang)
+        # Capture fuzzy hint from first probe that carries one; skip re-scanning
+        if first_fuzzy is None and ctx.error:
+            anchor_pos = ctx.error.find(_probe_anchor)
+            if anchor_pos >= 0:
+                marker_pos = ctx.error.find(_marker, anchor_pos + len(_probe_anchor))
+                if marker_pos >= 0:
+                    first_fuzzy = ctx.error[marker_pos:].split("\n", 1)[0]
 
-    probed = ", ".join(languages)
+    probed = ", ".join(probed_langs)
+    base = (
+        f"Function '{entry_point}' not found in project "
+        f"(probed: {probed})"
+    )
+    error = f"{base}. {first_fuzzy}" if first_fuzzy else base
     return RelevantContext(
         entry_point=entry_point,
         depth=depth,
-        error=(
-            f"Function '{entry_point}' not found in project "
-            f"(probed: {probed})"
-        ),
+        error=error,
     )
 
 
