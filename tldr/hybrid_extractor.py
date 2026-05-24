@@ -10,6 +10,7 @@ Strategy:
 Output is unified across all extractors.
 """
 
+import dataclasses
 import json
 import logging
 import os
@@ -193,6 +194,19 @@ class HybridExtractor:
     LUAU_EXTENSIONS = {".luau"}
     ELIXIR_EXTENSIONS = {".ex", ".exs"}
     PHP_EXTENSIONS = {".php"}
+
+    # Boundary node types for _get_variable_declarator_name's upward walk.
+    # See that method's docstring for the rationale of each entry.
+    _TS_VARIABLE_DECLARATOR_BOUNDARY = (
+        "program",
+        "statement_block",
+        "class_body",
+        "export_statement",
+        "object",
+        "pair",
+        "call_expression",
+        "arguments",
+    )
 
     def __init__(self):
         self._pygments_extractor = SignatureExtractor()
@@ -449,8 +463,24 @@ class HybridExtractor:
                                     if m.type == "property_identifier":
                                         names.add(self._safe_decode(source[m.start_byte:m.end_byte]))
                                         break
+            # Arrow / function-expression assigned to a variable:
+            #   const foo = () => {}
+            #   let bar = function () {}
+            # Mirrors tldr/cross_file_calls.py:2352-2363.
+            elif child.type in ("lexical_declaration", "variable_declaration"):
+                for vc in child.children:
+                    if vc.type == "variable_declarator":
+                        ident_name = None
+                        has_callable = False
+                        for sub in vc.children:
+                            if sub.type == "identifier":
+                                ident_name = self._safe_decode(source[sub.start_byte:sub.end_byte])
+                            elif sub.type in ("arrow_function", "function_expression"):
+                                has_callable = True
+                        if ident_name and has_callable:
+                            names.add(ident_name)
             # Recurse
-            if child.type in ("program", "export_statement"):
+            elif child.type in ("program", "export_statement"):
                 names.update(self._collect_ts_definitions(child, source))
         return names
 
@@ -528,7 +558,10 @@ class HybridExtractor:
                         self._extract_ts_calls(child, func.name, source, module_info.call_graph, defined_names)
                 else:
                     # Anonymous function - try to get name from parent context
-                    # First try pair (object literal), then assignment (CommonJS exports)
+                    # First try pair (object literal), then assignment (CommonJS exports).
+                    # Pair-naming contract: arrow/function_expression inside an object
+                    # literal (e.g. `const h = { onClick: () => {} }`) gets its name
+                    # from the enclosing `pair`'s property key — see _get_pair_property_name.
                     parent_name = self._get_pair_property_name(child, source)
                     if not parent_name:
                         parent_name = self._get_assignment_name(child, source)
@@ -563,6 +596,40 @@ class HybridExtractor:
                     module_info.classes.append(cls)
                 prev_comment = None
 
+            # Dedicated export_statement branch — detect `export default` and
+            # synthesise a FunctionInfo(name="default") alias after recursion.
+            # The inner declaration (function_declaration / lexical_declaration /
+            # arrow_function / function_expression) is handled by the existing
+            # branches via the recursive call.
+            elif node_type == "export_statement":
+                is_default = any(c.type == "default" for c in child.children)
+                len_before = len(module_info.functions)
+                self._extract_ts_nodes(child, source, module_info, defined_names)
+                if is_default:
+                    if len(module_info.functions) > len_before:
+                        # Inner declaration produced a named FunctionInfo (e.g.
+                        # `export default function App()`). Append a synthetic
+                        # alias copying all metadata, overriding only the name.
+                        inner = module_info.functions[len_before]
+                        if inner.name != "default":
+                            module_info.functions.append(
+                                dataclasses.replace(inner, name="default")
+                            )
+                    else:
+                        # Inner was fully anonymous (e.g. `export default () => {}`
+                        # or `export default function () {}`). Register a minimal
+                        # FunctionInfo so the `default` alias is reachable.
+                        module_info.functions.append(FunctionInfo(
+                            name="default",
+                            params=[],
+                            return_type=None,
+                            docstring=None,
+                            is_async=False,
+                            line_number=child.start_point[0] + 1,
+                            end_line=child.end_point[0] + 1,
+                        ))
+                prev_comment = None
+
             # Recurse into containers
             # Added: "object", "pair", "call_expression", "arguments" to support object literal patterns like:
             # export const router = { method: procedure.handler(() => {...}) }
@@ -570,7 +637,7 @@ class HybridExtractor:
             # This enables extraction of arrow functions inside object literals (e.g., oRPC routers)
             # CommonJS: exports.foo = function() {} requires traversing expression_statement → assignment_expression
             # Control flow: if_statement, try_statement, catch_clause for conditionally exported functions
-            elif node_type in ("export_statement", "lexical_declaration", "program",
+            elif node_type in ("lexical_declaration", "program",
                             "variable_declaration", "variable_declarator", "statement_block",
                             "export_clause", "object", "pair", "call_expression", "arguments",
                             "expression_statement", "assignment_expression", "if_statement",
@@ -659,6 +726,32 @@ class HybridExtractor:
                 cleaned.append(line)
         return " ".join(cleaned)
 
+    def _get_variable_declarator_name(self, node, source: bytes) -> str | None:
+        """Walk node.parent upward to the first variable_declarator; return its name field.
+
+        Returns None if a boundary node is hit before a variable_declarator.
+
+        Boundary set (return None immediately):
+          - "program", "statement_block", "class_body": scope boundaries.
+          - "export_statement": defensive — keep walks contained.
+          - "object", "pair": prevent clobbering _get_pair_property_name for
+            `const h = { onClick: () => {} }` (would otherwise return 'h').
+          - "call_expression", "arguments": prevent arrow callbacks in function
+            args from picking up an unrelated outer declarator
+            (e.g. `const timer = setTimeout(() => {}, 100)`).
+        """
+        current = node.parent
+        while current is not None:
+            if current.type == "variable_declarator":
+                name_field = current.child_by_field_name("name")
+                if name_field is not None and name_field.type == "identifier":
+                    return self._safe_decode(source[name_field.start_byte:name_field.end_byte])
+                return None
+            if current.type in self._TS_VARIABLE_DECLARATOR_BOUNDARY:
+                return None
+            current = current.parent
+        return None
+
     def _extract_ts_function(self, node, source: bytes) -> FunctionInfo | None:
         """Extract TypeScript/JavaScript function."""
         name = ""
@@ -679,6 +772,12 @@ class HybridExtractor:
                         params.append(self._safe_decode(source[p.start_byte:p.end_byte]))
             elif child.type == "type_annotation":
                 return_type = self._safe_decode(source[child.start_byte:child.end_byte]).lstrip(": ")
+
+        if not name:
+            # Fallback: arrow_function / function_expression assigned to a variable
+            # (e.g. `export const foo = () => {}`). Walk parent chain to the
+            # enclosing variable_declarator and recover its name.
+            name = self._get_variable_declarator_name(node, source) or ""
 
         if not name:
             return None
@@ -1237,31 +1336,68 @@ class HybridExtractor:
             docstring=None,
             methods=methods,
             line_number=node.start_point[0] + 1,
+            end_line=node.end_point[0] + 1,
         )
 
+    def _parse_rust_impl_type(self, node, source: bytes) -> str:
+        """Return the implementing type for an ``impl_item`` node.
+
+        Uses tree-sitter-rust grammar-native named field ``type`` to correctly
+        extract the implementing type, whether the impl is inherent (``impl Type {...}``)
+        or for a trait (``impl Trait for Type {...}``).
+
+        Returns ``""`` for malformed nodes missing the required ``type`` field,
+        so callers can safely skip qualified-name emission.
+        """
+        type_field = node.child_by_field_name("type")
+        impl_type = ""
+        if type_field is not None:
+            impl_type = self._safe_decode(source[type_field.start_byte:type_field.end_byte])
+
+        return impl_type
+
     def _extract_rust_impl(self, node, source: bytes, module_info: ModuleInfo, defined_names: set[str] | None = None):
-        """Extract Rust impl block methods and associate with struct/trait."""
+        """Extract Rust impl block methods and associate with struct/trait.
+
+        For each ``function_item`` inside the impl's ``declaration_list``:
+          1. Append a ``FunctionInfo`` with the bare method name unchanged.
+          2. Append a second ``FunctionInfo`` (via ``dataclasses.replace``) with
+             name ``"{impl_type}.{bare_name}"`` — DOT separator so the entry
+             matches after ``resolve_func_name`` normalises ``::`` -> ``.``.
+          3. For trait impls (``impl Trait for Type``), the qualified name uses
+             the IMPLEMENTING TYPE only (``Type.method``), not the trait.
+          4. Call-graph caller key uses ``.`` separator: ``Type.method``
+             (matches the qualified FunctionInfo key and TS class-method
+             convention).
+        """
         if defined_names is None:
             defined_names = set()
-        impl_type = ""
-        trait_name = ""
+
+        impl_type = self._parse_rust_impl_type(node, source)
 
         for child in node.children:
-            if child.type == "type_identifier":
-                impl_type = self._safe_decode(source[child.start_byte:child.end_byte])
-            elif child.type == "generic_type":
-                impl_type = self._safe_decode(source[child.start_byte:child.end_byte])
-            elif child.type == "declaration_list":
+            if child.type == "declaration_list":
                 for item in child.children:
                     if item.type == "function_item":
                         func = self._extract_rust_function(item, source)
                         if func:
                             func.is_method = True
-                            # Tag with impl type
-                            caller_name = f"({impl_type}) {func.name}"
-                            func.name = caller_name
+                            bare_name = func.name
                             module_info.functions.append(func)
-                            # Extract call graph from method body
+                            defined_names.add(bare_name)
+                            if impl_type:
+                                qualified = dataclasses.replace(
+                                    func,
+                                    name=f"{impl_type}.{bare_name}",
+                                    is_method=True,
+                                )
+                                module_info.functions.append(qualified)
+                            # Call-graph caller key uses dot separator,
+                            # matching the qualified FunctionInfo name above
+                            # and the TS class-method convention at line 833.
+                            caller_name = (
+                                f"{impl_type}.{bare_name}" if impl_type else bare_name
+                            )
                             self._extract_rust_calls(item, caller_name, source, module_info.call_graph, defined_names)
 
     def _extract_rust_calls(self, node, caller_name: str, source: bytes, call_graph: CallGraphInfo, defined_names: set[str]):
