@@ -52,6 +52,9 @@ SUPPORTED_CONTEXT_EXT_MAP: dict[str, set[str]] = {
     "php": {".php"},
     "swift": {".swift"},
     "java": {".java"},
+    "ruby": {".rb"},
+    "c": {".c", ".h"},
+    "elixir": {".ex", ".exs"},
 }
 SUPPORTED_CONTEXT_LANGUAGES: frozenset[str] = frozenset(SUPPORTED_CONTEXT_EXT_MAP.keys())
 
@@ -1315,7 +1318,8 @@ def get_dfg_context(
     Args:
         source_or_path: Source code string OR path to file (auto-detected)
         function_name: Name of function to analyze
-        language: python, typescript, go, or rust (defaults to python)
+        language: python, typescript, javascript, go, rust, java, c, cpp, ruby,
+            php, kotlin, swift, csharp, scala, lua, luau, or elixir (defaults to python)
 
     Returns:
         Dict with:

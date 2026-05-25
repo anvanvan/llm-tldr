@@ -248,11 +248,13 @@ def dead_code_analysis(
     for from_file, from_func, _, _ in edges:
         callers.add(FunctionRef(file=from_file, name=from_func))
 
-    # Common entry point patterns
+    # Common entry point patterns. The Ruby builder used to emit "<top-level>"
+    # as its synthetic top-level caller bucket, but it now emits "__main__"
+    # instead, so the legacy "<top-level>" pattern can no longer match anything
+    # in the graph and was dropped.
     entry_patterns = [
         "main",
         "__main__",
-        "<top-level>",
         "cli",
         "app",
         "run",

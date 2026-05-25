@@ -33,10 +33,12 @@ from . import __version__
 # Dual-gate idiom: api.py uses self.language=='rust' (RelevantContext owns language);
 # cli.py uses .endswith('.rs') (edge tuples have no language object).
 from .api import SUPPORTED_CONTEXT_LANGUAGES, _serialize_call_graph_to_cache, _rust_display_name
-from .cross_file_calls import CALL_GRAPH_LANGUAGES
+from .cross_file_calls import CALL_GRAPH_LANGUAGES, RUBY_ORPHAN_SENTINEL
 from .semantic import ALL_LANGUAGES, EXTENSION_TO_LANGUAGE
 
-_RUBY_ORPHAN_SENTINEL = "__ruby_orphan__"
+# Re-export under the legacy private alias to avoid touching every existing
+# call site in this module. Single source of truth lives in cross_file_calls.
+_RUBY_ORPHAN_SENTINEL = RUBY_ORPHAN_SENTINEL
 
 
 def _is_orphan_sentinel(func_name: str) -> bool:
@@ -153,7 +155,7 @@ def _resolve_context_languages(
         if not detected:
             from .semantic import _detect_project_languages
             detected = _detect_project_languages(
-                project_path, respect_ignore=respect_ignore
+                Path(project_path), respect_ignore=respect_ignore
             ) or []
         supported = [l for l in detected if l in SUPPORTED_CONTEXT_LANGUAGES]
         if detected and not supported:
@@ -328,7 +330,7 @@ Semantic Search:
         choices=CONTEXT_LANG_CHOICES,
         help="Language for call-graph context (auto=detect languages in project; "
              "all=probe every supported language regardless of detection; "
-             "or specify one: python, typescript, javascript, go, rust, php, swift, java)",
+             "or specify one: python, typescript, javascript, go, rust, php, swift, java, ruby)",
     )
 
     # tldr cfg <file> <function>
@@ -360,7 +362,12 @@ Semantic Search:
     # tldr calls <path>
     calls_p = subparsers.add_parser("calls", help="Build cross-file call graph")
     calls_p.add_argument("path", nargs="?", default=".", help="Project root")
-    calls_p.add_argument("--lang", default="auto", help="Language (auto=cached, all=detect)")
+    calls_p.add_argument(
+        "--lang",
+        default="auto",
+        choices=CONTEXT_LANG_CHOICES,
+        help="Language (auto=cached, all=detect)",
+    )
 
     # tldr impact <func> [path]
     impact_p = subparsers.add_parser(
@@ -371,7 +378,12 @@ Semantic Search:
     impact_p.add_argument("--project", dest="project_path", default=".", help="Project root (alternative to positional path)")
     impact_p.add_argument("--depth", type=int, default=3, help="Max depth (default: 3)")
     impact_p.add_argument("--file", help="Filter by file containing this string")
-    impact_p.add_argument("--lang", default="auto", help="Language (auto=cached, all=detect)")
+    impact_p.add_argument(
+        "--lang",
+        default="auto",
+        choices=CONTEXT_LANG_CHOICES,
+        help="Language (auto=cached, all=detect)",
+    )
 
     # tldr dead [path]
     dead_p = subparsers.add_parser("dead", help="Find unreachable (dead) code")
@@ -379,14 +391,24 @@ Semantic Search:
     dead_p.add_argument(
         "--entry", nargs="*", default=[], help="Additional entry point patterns"
     )
-    dead_p.add_argument("--lang", default="auto", help="Language (auto=cached, all=detect)")
+    dead_p.add_argument(
+        "--lang",
+        default="auto",
+        choices=CONTEXT_LANG_CHOICES,
+        help="Language (auto=cached, all=detect)",
+    )
 
     # tldr arch [path]
     arch_p = subparsers.add_parser(
         "arch", help="Detect architectural layers from call patterns"
     )
     arch_p.add_argument("path", nargs="?", default=".", help="Project root")
-    arch_p.add_argument("--lang", default="auto", help="Language (auto=cached, all=detect)")
+    arch_p.add_argument(
+        "--lang",
+        default="auto",
+        choices=CONTEXT_LANG_CHOICES,
+        help="Language (auto=cached, all=detect)",
+    )
 
     # tldr imports <file>
     imports_p = subparsers.add_parser(

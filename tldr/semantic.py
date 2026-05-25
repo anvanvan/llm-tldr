@@ -52,6 +52,50 @@ from tldr.dirty_flag import _normalize_file_path  # shared path normalization ut
 # window but bounded so pathological large config/log files don't bloat the index.
 _NON_CODE_PREVIEW_CHARS = 8000
 
+# Bug 004: short, query-aligned hints for well-known non-code files. Injected
+# into the embedding text by build_embedding_text so that natural-language
+# queries about install / setup / dependencies / CI surface README,
+# pyproject.toml, requirements.txt, package.json, build.sh, etc. at the top.
+#
+# Keep these CONCISE — long "Description:" prose dilutes the BGE signal
+# (measured: 0.5873 for verbose hint+Configuration label, 0.7439 for the
+# concise "filename: keywords" form below, vs 0.7040 baseline with no hint
+# and a misleading "Code:" prefix).
+_NON_CODE_FILENAME_HINTS: dict[str, str] = {
+    "readme.md": "project readme: overview installation usage",
+    "readme.rst": "project readme: overview installation usage",
+    "readme.txt": "project readme: overview installation usage",
+    "readme": "project readme: overview installation usage",
+    "contributing.md": "contributor guide: install dev dependencies run tests",
+    "changelog.md": "changelog: release notes version history",
+    "license": "license",
+    "license.md": "license",
+    "license.txt": "license",
+    "pyproject.toml": "python project manifest: install dependencies metadata build",
+    "setup.py": "python setup script: install dependencies package metadata",
+    "setup.cfg": "python setup config: install dependencies package metadata",
+    "requirements.txt": "python pip requirements: install dependencies",
+    "requirements-dev.txt": "python pip dev requirements: install development dependencies",
+    "package.json": "node.js package manifest: install dependencies scripts metadata",
+    "package-lock.json": "node.js dependency lockfile",
+    "cargo.toml": "rust crate manifest: install dependencies build config",
+    "cargo.lock": "rust dependency lockfile",
+    "go.mod": "go module manifest: install dependencies module path",
+    "gemfile": "ruby bundler manifest: install dependencies",
+    "podfile": "cocoapods manifest: install ios macos dependencies",
+    "build.sh": "build shell script",
+    "install.sh": "install shell script: install dependencies set up project",
+    "dockerfile": "container image build instructions",
+    "makefile": "gnu make build configuration",
+}
+
+# Extensionless build/manifest basenames (lowercased) that should reach the
+# non-code embedding path even though their suffix is empty. Kept in sync with
+# the matching entries in `_NON_CODE_FILENAME_HINTS` above.
+_NON_CODE_EXTENSIONLESS_BASENAMES: frozenset[str] = frozenset(
+    {"makefile", "dockerfile", "gemfile", "podfile"}
+)
+
 # Extension-to-language map (defined here to avoid circular import with cli.py)
 EXTENSION_TO_LANGUAGE = {
     '.java': 'java',
@@ -543,13 +587,28 @@ def build_embedding_text(unit: EmbeddingUnit) -> str:
     if unit.dependencies:
         parts.append(f"Dependencies: {unit.dependencies}")
 
-    # Code preview (first 10 lines of function body)
+    # Code preview (first 10 lines of function body, or whole-file content for
+    # non-code units). Bug 004: for file units (.md/.toml/.yaml/.sh/.json/...)
+    # the preview is plain documentation/config text — labelling it "Code:"
+    # biases the BGE embedding toward code-style queries. Drop the prefix for
+    # file units; the docstring-derived hint above already supplies query-
+    # aligned keywords ("install dependencies", "build configuration", ...).
     if unit.code_preview:
-        parts.append(f"Code:\n{unit.code_preview}")
+        if unit.unit_type == "file":
+            parts.append(unit.code_preview)
+        else:
+            parts.append(f"Code:\n{unit.code_preview}")
 
     # Add name and type for context
     type_str = unit.unit_type if unit.unit_type else "function"
     parts.insert(0, f"{type_str.capitalize()}: {unit.name}")
+
+    # Bug 004 follow-up: the docstring is already appended via the
+    # ``Description:`` field above for every unit (including file units), so
+    # we no longer also prepend it at position 0 — that double-inserted the
+    # hint text for non-code file units. The BGE embedding still picks up the
+    # hint via the ``Description:`` field; the leading ``File: <name>`` token
+    # carries enough query alignment for filename-keyed queries.
 
     return "\n".join(parts)
 
@@ -983,18 +1042,36 @@ def _process_file_for_extraction(
     # to emit. Gate 1 in api.py already includes them in structure["files"] via
     # _build_non_code_file_entry (empty functions/classes/methods/imports). Emit
     # one whole-file EmbeddingUnit so they appear in semantic search results.
-    if full_path.suffix in NON_CODE_EXTENSIONS:
+    # Extensionless build/manifest files (Makefile, Dockerfile, Gemfile,
+    # Podfile) have no suffix to match NON_CODE_EXTENSIONS, so the hint dict
+    # entries for them would otherwise be unreachable; whitelist their basenames
+    # (case-insensitive) so the non-code hint path still picks them up.
+    if (
+        full_path.suffix in NON_CODE_EXTENSIONS
+        or full_path.name.lower() in _NON_CODE_EXTENSIONLESS_BASENAMES
+    ):
         basename = full_path.name
+        basename_lower = basename.lower()
         preview = content[:_NON_CODE_PREVIEW_CHARS]
+        # Tag the unit with its actual document type (markdown/toml/yaml/shell/...)
+        # rather than a generic "text" so query-time language filters and the
+        # embedding text below can distinguish doc/config/build files from code.
+        nc_language = EXTENSION_TO_LANGUAGE.get(full_path.suffix, "text")
+        # Bug 004: inject a filename-derived description so well-known files
+        # (README, pyproject.toml, requirements.txt, package.json, build.sh, ...)
+        # have semantic context beyond their raw content. Without this hint,
+        # BGE embeddings of pure config/manifest text often lose to .py units
+        # that lexically mention "dependency" in a CS sense.
+        nc_docstring = _NON_CODE_FILENAME_HINTS.get(basename_lower, "")
         unit = EmbeddingUnit(
             name=basename,
             qualified_name=file_path,
             file=file_path,
             line=1,
-            language="text",
+            language=nc_language,
             unit_type="file",
             signature=basename,
-            docstring="",
+            docstring=nc_docstring,
             calls=[],
             called_by=[],
             cfg_summary="",
