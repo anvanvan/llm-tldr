@@ -15,6 +15,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Iterable
 
+from .api import _strip_namespace_qualifier, build_project_call_graph
+
 if TYPE_CHECKING:
     from .cross_file_calls import ProjectCallGraph
 
@@ -108,6 +110,25 @@ def impact_analysis(
     is_php = language == "php"
     norm_target_func = target_func.replace(".", "::") if is_php else target_func
 
+    # Precompute distinct candidate names in the graph and the set of full names
+    # that share each bare suffix. Used to gate the qualified/bare fallbacks so
+    # they only fire when there's exactly one unambiguous candidate — preventing
+    # cross-module false positives in qualified-name languages (Elixir, Ruby,
+    # Java, Go-methods) where `Mod1.run` and `Mod2.run` must not collide.
+    _all_names: set[str] = set()
+    for _ff, _fn, _tf, _tn in edges:
+        _all_names.add(_fn)
+        _all_names.add(_tn)
+    _bare_to_full: dict[str, set[str]] = defaultdict(set)
+    for _name in _all_names:
+        _norm = _name.replace(".", "::") if is_php else _name
+        _bare = _strip_namespace_qualifier(_norm)
+        if _bare:
+            _bare_to_full[_bare].add(_norm)
+        else:
+            # Already bare — record itself under its own key
+            _bare_to_full[_norm].add(_norm)
+
     def _matches_target(func_name: str) -> bool:
         if is_php:
             # Normalize '.' to '::' so "Class.method" matches "Class::method"
@@ -116,11 +137,31 @@ def impact_analysis(
             norm_func = func_name
         if norm_func == norm_target_func:
             return True
-        # Match bare name against qualified ClassName::method
-        if "::" in norm_func and norm_func.split("::")[-1] == norm_target_func:
-            return True
-        if "::" in norm_target_func and norm_target_func.split("::")[-1] == norm_func:
-            return True
+        # Use centralized utility for extracting bare suffix from qualified names
+        norm_func_bare = _strip_namespace_qualifier(norm_func)
+        norm_target_bare = _strip_namespace_qualifier(norm_target_func)
+        # Bare suffix used to look up unique-candidate counts: prefer the
+        # qualified side's bare suffix; otherwise the already-bare side itself.
+        lookup_bare = norm_target_bare or norm_func_bare or norm_target_func
+        # Number of distinct full names in the graph sharing this bare suffix.
+        # If >1, accepting any qualified/bare fallback would conflate them.
+        # PHP retains its historical behavior (fallback always allowed) — its
+        # call graph stores both qualified and bare under disambiguating
+        # ClassName::method form and the test suite depends on permissive
+        # matching for PHP class methods.
+        candidate_count = len(_bare_to_full.get(lookup_bare, ()))
+        unique_candidate = is_php or candidate_count <= 1
+        if norm_func_bare and norm_func_bare == norm_target_func:
+            if unique_candidate:
+                return True
+        if norm_target_bare and norm_target_bare == norm_func:
+            if unique_candidate:
+                return True
+        if norm_func_bare and norm_target_bare and norm_func_bare == norm_target_bare:
+            # Strict: both sides qualified — require the namespace prefix to
+            # match exactly. This blocks `Mod1.run` from matching `Mod2.run`.
+            if is_php or norm_func == norm_target_func:
+                return True
         return False
 
     all_callees = set()
@@ -238,14 +279,32 @@ def dead_code_analysis(
     edges = call_graph.edges
     entry_points = entry_points or []
 
+    # Synthetic orphan-sentinel edges (Ruby/Elixir) carry no semantic call: the
+    # `to_func` is a placeholder (e.g. "__ruby_orphan__", "__elixir_orphan__")
+    # emitted by the builder to keep orphan defs visible to impact_analysis. If
+    # we treated such edges as real, every truly-orphan function (no incoming
+    # AND no outgoing edges) would falsely look like a caller (it "calls" the
+    # sentinel) and be classified as an entry-point root at the final
+    # `if func in callers: continue` check below. Filter them out up front so
+    # genuine orphans surface as dead. Imported lazily inside the function to
+    # avoid a top-level circular import with cross_file_calls.
+    from .cross_file_calls import is_orphan_sentinel as _is_synthetic_orphan_edge
+
     # Build set of all called functions
     called = set()
     for _, _, to_file, to_func in edges:
+        if _is_synthetic_orphan_edge(to_func):
+            continue
         called.add(FunctionRef(file=to_file, name=to_func))
 
-    # Build set of all callers (these are "alive" by definition)
+    # Build set of all callers (these are "alive" by definition).
+    # Exclude synthetic orphan-sentinel edges — their `from_func` is exactly
+    # the orphan we want to surface as dead; counting it as a caller would
+    # incorrectly classify it as an entry-point root (see policy gap fix).
     callers = set()
-    for from_file, from_func, _, _ in edges:
+    for from_file, from_func, _, to_func in edges:
+        if _is_synthetic_orphan_edge(to_func):
+            continue
         callers.add(FunctionRef(file=from_file, name=from_func))
 
     # Common entry point patterns. The Ruby builder used to emit "<top-level>"
@@ -270,6 +329,24 @@ def dead_code_analysis(
     for func_info in all_functions:
         func = FunctionRef(file=func_info["file"], name=func_info["name"])
 
+        # Skip dunder methods (always — they are framework-managed regardless
+        # of edge counts).
+        if func.name.startswith("__") and func.name.endswith("__"):
+            continue
+
+        # True-orphan override: a function with NO incoming edges (not in
+        # `called`) AND NO outgoing real edges (not in `callers`, where
+        # synthetic orphan-sentinel edges have already been excluded above)
+        # is genuinely unreachable AND unproductive. Surface it as dead
+        # *before* the entry-point heuristics — those heuristics are intended
+        # to spare framework entry points like `main`, `cli.run`, `setup`,
+        # which have outgoing calls. They must NOT also spare a function
+        # whose only "evidence of life" is a name/file substring match.
+        is_orphan = func not in called and func not in callers
+        if is_orphan:
+            dead.append(func)
+            continue
+
         # Skip if it's called
         if func in called:
             continue
@@ -279,10 +356,6 @@ def dead_code_analysis(
             pattern in func.name or pattern in func.file for pattern in entry_patterns
         )
         if is_entry:
-            continue
-
-        # Skip dunder methods
-        if func.name.startswith("__") and func.name.endswith("__"):
             continue
 
         # Skip if it calls something (it's a root/entry)
@@ -321,7 +394,15 @@ def architecture_analysis(call_graph: "ProjectCallGraph") -> dict:
     Returns:
         Dict with layer info, directory analysis, and circular deps
     """
-    edges = call_graph.edges
+    # B-1/S-10: filter synthetic orphan-sentinel edges (Ruby/Elixir) before
+    # computing dir_stats / forward / reverse so they don't pollute layer stats.
+    # Same filter dead_code_analysis applies for the same reason.
+    from .cross_file_calls import is_orphan_sentinel as _is_synthetic_orphan_edge
+
+    edges = [
+        e for e in call_graph.edges
+        if not _is_synthetic_orphan_edge(e[1]) and not _is_synthetic_orphan_edge(e[3])
+    ]
     forward = build_forward_graph(edges)
     reverse = build_reverse_graph(edges)
 
@@ -424,8 +505,6 @@ def analyze_impact(
     Returns:
         Impact analysis results
     """
-    from .api import build_project_call_graph
-
     call_graph = build_project_call_graph(path, language=language)
     return impact_analysis(call_graph, target_func, max_depth, target_file, language=language)
 
@@ -445,7 +524,7 @@ def analyze_dead_code(
     Returns:
         Dead code analysis results
     """
-    from .api import build_project_call_graph, get_code_structure
+    from .api import get_code_structure
 
     call_graph = build_project_call_graph(path, language=language)
     structure = get_code_structure(path, language=language, max_results=1000)
@@ -470,7 +549,5 @@ def analyze_architecture(path: str, language: str = "python") -> dict:
     Returns:
         Architecture analysis results
     """
-    from .api import build_project_call_graph
-
     call_graph = build_project_call_graph(path, language=language)
     return architecture_analysis(call_graph)

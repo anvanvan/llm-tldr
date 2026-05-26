@@ -42,22 +42,6 @@ def _rust_display_name(name: str) -> str:
     return name.replace(".", "::")
 
 
-# Languages supported by get_relevant_context (ext_map used for file scanning)
-SUPPORTED_CONTEXT_EXT_MAP: dict[str, set[str]] = {
-    "python": {".py"},
-    "typescript": {".ts", ".tsx"},
-    "javascript": {".js", ".jsx", ".mjs", ".cjs"},
-    "go": {".go"},
-    "rust": {".rs"},
-    "php": {".php"},
-    "swift": {".swift"},
-    "java": {".java"},
-    "ruby": {".rb"},
-    "c": {".c", ".h"},
-    "elixir": {".ex", ".exs"},
-}
-SUPPORTED_CONTEXT_LANGUAGES: frozenset[str] = frozenset(SUPPORTED_CONTEXT_EXT_MAP.keys())
-
 # Authoritative extension map for all supported languages (used by get_module,
 # get_relevant_context, and scan_project_files to avoid duplication).
 _EXT_MAP_ALL_LANGUAGES: dict[str, set[str]] = {
@@ -79,6 +63,18 @@ _EXT_MAP_ALL_LANGUAGES: dict[str, set[str]] = {
     "scala": {".scala", ".sc"},
     "cpp": {".cpp", ".cc", ".cxx", ".hpp", ".hh", ".hxx"},
 }
+
+# Languages supported by get_relevant_context (ext_map used for file scanning).
+# Derived from _EXT_MAP_ALL_LANGUAGES to keep a single source of truth for
+# extension lists — future additions only need updating one place. S-1 follow-up.
+_SUPPORTED_CONTEXT_LANGS: tuple[str, ...] = (
+    "python", "typescript", "javascript", "go", "rust", "php",
+    "swift", "java", "ruby", "c", "elixir",
+)
+SUPPORTED_CONTEXT_EXT_MAP: dict[str, set[str]] = {
+    lang: _EXT_MAP_ALL_LANGUAGES[lang] for lang in _SUPPORTED_CONTEXT_LANGS
+}
+SUPPORTED_CONTEXT_LANGUAGES: frozenset[str] = frozenset(SUPPORTED_CONTEXT_EXT_MAP.keys())
 
 # Namespace separators recognised by the qualified-name fallback helpers.
 # Order matters: "::" is checked before "/" before "." so that the rightmost
@@ -896,14 +892,25 @@ def get_relevant_context(
 
             info = extractor.extract(str(file_path))
             for func in info.functions:
-                # Primary key: module.function (e.g., "claude_spawn.spawn_agent")
-                module_name = file_path.stem  # "claude_spawn" from "claude_spawn.py"
-                qualified_key = f"{module_name}.{func.name}"
-                signatures[qualified_key] = (str(file_path), func)
-
-                # Also store unqualified for backward compat (first wins)
-                if func.name not in signatures:
+                # Primary key: module.function (e.g., "claude_spawn.spawn_agent").
+                # When the extractor has already qualified the name with the
+                # source module (Elixir's ``Greeter.greet`` form), skip the
+                # file-stem prefix — otherwise we'd store both
+                # ``greeter.Greeter.greet`` AND ``Greeter.greet`` for the same
+                # function, which makes unqualified queries return duplicate
+                # result_functions (both keys ``endswith(".greet")``).
+                if "." in func.name:
+                    # Name is already qualified by the extractor; index it
+                    # directly without the file-stem prefix.
                     signatures[func.name] = (str(file_path), func)
+                else:
+                    module_name = file_path.stem  # "claude_spawn" from "claude_spawn.py"
+                    qualified_key = f"{module_name}.{func.name}"
+                    signatures[qualified_key] = (str(file_path), func)
+
+                    # Also store unqualified for backward compat (first wins)
+                    if func.name not in signatures:
+                        signatures[func.name] = (str(file_path), func)
             for cls in info.classes:
                 # Index class itself as callable (dataclasses, constructors)
                 # Create a pseudo-FunctionInfo for the class

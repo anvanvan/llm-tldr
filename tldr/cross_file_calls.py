@@ -160,7 +160,7 @@ except ImportError:
 
 # Languages with a full _build_*_call_graph implementation in build_project_call_graph.
 CALL_GRAPH_LANGUAGES: frozenset[str] = frozenset(
-    {"python", "typescript", "go", "rust", "java", "c", "php"}
+    {"python", "typescript", "go", "rust", "java", "c", "php", "ruby", "elixir", "swift"}
 )
 
 # Synthetic sentinel used by the Ruby call-graph builder to mark "orphan"
@@ -169,6 +169,28 @@ CALL_GRAPH_LANGUAGES: frozenset[str] = frozenset(
 # Filtered out at the CLI layer before user-facing output. Shared with
 # tldr/cli.py to avoid string-literal divergence.
 RUBY_ORPHAN_SENTINEL = "__ruby_orphan__"
+
+# Synthetic sentinel used by the Elixir call-graph builder to mark "orphan"
+# defs (defined functions with no real callers or callees). Mirrors the
+# Ruby sentinel pattern above so impact_analysis returns caller_count=0
+# rather than a "not found" error for unreferenced Elixir defs. Filtered
+# out at the CLI layer before user-facing output.
+ELIXIR_ORPHAN_SENTINEL = "__elixir_orphan__"
+
+# Canonical orphan-sentinel tuple — single source of truth for membership
+# checks. S-8: previously duplicated as `_is_synthetic_orphan_edge` in
+# analysis.py and `_is_orphan_sentinel` in cli.py. Both now delegate here.
+_ORPHAN_SENTINELS: tuple[str, ...] = (RUBY_ORPHAN_SENTINEL, ELIXIR_ORPHAN_SENTINEL)
+
+
+def is_orphan_sentinel(name: str) -> bool:
+    """Return True if `name` is a synthetic orphan-sentinel marker.
+
+    Used to filter Ruby/Elixir builder-emitted sentinel edges/functions that
+    represent "defined but no real callers or callees" rather than real calls.
+    Canonical helper — analysis.py and cli.py both delegate here (S-8).
+    """
+    return name in _ORPHAN_SENTINELS
 
 
 @dataclass
@@ -4787,7 +4809,7 @@ def _extract_elixir_module_name(call_node, source: bytes):
 
 
 def _extract_elixir_func_name(call_node, source: bytes):
-    """Extract the function name from an Elixir def/defp call node."""
+    """Extract the function name from an Elixir def/defp/defmacro/defmacrop call node."""
     for child in call_node.children:
         if child.type == "arguments":
             for arg_child in child.children:
@@ -4874,6 +4896,54 @@ def _extract_elixir_file_calls(file_path: Path, root: Path, parser=None) -> tupl
                             calls.append(("intra", fname))
                         else:
                             calls.append(("local", fname))
+            elif node.type == "unary_operator":
+                # `&` captures: &Mod.fn/arity, &local_fn/arity, &local_fn (bare).
+                # Node access via .children[N] index ONLY — Elixir tree-sitter grammar
+                # does NOT define named fields on unary_operator / binary_operator, so
+                # child_by_field_name would silently return None and drop edges (T-8).
+                # Fall-through to default child recursion below is intentional (T2-6):
+                # for &Mod.fn/arity the inner `call` node is also visited and produces
+                # a duplicate ("qualified", "Mod.fn") tuple, deduped at graph.edges set.
+                if len(node.children) >= 2:
+                    op_token = node.children[0]
+                    if source[op_token.start_byte:op_token.end_byte] == b"&":
+                        operand = node.children[1]
+                        if operand.type == "binary_operator":
+                            # MFA form: &Mod.fn/arity or &local_fn/arity
+                            if len(operand.children) >= 1:
+                                left = operand.children[0]
+                                if left.type == "call":
+                                    # Qualified: &Mod.fn/arity → ("qualified", "Mod.fn")
+                                    dot_child2 = None
+                                    for dc in left.children:
+                                        if dc.type == "dot":
+                                            dot_child2 = dc
+                                    if dot_child2 is not None:
+                                        alias_text = None
+                                        fname = None
+                                        for dc in dot_child2.children:
+                                            if dc.type == "alias":
+                                                alias_text = source[dc.start_byte:dc.end_byte].decode("utf-8", errors="replace")
+                                            elif dc.type == "identifier":
+                                                fname = source[dc.start_byte:dc.end_byte].decode("utf-8", errors="replace")
+                                        if alias_text and fname:
+                                            calls.append(("qualified", f"{alias_text}.{fname}"))
+                                elif left.type == "identifier":
+                                    # Local MFA capture: &local_fn/arity
+                                    name = source[left.start_byte:left.end_byte].decode("utf-8", errors="replace")
+                                    if name not in skip_keywords:
+                                        if name in local_defs:
+                                            calls.append(("intra", name))
+                                        else:
+                                            calls.append(("local", name))
+                        elif operand.type == "identifier":
+                            # Bare capture: &local_fn (no arity) — G2-4
+                            name = source[operand.start_byte:operand.end_byte].decode("utf-8", errors="replace")
+                            if name not in skip_keywords:
+                                if name in local_defs:
+                                    calls.append(("intra", name))
+                                else:
+                                    calls.append(("local", name))
             for child in node.children:
                 visit(child)
 
@@ -4899,15 +4969,30 @@ def _extract_elixir_file_calls(file_path: Path, root: Path, parser=None) -> tupl
                                 visit_all(dc)
                     current_module = old
                     return
-            if ident in ("def", "defp"):
+            if ident in ("def", "defp", "defmacro", "defmacrop"):
                 fname = _extract_elixir_func_name(node, source)
                 if fname and current_module:
                     defined.setdefault(current_module, set()).add(fname)
                     key = f"{current_module}.{fname}"
                     local = defined.get(current_module, set())
+                    calls_by_func.setdefault(key, [])
                     for child in node.children:
                         if child.type == "do_block":
-                            calls_by_func.setdefault(key, []).extend(extract_body_calls(child, local))
+                            calls_by_func[key].extend(extract_body_calls(child, local))
+                        elif child.type == "arguments":
+                            # Single-line `def name(args), do: body` form: body lives in
+                            # arguments → keywords → pair → named_children[-1]. visit_all's
+                            # existing do_block path misses this, leaving outbound calls
+                            # uncollected. Traverse it here. Guard with
+                            # len(pair.named_children) >= 2 (T2-10) for consistency with
+                            # the named_children[-1] access that follows.
+                            for arg in child.children:
+                                if arg.type == "keywords":
+                                    for pair in arg.children:
+                                        if pair.type == "pair" and len(pair.named_children) >= 2:
+                                            body_value = pair.named_children[-1]
+                                            calls_by_func[key].extend(
+                                                extract_body_calls(body_value, local))
                     return
         for child in node.children:
             visit_all(child)
@@ -4947,7 +5032,11 @@ def _build_elixir_call_graph(
         last = fqn.rsplit(".", 1)[-1]
         last_segment_to_fqn.setdefault(last, fqn)
 
-    # Pass 2: emit edges
+    # Pass 2: emit edges. Track which (file, fqn) pairs participate in any
+    # real edge so the orphan sweep below can emit sentinel edges for
+    # defined functions that never appeared as caller or callee. Mirrors
+    # the Ruby builder pattern (see _build_ruby_call_graph lines ~5374-5425).
+    referenced: set[tuple[str, str]] = set()
     for rel_path, defined, calls_by_func in per_file:
         for caller_func, calls in calls_by_func.items():
             # Caller's module fqn = caller_func minus last segment
@@ -4955,9 +5044,14 @@ def _build_elixir_call_graph(
             for call_type, target in calls:
                 if call_type == "intra":
                     if caller_mod:
-                        graph.add_edge(rel_path, caller_func, rel_path, f"{caller_mod}.{target}")
+                        dst_fqn = f"{caller_mod}.{target}"
+                        graph.add_edge(rel_path, caller_func, rel_path, dst_fqn)
+                        referenced.add((rel_path, caller_func))
+                        referenced.add((rel_path, dst_fqn))
                     else:
                         graph.add_edge(rel_path, caller_func, rel_path, target)
+                        referenced.add((rel_path, caller_func))
+                        referenced.add((rel_path, target))
                 elif call_type == "qualified":
                     mod_ref, fname = target.rsplit(".", 1)
                     # Try to resolve mod_ref: direct fqn, or last-segment alias
@@ -4968,12 +5062,35 @@ def _build_elixir_call_graph(
                         resolved_fqn = last_segment_to_fqn[mod_ref]
                     if resolved_fqn and fname in module_funcs.get(resolved_fqn, set()):
                         dst_file = module_to_file[resolved_fqn]
-                        graph.add_edge(rel_path, caller_func, dst_file, f"{resolved_fqn}.{fname}")
+                        dst_fqn = f"{resolved_fqn}.{fname}"
+                        graph.add_edge(rel_path, caller_func, dst_file, dst_fqn)
+                        referenced.add((rel_path, caller_func))
+                        referenced.add((dst_file, dst_fqn))
                 elif call_type == "local":
                     # Bare same-file call: only emit when target is a function
                     # in the caller's module — avoids fake edges for imports/builtins.
                     if caller_mod and target in module_funcs.get(caller_mod, set()):
-                        graph.add_edge(rel_path, caller_func, rel_path, f"{caller_mod}.{target}")
+                        dst_fqn = f"{caller_mod}.{target}"
+                        graph.add_edge(rel_path, caller_func, rel_path, dst_fqn)
+                        referenced.add((rel_path, caller_func))
+                        referenced.add((rel_path, dst_fqn))
+
+    # Orphan sweep: emit synthetic sentinel edges for every defined function
+    # that never appeared as caller or callee of any real edge. Without this,
+    # impact_analysis returns {'error': 'not found'} for orphans because it
+    # only consults graph.edges. The func_fqn format MUST match the
+    # f"{resolved_fqn}.{fname}" format used in referenced.add(...) above (G2-5)
+    # to prevent silently marking all real callees as orphans.
+    for rel_path, defined, _calls_by_func in per_file:
+        for mod_fqn, funcs in defined.items():
+            for fname in funcs:
+                func_fqn = f"{mod_fqn}.{fname}"
+                if (rel_path, func_fqn) in referenced:
+                    continue
+                graph.add_edge(
+                    rel_path, func_fqn,
+                    ELIXIR_ORPHAN_SENTINEL, ELIXIR_ORPHAN_SENTINEL,
+                )
 
 
 # -----------------------------------------------------------------------------

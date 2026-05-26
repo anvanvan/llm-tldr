@@ -2138,7 +2138,7 @@ def _find_elixir_function_node(tree, function_name: str):
                     call_name = tree.root_node.text[child.start_byte:child.end_byte].decode('utf-8')
                     break
 
-            if call_name in ("def", "defp"):
+            if call_name in ("def", "defp", "defmacro", "defmacrop"):
                 # Find the function name in arguments
                 # Note: tree-sitter-elixir uses direct children, not field names
                 args = None
@@ -2175,7 +2175,10 @@ def extract_elixir_cfg(source: str, function_name: str) -> CFGInfo:
 
     Args:
         source: Elixir source code
-        function_name: Name of function to extract CFG for
+        function_name: Name of function to extract CFG for. May be either a
+            bare name (``greet``) or module-qualified (``Greeter.greet``);
+            qualified names are stripped to the bare suffix before lookup
+            because Elixir def nodes only carry the bare name.
 
     Returns:
         CFGInfo with blocks, edges, and complexity
@@ -2191,9 +2194,13 @@ def extract_elixir_cfg(source: str, function_name: str) -> CFGInfo:
     parser = _get_ts_parser("elixir")
     tree = parser.parse(source_bytes)
 
-    func_node = _find_elixir_function_node(tree, function_name)
+    # Accept ``Greeter.greet`` by stripping the module prefix — Elixir def
+    # nodes hold only the bare name. Mirrors the qualified-name behaviour now
+    # produced by ``HybridExtractor._extract_elixir_nodes``.
+    bare_name = function_name.rsplit(".", 1)[-1]
+    func_node = _find_elixir_function_node(tree, bare_name)
     if not func_node:
         raise ValueError(f"Function '{function_name}' not found in source")
 
     builder = ElixirCFGBuilder(source_bytes)
-    return builder.build(func_node, function_name)
+    return builder.build(func_node, bare_name)

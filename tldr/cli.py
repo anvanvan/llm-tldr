@@ -33,17 +33,19 @@ from . import __version__
 # Dual-gate idiom: api.py uses self.language=='rust' (RelevantContext owns language);
 # cli.py uses .endswith('.rs') (edge tuples have no language object).
 from .api import SUPPORTED_CONTEXT_LANGUAGES, _serialize_call_graph_to_cache, _rust_display_name
-from .cross_file_calls import CALL_GRAPH_LANGUAGES, RUBY_ORPHAN_SENTINEL
+from .cross_file_calls import (
+    CALL_GRAPH_LANGUAGES,
+    ELIXIR_ORPHAN_SENTINEL,
+    RUBY_ORPHAN_SENTINEL,
+    is_orphan_sentinel as _is_orphan_sentinel,
+)
 from .semantic import ALL_LANGUAGES, EXTENSION_TO_LANGUAGE
 
 # Re-export under the legacy private alias to avoid touching every existing
 # call site in this module. Single source of truth lives in cross_file_calls.
+# `_is_orphan_sentinel` is now imported directly from cross_file_calls (S-8).
 _RUBY_ORPHAN_SENTINEL = RUBY_ORPHAN_SENTINEL
-
-
-def _is_orphan_sentinel(func_name: str) -> bool:
-    """Check if func_name is a Ruby orphan sentinel marker."""
-    return func_name == _RUBY_ORPHAN_SENTINEL
+_ELIXIR_ORPHAN_SENTINEL = ELIXIR_ORPHAN_SENTINEL
 
 
 def _get_subprocess_detach_kwargs():
@@ -895,8 +897,9 @@ Semantic Search:
             # Check for cached graph and dirty files for incremental update
             lang = resolve_language(args.lang, args.path)
             graph = _get_or_build_graph(args.path, lang, build_project_call_graph)
-            # Filter _RUBY_ORPHAN_SENTINEL edges on both e[1] (from_func) and
-            # e[3] (to_func) positions before emission.
+            # Filter Ruby/Elixir orphan-sentinel edges (canonical helper
+            # `_is_orphan_sentinel` from cross_file_calls) on both e[1]
+            # (from_func) and e[3] (to_func) positions before emission.
             filtered_edges = [
                 e for e in graph.edges
                 if not _is_orphan_sentinel(e[1]) and not _is_orphan_sentinel(e[3])
@@ -943,11 +946,17 @@ Semantic Search:
             lang = resolve_language(args.lang, args.path)
             result = analyze_architecture(args.path, language=lang)
             # Rust display: dot→:: in arch function fields for .rs files; skip
-            # _RUBY_ORPHAN_SENTINEL entries BEFORE the .rs guard.
+            # Ruby/Elixir orphan-sentinel entries (on either `file` or `function`)
+            # BEFORE the .rs guard. B-2 defensive: orphans are dead code already
+            # surfaced by `tldr dead`, not real entry points — preserve real
+            # entry points like main() (caller=0, callee>0) which DO have a
+            # real file path and non-sentinel function name.
             for layer_key in ("entry_layer", "leaf_layer"):
                 processed = []
                 for entry in result.get(layer_key, []):
                     if _is_orphan_sentinel(entry.get("file", "")):
+                        continue
+                    if _is_orphan_sentinel(entry.get("function", "")):
                         continue
                     if entry.get("file", "").endswith(".rs"):
                         entry["function"] = _rust_display_name(entry["function"])

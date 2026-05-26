@@ -3333,26 +3333,62 @@ class HybridExtractor:
             self._ts_parsers["elixir"] = parser
         return self._ts_parsers["elixir"]
 
-    def _extract_elixir_nodes(self, node, source: bytes, module_info: ModuleInfo):
-        """Extract Elixir nodes into module info."""
+    def _extract_elixir_nodes(self, node, source: bytes, module_info: ModuleInfo, current_module: str | None = None):
+        """Extract Elixir nodes into module info.
+
+        Tracks the enclosing ``defmodule`` name so that function signatures are
+        registered as ``ModuleName.func_name`` (e.g. ``Greeter.greet``) — matching
+        the qualified-name format emitted by the Elixir call-graph builder in
+        ``cross_file_calls.py``. Without this qualification the BFS in
+        ``api.get_relevant_context`` would key adjacency lookups by bare
+        ``greet`` while the edges use ``Greeter.greet``, returning empty
+        callers/callees.
+
+        Toplevel ``def``s outside any ``defmodule`` (rare) fall back to bare
+        names. Nested ``defmodule`` blocks adopt the innermost module name
+        (dotted module names like ``MyApp.Greeter`` are preserved verbatim).
+        """
         for child in node.children:
             if child.type == "call":
-                # Check if this is a def/defp/defmodule call
+                # Check if this is a def/defp/defmacro/defmacrop/defmodule call
                 call_name = self._get_elixir_call_identifier(child, source)
-                if call_name in ("def", "defp"):
-                    func_info = self._extract_elixir_function(child, source, call_name == "defp")
+                if call_name in ("def", "defp", "defmacro", "defmacrop"):
+                    func_info = self._extract_elixir_function(
+                        child, source, call_name in ("defp", "defmacrop")
+                    )
                     if func_info:
+                        if current_module:
+                            func_info.name = f"{current_module}.{func_info.name}"
                         module_info.functions.append(func_info)
+                    # Do NOT recurse into def bodies — nested defs would be
+                    # mis-attributed to the outer module if we did.
+                    continue
                 elif call_name == "defmodule":
-                    # Extract module name
-                    args = child.child_by_field_name("arguments")
-                    if args:
-                        for arg in args.children:
-                            if arg.type == "alias":
-                                module_info.docstring = f"Module: {self._safe_decode(source[arg.start_byte:arg.end_byte])}"
-                                break
-            # Recurse
-            self._extract_elixir_nodes(child, source, module_info)
+                    # Extract module name (alias node, e.g. "Greeter" or
+                    # "MyApp.Greeter") and recurse into the do_block body with
+                    # that name as the active module scope.
+                    mod_name = None
+                    for c in child.children:
+                        if c.type == "arguments":
+                            for arg in c.children:
+                                if arg.type == "alias":
+                                    mod_name = self._safe_decode(
+                                        source[arg.start_byte:arg.end_byte]
+                                    )
+                                    break
+                            break
+                    if mod_name and module_info.docstring is None:
+                        module_info.docstring = f"Module: {mod_name}"
+                    # Recurse into the defmodule body with the new module scope.
+                    # We pass `mod_name or current_module` so nested defmodules
+                    # inherit the outer name when the inner one fails to parse.
+                    self._extract_elixir_nodes(
+                        child, source, module_info, mod_name or current_module
+                    )
+                    continue
+            # Recurse for any other node type (preserves traversal of top-level
+            # constructs surrounding defmodule).
+            self._extract_elixir_nodes(child, source, module_info, current_module)
 
     def _get_elixir_call_identifier(self, node, source: bytes) -> str | None:
         """Get the identifier from an Elixir call node."""
