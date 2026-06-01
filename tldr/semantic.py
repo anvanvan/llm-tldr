@@ -22,8 +22,7 @@ from collections.abc import Iterator
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
-from collections.abc import Iterator
-from typing import List, Optional, Tuple, Dict, Any
+from typing import Iterable, List, Optional, Set, Tuple, Dict, Any
 
 logger = logging.getLogger("tldr.semantic")
 
@@ -224,6 +223,40 @@ DEFAULT_MODEL = "bge-large-en-v1.5"
 PROJECT_ROOT_MARKERS = [".git", "pyproject.toml", "package.json", "Cargo.toml", "go.mod", ".tldr"]
 
 
+def _resolve_default_device() -> str:
+    """Return the GPU-first default compute device for this platform.
+
+    ``"metal"`` on Apple Silicon (darwin), ``"cpu"`` everywhere else (e.g. Linux
+    CI). This is the platform default used when neither an explicit ``device``
+    argument nor ``TLDR_DEVICE`` is set; the env/flag precedence is applied at
+    the API boundary (the ``device = device or os.environ.get(...) or
+    _resolve_default_device()`` chain) before this is consulted.
+    """
+    return "metal" if sys.platform == "darwin" else "cpu"
+
+
+def _resolve_device_arg(device: Optional[str]) -> Optional[str]:
+    """Resolve device: explicit arg > TLDR_DEVICE env > None (auto-pick).
+
+    Shared helper used by both ``get_model`` (semantic.py) and ``_resolve_device``
+    (cli.py) so the TLDR_DEVICE lookup lives in exactly one place.
+
+    If TLDR_DEVICE is set to a recognised value ('cpu', 'metal', 'mps'), returns
+    it. Unrecognised values are silently ignored here — the CLI layer
+    (``_resolve_device``) is responsible for user-visible validation and exit.
+    Note the asymmetry: 'mps' is accepted from the env (legacy, predates this
+    refactor) but is NOT an argparse ``--device`` choice, so ``TLDR_DEVICE=mps``
+    works while ``--device mps`` is rejected by the CLI.
+    Returns the device string, or None if no device can be determined.
+    """
+    if device is not None:
+        return device
+    env_device = os.environ.get("TLDR_DEVICE")
+    if env_device in ("cpu", "metal", "mps"):
+        return env_device
+    return None
+
+
 def _find_project_root(start_path: Path) -> Path:
     """Find project root by walking up from start_path.
 
@@ -282,6 +315,9 @@ class EmbeddingUnit:
     dfg_summary: str = ""
     dependencies: str = ""
     code_preview: str = ""
+    # L1 incremental-reindex gate: sha256 of build_embedding_text(self). Empty by
+    # default so metadata written before this field loads back without error.
+    text_hash: str = ""
 
     def to_dict(self) -> dict:
         """Convert to dictionary for JSON serialization."""
@@ -300,7 +336,41 @@ class EmbeddingUnit:
             "dfg_summary": self.dfg_summary,
             "dependencies": self.dependencies,
             "code_preview": self.code_preview,
+            "text_hash": self.text_hash,
         }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "EmbeddingUnit":
+        """Reconstruct an EmbeddingUnit from a ``to_dict()`` payload.
+
+        Round-trips ``to_dict()`` exactly (``from_dict(u.to_dict()).to_dict() ==
+        u.to_dict()``). Used by the parse-skip carry-forward path to rehydrate
+        unchanged units from the persisted metadata WITHOUT re-parsing the file —
+        so ``text_hash`` (the plan() reuse gate), ``calls`` and ``called_by``
+        (flat ``List[str]`` edge lists) must survive verbatim.
+
+        Every field is read with ``.get(field, default)`` so old metadata written
+        before a field existed still loads (forward-compatibility). ``calls`` and
+        ``called_by`` are the unit's persisted flat string lists here — NOT the
+        richer ``dict[str, list[tuple[str, str]]]`` shape used by file_calls_cache.
+        """
+        return cls(
+            name=d.get("name", ""),
+            qualified_name=d.get("qualified_name", ""),
+            file=d.get("file", ""),
+            line=d.get("line", 0),
+            language=d.get("language", ""),
+            unit_type=d.get("unit_type", ""),
+            signature=d.get("signature", ""),
+            docstring=d.get("docstring", ""),
+            calls=list(d.get("calls", []) or []),
+            called_by=list(d.get("called_by", []) or []),
+            cfg_summary=d.get("cfg_summary", ""),
+            dfg_summary=d.get("dfg_summary", ""),
+            dependencies=d.get("dependencies", ""),
+            code_preview=d.get("code_preview", ""),
+            text_hash=d.get("text_hash", ""),
+        )
 
 
 MODEL_NAME = "BAAI/bge-large-en-v1.5"  # Legacy, use SUPPORTED_MODELS
@@ -411,7 +481,10 @@ def get_model(model_name: Optional[str] = None, *, device: Optional[str] = None)
     Args:
         model_name: Model key from SUPPORTED_MODELS, or None for default.
                    Can also be a full HuggingFace model name.
-        device: 'cpu', 'metal', 'mps', or None for default behavior.
+        device: 'cpu', 'metal', 'mps', or None to read from TLDR_DEVICE env var
+                (or let SentenceTransformer auto-pick if not set). Note: this
+                function does NOT apply the platform default — that is only done
+                at the build_semantic_index/semantic_search API boundaries.
 
     Returns:
         SentenceTransformer model instance.
@@ -425,10 +498,7 @@ def get_model(model_name: Optional[str] = None, *, device: Optional[str] = None)
     # Default device from TLDR_DEVICE env if caller omitted it — ensures every
     # call site (including no-console embed fallback and daemon paths) honors
     # the requested device instead of letting PyTorch silently pick MPS.
-    if device is None:
-        env_device = os.environ.get("TLDR_DEVICE")
-        if env_device in ("cpu", "metal", "mps"):
-            device = env_device
+    device = _resolve_device_arg(device)
 
     # Resolve model name
     if model_name is None:
@@ -536,13 +606,44 @@ class _MLXEmbedder:
             out_chunks.append(np.asarray(embeds))
             del result, embeds
             if (i // mlx_batch) % 16 == 15:
-                if self._device != "cpu":
+                if self._device != "cpu" and hasattr(mx, "metal") and hasattr(mx.metal, "clear_cache"):
                     mx.metal.clear_cache()
 
-        if self._device != "cpu":
+        if self._device != "cpu" and hasattr(mx, "metal") and hasattr(mx.metal, "clear_cache"):
             mx.metal.clear_cache()
         result_np = np.vstack(out_chunks) if len(out_chunks) > 1 else out_chunks[0]
         return result_np[0] if single else result_np
+
+
+def _stable_call_list(names: List[str], limit: int = 5) -> List[str]:
+    """Return a deterministic, de-duplicated, length-capped call list.
+
+    The L2 call-graph edges feeding ``calls`` / ``called_by`` are emitted in a
+    hash-seed-dependent order by ``build_project_call_graph`` (dict/set iteration
+    over the func_index/registry), so a raw ``list[:5]`` slice picks both a
+    different ORDER and a different MEMBERSHIP across separate Python processes.
+    That made ``build_embedding_text`` — and therefore each unit's ``text_hash``
+    — vary between an index build and a later reindex in a fresh interpreter,
+    needlessly re-embedding unchanged units (the EDGE-4 reuse-churn finding).
+
+    Sorting (and de-duplicating) BEFORE the cap makes the kept subset and its
+    order independent of the upstream edge-emission order, so the text_hash is
+    stable across runs and unchanged units reuse their cached vector.
+    """
+    if not names:
+        return []
+    # Fast path: list is short enough that dedup + sort without full set overhead.
+    if len(names) <= limit:
+        seen: set = set()
+        result = []
+        for name in names:
+            if name not in seen:
+                seen.add(name)
+                result.append(name)
+        # Deduped result is already ≤limit; sort for cross-process determinism.
+        return sorted(result)
+    # Slow path: full dedup + sort + cap for long lists.
+    return sorted(set(names))[:limit]
 
 
 def build_embedding_text(unit: EmbeddingUnit) -> str:
@@ -636,7 +737,51 @@ def compute_embedding(text: str, model_name: Optional[str] = None, *, device: Op
     return np.array(embedding, dtype=np.float32)
 
 
-def extract_units_from_project(project_path: str, lang: str = "python", respect_ignore: bool = True, progress_callback=None) -> List[EmbeddingUnit]:
+# Process-global set by _init_extraction_worker so each spawned worker records
+# the language it was warmed for (diagnostic / future reuse hook). Lives in the
+# worker process only; the main process never reads it.
+_WORKER_LANG: Optional[str] = None
+
+
+def _init_extraction_worker(lang: Optional[str]) -> None:
+    """ProcessPoolExecutor initializer — runs ONCE per worker process.
+
+    Amortizes the per-task spawn/re-import cost: the worker imports the heavy
+    tree-sitter extractor module a single time when the process starts, warming
+    Python's module cache for every file the process subsequently handles
+    (instead of paying the import on each future). Module-level so it is picklable
+    across the macOS ``spawn`` start method.
+
+    ``lang`` is ``None`` only on the multi-language expansion path, which recurses
+    into ``extract_units_from_project`` once per concrete tag — each recursive
+    call constructs its own pool with a concrete ``lang`` — so a ``None`` here
+    simply skips the language-specific pre-import and the worker still processes
+    files correctly.
+    """
+    global _WORKER_LANG
+    # Dead write today: no code reads _WORKER_LANG. Kept as a diagnostic /
+    # future per-worker reuse hook (see the module-level declaration).
+    _WORKER_LANG = lang
+    if lang is None or lang == NON_CODE_DISPATCH_SENTINEL:
+        # Non-code / unresolved: nothing language-specific to pre-import.
+        return
+    try:
+        # Warm the extractor module cache once for this worker. Best-effort: an
+        # import failure must never abort the worker (the per-file try/except in
+        # the dispatch loop still isolates real extraction errors).
+        import tldr.api  # noqa: F401  (warms get_code_structure's dependency tree)
+    except Exception:
+        pass
+
+
+def extract_units_from_project(
+    project_path: str,
+    lang: Optional[str] = None,
+    respect_ignore: bool = True,
+    progress_callback=None,
+    files_to_parse: Optional[Set[str]] = None,
+    return_file_calls_cache: bool = False,
+) -> "List[EmbeddingUnit] | Tuple[List[EmbeddingUnit], Optional[ProjectCallGraph], dict]":
     """Extract all functions/methods/classes from a project.
 
     Uses existing TLDR APIs:
@@ -647,111 +792,196 @@ def extract_units_from_project(project_path: str, lang: str = "python", respect_
 
     Args:
         project_path: Path to project root.
-        lang: Programming language ("python", "typescript", "go", "rust").
+        lang: Programming language ("python", "typescript", "go", "rust"). When
+            ``None`` (the default) the project's languages are auto-detected via
+            ``_detect_project_language_tags`` and units are MERGED across every
+            detected tag — the single authoritative multi-language expansion seam
+            (build_semantic_index delegates its ``--lang all`` path here). A
+            non-code-only project yields its whole-file units via the
+            ``NON_CODE_DISPATCH_SENTINEL`` tag without the sentinel ever reaching
+            ``get_code_structure`` / ``build_project_call_graph`` / ``scan_project``.
         respect_ignore: If True, respect .tldrignore patterns (default True).
+        files_to_parse: Optional set of project-relative posix paths. When
+            provided, the file list from ``get_code_structure`` is filtered to this
+            allowlist BEFORE worker dispatch, so excluded (unchanged) files get
+            ZERO parse/worker cost. ``None`` (default) parses every file.
+        return_file_calls_cache: When True, return a 3-tuple
+            ``(units, call_graph_or_None, file_calls_cache)`` where
+            ``file_calls_cache`` maps ``(abs_path_str, lang)`` to the
+            ``_extract_file_calls`` output (``dict[str, list[tuple[str, str]]]``)
+            for each freshly-parsed file. Consumed by ``_build_reapply_call_maps``
+            Pass-2 so it can skip the scan_project walk. When False (default — all
+            pre-existing callers), the existing return shape is preserved.
 
     Returns:
-        List of EmbeddingUnit objects with enriched metadata.
+        List of EmbeddingUnit objects with enriched metadata, or a
+        (units, call_graph, file_calls_cache) 3-tuple if return_file_calls_cache=True.
     """
     from tldr.api import get_code_structure, build_project_call_graph, get_imports
     from tldr.tldrignore import load_ignore_patterns, should_ignore
 
     project = Path(project_path).resolve()
-    units = []
 
     # Load ignore spec before getting structure
     ignore_spec = load_ignore_patterns(project) if respect_ignore else None
 
-    # Get code structure (L1) - use high limit for semantic index
-    structure = get_code_structure(str(project), language=lang, max_results=100000, ignore_spec=ignore_spec)
-
-    # Filter ignored files
-    if respect_ignore:
-        spec = load_ignore_patterns(project)
-        structure["files"] = [
-            f for f in structure.get("files", [])
-            if not should_ignore(project / f.get("path", ""), project, spec)
-        ]
-
-    # Build call graph (L2)
-    try:
-        call_graph = build_project_call_graph(str(project), language=lang)
-
-        # Build call/called_by maps
-        calls_map = {}  # func -> [called functions]
-        called_by_map = {}  # func -> [calling functions]
-
-        for edge in call_graph.edges:
-            src_file, src_func, dst_file, dst_func = edge
-
-            # Forward: src calls dst
-            if src_func not in calls_map:
-                calls_map[src_func] = []
-            calls_map[src_func].append(dst_func)
-
-            # Backward: dst is called by src
-            if dst_func not in called_by_map:
-                called_by_map[dst_func] = []
-            called_by_map[dst_func].append(src_func)
-    except Exception:
-        # Call graph may not be available for all projects
-        calls_map = {}
-        called_by_map = {}
-
-    # Process files in parallel for better performance
-    files = structure.get("files", [])
     max_workers = int(os.environ.get("TLDR_MAX_WORKERS", os.cpu_count() or 4))
 
-    # Use parallel processing if we have multiple files
-    if len(files) > 1 and max_workers > 1:
-        try:
-            with ProcessPoolExecutor(max_workers=max_workers) as executor:
-                futures = {
-                    executor.submit(
-                        _process_file_for_extraction,
-                        file_info,
-                        str(project),
-                        lang,
-                        calls_map,
-                        called_by_map,
-                    ): file_info
-                    for file_info in files
-                }
+    def _extract_one_language(structure_lang: str):
+        """Extract units for ONE concrete language pass.
 
-                for future in as_completed(futures):
-                    file_info = futures[future]
+        ``structure_lang`` is the language handed to ``get_code_structure`` /
+        ``build_project_call_graph`` / the worker pool — it is ALWAYS a concrete
+        code language (never ``None`` / ``"all"`` / ``"auto"`` / the non-code
+        sentinel; the sentinel is mapped to a representative code language by the
+        caller so non-code files are still enumerated via the
+        ``code_extensions | NON_CODE_EXTENSIONS`` union inside get_code_structure).
+
+        Returns ``(lang_units, call_graph_obj_or_None, file_calls_cache)``.
+        """
+        lang_units: List[EmbeddingUnit] = []
+        file_calls_cache: Dict[Tuple[str, str], Dict[str, List[Tuple[str, str]]]] = {}
+
+        # Get code structure (L1) - use high limit for semantic index
+        structure = get_code_structure(str(project), language=structure_lang, max_results=100000, ignore_spec=ignore_spec)
+
+        # Filter ignored files. Reuse the outer ``ignore_spec`` (already loaded
+        # once above) instead of re-reading the patterns per language.
+        if respect_ignore:
+            structure["files"] = [
+                f for f in structure.get("files", [])
+                if not should_ignore(project / f.get("path", ""), project, ignore_spec)
+            ]
+
+        # Build call graph (L2). When the caller wants the file_calls_cache
+        # (build_semantic_index's index path), the eager build_project_call_graph
+        # is SKIPPED: it would re-walk the project via scan_project (the os.walk the
+        # cache exists to eliminate), and its per-unit calls/called_by enrichment is
+        # OVERWRITTEN by build_semantic_index's subsequent _reapply_call_graph anyway
+        # (which consumes the file_calls_cache). Worker enrichment then uses empty
+        # maps; the authoritative edges come from the cache-driven re-apply.
+        call_graph_obj = None
+        if return_file_calls_cache:
+            calls_map = {}
+            called_by_map = {}
+        else:
+            try:
+                call_graph = build_project_call_graph(str(project), language=structure_lang)
+                calls_map, called_by_map = _build_calls_maps(call_graph)
+                call_graph_obj = call_graph
+            except Exception:
+                # Call graph may not be available for all projects
+                calls_map = {}
+                called_by_map = {}
+
+        # Process files in parallel for better performance
+        files = structure.get("files", [])
+
+        # Parse-skip scoping (T2-8): restrict the worker dispatch to the allowlist
+        # BEFORE any future is submitted, so unchanged files cost zero parse/spawn.
+        if files_to_parse is not None:
+            files = [f for f in files if f.get("path") in files_to_parse]
+
+        # Only ask the worker for file_calls when the caller actually wants the
+        # file_calls_cache; otherwise the per-file _extract_file_calls AST parse is
+        # pure waste (existing single-language callers that don't need the cache).
+        want_calls = return_file_calls_cache
+
+        def _accumulate(file_info, result):
+            """Accumulate one worker result (units, or (units, file_calls))."""
+            if want_calls:
+                f_units, f_calls = result
+                if f_calls:
+                    # Key lang is the DISPATCH language (structure_lang) — the same
+                    # value _iter_call_graph_files filters on — NOT unit.language.
+                    # On the non-code sentinel path this is "python" by design.
+                    key = (str((project / file_info.get("path", "")).resolve()), structure_lang)
+                    file_calls_cache[key] = f_calls
+            else:
+                f_units = result
+            lang_units.extend(f_units)
+            if progress_callback:
+                progress_callback(file_info.get('path', 'unknown'), len(lang_units), len(files))
+
+        # Use parallel processing if we have multiple files
+        if len(files) > 1 and max_workers > 1:
+            try:
+                with ProcessPoolExecutor(
+                    max_workers=max_workers,
+                    initializer=_init_extraction_worker,
+                    initargs=(structure_lang,),
+                ) as executor:
+                    futures = {
+                        executor.submit(
+                            _process_file_for_extraction,
+                            file_info,
+                            str(project),
+                            structure_lang,
+                            calls_map,
+                            called_by_map,
+                            want_calls,
+                        ): file_info
+                        for file_info in files
+                    }
+
+                    for future in as_completed(futures):
+                        file_info = futures[future]
+                        try:
+                            _accumulate(file_info, future.result(timeout=60))
+                        except Exception as e:
+                            logger.warning(f"Failed to process {file_info.get('path', 'unknown')}: {e}")
+
+            except Exception as e:
+                logger.warning(f"Parallel extraction failed: {e}, falling back to sequential")
+                for file_info in files:
                     try:
-                        file_units = future.result(timeout=60)
-                        units.extend(file_units)
-                        if progress_callback:
-                            progress_callback(file_info.get('path', 'unknown'), len(units), len(files))
-                    except Exception as e:
-                        logger.warning(f"Failed to process {file_info.get('path', 'unknown')}: {e}")
-
-        except Exception as e:
-            logger.warning(f"Parallel extraction failed: {e}, falling back to sequential")
+                        _accumulate(file_info, _process_file_for_extraction(
+                            file_info, str(project), structure_lang, calls_map, called_by_map, want_calls
+                        ))
+                    except Exception as fe:
+                        logger.warning(f"Failed to process {file_info.get('path', 'unknown')}: {fe}")
+        else:
             for file_info in files:
                 try:
-                    file_units = _process_file_for_extraction(
-                        file_info, str(project), lang, calls_map, called_by_map
-                    )
-                    units.extend(file_units)
-                    if progress_callback:
-                        progress_callback(file_info.get('path', 'unknown'), len(units), len(files))
-                except Exception as fe:
-                    logger.warning(f"Failed to process {file_info.get('path', 'unknown')}: {fe}")
-    else:
-        for file_info in files:
-            try:
-                file_units = _process_file_for_extraction(
-                    file_info, str(project), lang, calls_map, called_by_map
-                )
-                units.extend(file_units)
-                if progress_callback:
-                    progress_callback(file_info.get('path', 'unknown'), len(units), len(files))
-            except Exception as e:
-                logger.warning(f"Failed to process {file_info.get('path', 'unknown')}: {e}")
+                    _accumulate(file_info, _process_file_for_extraction(
+                        file_info, str(project), structure_lang, calls_map, called_by_map, want_calls
+                    ))
+                except Exception as e:
+                    logger.warning(f"Failed to process {file_info.get('path', 'unknown')}: {e}")
 
+        return lang_units, call_graph_obj, file_calls_cache
+
+    # ------------------------------------------------------------------
+    # Dispatch
+    # ------------------------------------------------------------------
+    units: List[EmbeddingUnit] = []
+    file_calls_cache: Dict[Tuple[str, str], Dict[str, List[Tuple[str, str]]]] = {}
+    _call_graph_obj = None
+
+    if lang is None or lang == "all":
+        # Single authoritative expansion seam: detect the project's dispatch tags
+        # (code languages, or the non-code sentinel for doc-only repos) and MERGE
+        # units across every tag. Mirrors build_semantic_index's retired per-lang
+        # loop. _detect_project_language_tags (NOT _detect_project_languages) is
+        # used so non-code-only projects still yield their whole-file units.
+        tags = _detect_project_language_tags(project, respect_ignore=respect_ignore)
+        for tag in tags:
+            # Never hand the sentinel / pseudo-langs to lower-level APIs. The
+            # sentinel is a non-code-only project: extract under a representative
+            # code language ("python") so get_code_structure unions in
+            # NON_CODE_EXTENSIONS and enumerates the doc/config files (there are no
+            # .py files by hypothesis, so only the non-code files are emitted).
+            structure_lang = "python" if tag == NON_CODE_DISPATCH_SENTINEL else tag
+            lang_units, _, lang_cache = _extract_one_language(structure_lang)
+            units.extend(lang_units)
+            file_calls_cache.update(lang_cache)
+        # Multi-language merge cannot be represented by a single graph object.
+        _call_graph_obj = None
+    else:
+        units, _call_graph_obj, file_calls_cache = _extract_one_language(lang)
+
+    if return_file_calls_cache:
+        return units, _call_graph_obj, file_calls_cache
     return units
 
 
@@ -990,7 +1220,8 @@ def _process_file_for_extraction(
     lang: str,
     calls_map: Dict[str, List[str]],
     called_by_map: Dict[str, List[str]],
-) -> List[EmbeddingUnit]:
+    return_file_calls: bool = False,
+):
     """Process a single file and extract all units. Top-level for pickling.
 
     This function reads the file ONCE and extracts all information in a single pass,
@@ -1002,13 +1233,45 @@ def _process_file_for_extraction(
         lang: Programming language.
         calls_map: Map of function name -> list of called functions.
         called_by_map: Map of function name -> list of calling functions.
+        return_file_calls: When True, return ``(units, file_calls)`` where
+            ``file_calls`` is the ``_extract_file_calls`` output for this file
+            (``dict[str, list[tuple[str, str]]]``). This feeds the file_calls_cache
+            so the call-graph re-apply Pass-2 can skip the scan_project walk. When
+            False (default — all pre-existing direct callers), returns just the
+            ``List[EmbeddingUnit]`` exactly as before.
 
     Returns:
-        List of EmbeddingUnit objects for this file.
+        List of EmbeddingUnit objects for this file, or ``(units, file_calls)``
+        when ``return_file_calls=True``.
     """
     units = []
     project = Path(project_path)
     file_path = file_info.get("path", "")
+
+    def _ret(result_units):
+        """Wrap the return value with file_calls when requested.
+
+        file_calls is computed best-effort from the resolved on-disk path using the
+        extractor for ``lang`` (so the cache carries correct per-language call data
+        for all 8 import-index languages — python, ts/js, go, rust, java, c, php —
+        not just Python). It is ``{}`` for self-contained languages / unreadable /
+        non-existent files (every ``_extract_*_file_calls`` swallows parse/read
+        errors). This is what lets the registry-injected Pass-1 build_project_call_graph
+        produce import-resolved edges WITHOUT re-walking via scan_project.
+        """
+        if not return_file_calls:
+            return result_units
+        file_calls: Dict[str, List[Tuple[str, str]]] = {}
+        try:
+            from tldr.cross_file_calls import extract_file_calls_for_language
+            file_calls = extract_file_calls_for_language(
+                full_path,
+                project if not project.is_file() else project.parent,
+                lang,
+            )
+        except Exception:
+            file_calls = {}
+        return result_units, file_calls
     # Bug 004 R-5: when project_path is a single file (passed through from
     # build_semantic_index's scan_path), get_code_structure stores root.name as
     # file_path. Reconstruct full_path from the parent in that case; otherwise
@@ -1019,7 +1282,7 @@ def _process_file_for_extraction(
         full_path = project / file_path
 
     if not full_path.exists():
-        return units
+        return _ret(units)
 
     try:
         # Read file content ONCE.
@@ -1035,7 +1298,7 @@ def _process_file_for_extraction(
         lines = content.split('\n')
     except Exception as e:
         logger.warning(f"Failed to read {file_path}: {e}")
-        return units
+        return _ret(units)
 
     # Gate 2 (Bug 004): non-code files (.sh, .md, .toml, .yaml, .yml, .json,
     # .rst, .txt, .zsh, .bash) have no functions/classes for the AST loop below
@@ -1080,7 +1343,7 @@ def _process_file_for_extraction(
             code_preview=preview,
         )
         units.append(unit)
-        return units
+        return _ret(units)
 
     # Parse AST once for all function info
     ast_info = {"functions": {}, "classes": {}, "methods": {}}
@@ -1343,8 +1606,8 @@ def _process_file_for_extraction(
             unit_type="function",
             signature=sig,
             docstring=all_docstrings.get(func_name, ""),
-            calls=(calls_map.get(func_name) or calls_map.get(func_name.rsplit("\\", 1)[-1], []))[:5],
-            called_by=(called_by_map.get(func_name) or called_by_map.get(func_name.rsplit("\\", 1)[-1], []))[:5],
+            calls=_stable_call_list(calls_map.get(func_name) or calls_map.get(func_name.rsplit("\\", 1)[-1], [])),
+            called_by=_stable_call_list(called_by_map.get(func_name) or called_by_map.get(func_name.rsplit("\\", 1)[-1], [])),
             cfg_summary=cfg_cache.get(func_name, ""),
             dfg_summary=dfg_cache.get(func_name, ""),
             dependencies=dependencies,
@@ -1413,8 +1676,8 @@ def _process_file_for_extraction(
                 unit_type="method",
                 signature=all_signatures.get(method_key, f"{_sig_kw} {method}({_sig_args})"),
                 docstring=all_docstrings.get(method_key, ""),
-                calls=(calls_map.get(f"{_bare_cls}::{method}") or calls_map.get(method, []))[:5],
-                called_by=(called_by_map.get(f"{_bare_cls}::{method}") or called_by_map.get(method, []))[:5],
+                calls=_stable_call_list(calls_map.get(f"{_bare_cls}::{method}") or calls_map.get(method, [])),
+                called_by=_stable_call_list(called_by_map.get(f"{_bare_cls}::{method}") or called_by_map.get(method, [])),
                 cfg_summary=cfg_cache.get(method, ""),
                 dfg_summary=dfg_cache.get(method, ""),
                 dependencies=dependencies,
@@ -1422,7 +1685,7 @@ def _process_file_for_extraction(
             )
             units.append(unit)
 
-    return units
+    return _ret(units)
 
 
 def _get_progress_console():
@@ -1547,6 +1810,365 @@ def _detect_project_language_tags(project_path: Path, respect_ignore: bool = Tru
     return []
 
 
+def _add_call_edge(
+    calls_map: Dict[str, List[str]],
+    called_by_map: Dict[str, List[str]],
+    src: str,
+    dst: str,
+) -> None:
+    """Record a src->dst call edge into the forward + reverse maps (dedup per key).
+
+    Shared by ``_build_calls_maps`` and ``_build_reapply_call_maps`` so the
+    edge-accumulation/dedup logic lives in exactly one place.
+    """
+    bucket = calls_map.setdefault(src, [])
+    if dst not in bucket:
+        bucket.append(dst)
+    rbucket = called_by_map.setdefault(dst, [])
+    if src not in rbucket:
+        rbucket.append(src)
+
+
+def _build_calls_maps(call_graph) -> Tuple[Dict[str, List[str]], Dict[str, List[str]]]:
+    """Build (calls_map, called_by_map) from a ProjectCallGraph.
+
+    Shared helper used by both ``extract_units_from_project`` and
+    ``_build_reapply_call_maps`` so the edge-keying logic stays in one place.
+
+    Returns:
+        Tuple of (calls_map: func -> [called functions],
+                  called_by_map: func -> [calling functions])
+    """
+    calls_map: Dict[str, List[str]] = {}
+    called_by_map: Dict[str, List[str]] = {}
+
+    for edge in call_graph.edges:
+        _src_file, src_func, _dst_file, dst_func = edge
+        _add_call_edge(calls_map, called_by_map, src_func, dst_func)
+
+    return calls_map, called_by_map
+
+
+@dataclass
+class _ReapplyContext:
+    """The cache-context bundle for the 4b call-graph re-apply.
+
+    These four fields are always varied together (the aggressive cache path sets
+    all of them; the legacy path leaves them at their defaults). Bundling them
+    keeps ``_build_reapply_call_maps`` from carrying four independent optionals
+    that are only meaningful in combination.
+    """
+    call_graph: Optional["ProjectCallGraph"] = None
+    file_calls_cache: Optional[dict] = None
+    carried_units: Optional[List["EmbeddingUnit"]] = None
+    all_units: Optional[List["EmbeddingUnit"]] = None
+
+
+def _build_reapply_call_maps(
+    project_path: str,
+    lang: str,
+    unit_names: set,
+    ctx: Optional[_ReapplyContext] = None,
+) -> Tuple[Dict[str, List[str]], Dict[str, List[str]]]:
+    """Build (calls_map, called_by_map) for the 4b call-graph re-apply.
+
+    Combines two resolution passes so cross-file caller drift is always caught:
+
+    1. Resolved edges from ``build_project_call_graph`` — these carry proper
+       ``ClassName::method`` keys for OOP methods and import-resolved cross-file
+       edges, mirroring the keying ``extract_units_from_project`` uses.
+    2. A name-based pass over ``_extract_file_calls`` — links any direct/intra/
+       ref call whose target name matches a known project function even when the
+       callee was not imported (e.g. a sibling module-level helper). Without
+       this, a new un-imported caller would not change the callee's text.
+
+    ``unit_names`` is the set of bare names known to be project units; only calls
+    whose target is in that set become edges, keeping the maps tight.
+
+    Args:
+        ctx: Optional ``_ReapplyContext`` bundling the four cache-context fields
+            (always varied together — see the dataclass docstring):
+
+            - ``call_graph``: pre-built ProjectCallGraph (e.g. from
+              extract_units_from_project). When provided, skips the Pass 1 rebuild
+              to avoid redundant graph computation in single-language mode.
+            - ``file_calls_cache``: ``{(abs_path_str, lang): file_calls}`` map
+              collected during extraction. When provided, Pass-2 CONSUMES it (plus
+              ``carried_units`` for any unchanged files not in it) instead of
+              walking the project with ``scan_project`` — eliminating the
+              duplicate os.walk on the initial index. ``file_calls`` is the
+              ``_extract_file_calls`` output
+              (``dict[str, list[tuple[str, str]]]``). It ALSO drives Pass-1's
+              aggressive registry path (see ``all_units``).
+            - ``carried_units``: carried-forward EmbeddingUnits (parse-skip
+              unchanged files). For each, Pass-2 reconstructs the absolute path
+              and reads it via ``_extract_file_calls`` directly (cheap — file
+              unchanged on disk / in page cache). Only consulted when
+              ``file_calls_cache`` is provided.
+            - ``all_units``: complete merged unit list (fresh + carried). When
+              ``file_calls_cache`` is also provided and no pre-built graph exists,
+              Pass-1 builds the func_index from these units via
+              ``build_func_index_from_units`` and feeds both it and
+              ``file_calls_cache`` into ``build_project_call_graph`` — yielding the
+              import-resolved ``ClassName::method`` edges WITHOUT calling
+              ``scan_project``.
+
+            ``None`` (the default) keeps the legacy Pass-1 behavior.
+    """
+    if ctx is None:
+        ctx = _ReapplyContext()
+    call_graph = ctx.call_graph
+    file_calls_cache = ctx.file_calls_cache
+    carried_units = ctx.carried_units
+    all_units = ctx.all_units
+
+    calls_map: Dict[str, List[str]] = {}
+    called_by_map: Dict[str, List[str]] = {}
+
+    # Build the func-index ONCE before the per-language loop so every language
+    # iteration reuses the same registry instead of recomputing it O(n*L) times.
+    # The registry is language-agnostic (it indexes all units' files), so hoisting
+    # it out is safe regardless of how many languages are processed.
+    _prebuilt_func_idx = None
+    if file_calls_cache is not None and all_units is not None:
+        from tldr.cross_file_calls import build_func_index_from_units
+        _prebuilt_func_idx = build_func_index_from_units(all_units, Path(project_path))
+
+    def _add(src: str, dst: str) -> None:
+        _add_call_edge(calls_map, called_by_map, src, dst)
+
+    def _link_file_calls(file_calls) -> None:
+        """Merge one file's ``_extract_file_calls`` output into the shared maps."""
+        for caller_func, edges in file_calls.items():
+            for _call_type, target in edges:
+                # target may be "obj.method"; take the trailing name.
+                bare_target = target.rsplit(".", 1)[-1]
+                if bare_target in unit_names:
+                    _add(caller_func, bare_target)
+
+    def _apply_one_language(one_lang: str, prebuilt_graph=None) -> None:
+        """Run Pass 1 + Pass 2 for a single concrete language, merging into the
+        shared calls_map / called_by_map via ``_add`` (which dedupes per key).
+
+        Both passes are best-effort: a failure for one language is logged at
+        debug and never aborts the others (important for the lang="all" merge,
+        where one odd/unsupported language must not skip the rest).
+        """
+        root = Path(project_path).resolve()
+        # Pass 1: resolved project call graph (method keys, import-resolved edges).
+        # Reuse a pre-built graph when available (avoids double build_project_call_graph
+        # in single-language mode); fall back to building it here for multi-lang / tests.
+        # AGGRESSIVE cache path: when a file_calls_cache is supplied (initial-index /
+        # parse-skip fast path) and no graph was pre-built, build_project_call_graph is
+        # still run — but with an O(n) registry built from the already-parsed units
+        # (build_func_index_from_units) AND the cache fed in as the per-file call data.
+        # That keeps the import-resolved ClassName::method edges while NEVER calling
+        # scan_project (neither build_function_index nor the per-language walk runs).
+        try:
+            graph = prebuilt_graph
+            if graph is None:
+                from tldr.api import build_project_call_graph
+                if file_calls_cache is not None and _prebuilt_func_idx is not None:
+                    # Reuse the func-index built once outside the loop (O(n) vs O(n*L)).
+                    graph = build_project_call_graph(
+                        project_path,
+                        language=one_lang,
+                        prebuilt_func_index=_prebuilt_func_idx,
+                        prebuilt_file_calls=file_calls_cache,
+                    )
+                elif file_calls_cache is None:
+                    graph = build_project_call_graph(project_path, language=one_lang)
+                # Defensive no-op (unreachable in production): file_calls_cache set
+                # but _prebuilt_func_idx None requires all_units to be None at the
+                # call site, yet _reapply_call_graph always passes all_units. If it
+                # ever fires, graph stays None and Pass-1 is skipped (Pass-2 still
+                # runs); a different text_hash would just trigger a harmless
+                # re-embed, never corruption.
+            if graph is not None:
+                _cmap, _ = _build_calls_maps(graph)
+                for src, dsts in _cmap.items():
+                    for dst in dsts:
+                        _add(src, dst)
+        except Exception as e:
+            logger.debug("_build_reapply_call_maps pass1 (%s) failed: %s", one_lang, e, exc_info=True)
+
+        # Pass 2: name-based linking for un-imported same-name calls (Python/TS-style
+        # direct calls). Best-effort — failures here never break indexing.
+        if file_calls_cache is not None:
+            # Cache-driven Pass-2 (no scan_project os.walk): freshly-parsed files
+            # come from the cache; carried (unchanged) files are read directly via
+            # the per-language extractor (cheap — unchanged on disk). scan_project
+            # is NEVER called on this path.
+            try:
+                from tldr.cross_file_calls import extract_file_calls_for_language
+
+                # (a) Freshly-parsed files: iterate the cache for this language.
+                for (cache_path, cache_lang), fcalls in file_calls_cache.items():
+                    if cache_lang != one_lang:
+                        continue
+                    _link_file_calls(fcalls)
+
+                # (b) Carried files: per-language extraction (no os.walk).
+                for unit in (carried_units or []):
+                    if unit.language != one_lang:
+                        continue
+                    spath = (root / unit.file)
+                    try:
+                        fcalls = extract_file_calls_for_language(spath, root, one_lang)
+                    except Exception:
+                        continue
+                    _link_file_calls(fcalls)
+            except Exception as e:
+                logger.debug("_build_reapply_call_maps pass2-cache (%s) failed: %s", one_lang, e, exc_info=True)
+        else:
+            try:
+                from tldr.cross_file_calls import _extract_file_calls, scan_project
+
+                for src in scan_project(root, one_lang, None):
+                    spath = Path(src)
+                    try:
+                        file_calls = _extract_file_calls(spath, root)
+                    except Exception:
+                        continue
+                    _link_file_calls(file_calls)
+            except Exception as e:
+                logger.debug("_build_reapply_call_maps pass2 (%s) failed: %s", one_lang, e, exc_info=True)
+
+    if lang is None or lang == "all":
+        # B-3 / I-7: neither pass understands the "all"/None pseudo-language (Pass 1
+        # builds an empty graph; Pass 2's scan_project raises ValueError), so a naive
+        # value silently skipped the entire name-based re-apply for multi-language
+        # projects. Resolve the project's concrete code languages and run + merge the
+        # same two passes per language. _detect_project_languages (NOT the tags
+        # variant) is correct here: scan_project raises on the non-code sentinel, and
+        # concrete code tags let non-code-only repos produce empty maps and early-exit
+        # without crashing. No pre-built graph is reused (single-language path only).
+        for detected_lang in _detect_project_languages(Path(project_path)):
+            _apply_one_language(detected_lang)
+    else:
+        _apply_one_language(lang, prebuilt_graph=call_graph)
+
+    return calls_map, called_by_map
+
+
+def _reapply_call_graph(
+    units: List["EmbeddingUnit"],
+    project_path: str,
+    lang: str,
+    call_graph: Optional["ProjectCallGraph"] = None,
+    file_calls_cache: Optional[dict] = None,
+    carried_units: Optional[List["EmbeddingUnit"]] = None,
+) -> None:
+    """Re-apply calls/called_by to every unit from the full project call graph.
+
+    Runs over ALL freshly-extracted units (4b). Uses the same key logic as
+    ``extract_units_from_project`` — methods look up ``ClassName::method`` first
+    then the bare method name; functions look up the bare name. Mutates each
+    unit in place. Non-code/file units (no callable name) are left untouched.
+
+    Args:
+        call_graph: Optional pre-built ProjectCallGraph. When provided (single-
+            language mode), Pass 1 reuses it instead of rebuilding.
+        file_calls_cache: Optional ``{(abs_path, lang): file_calls}`` from
+            extraction. Threaded into Pass-1 (as the per-file call data for the
+            registry-injected build_project_call_graph) AND Pass-2 so BOTH skip the
+            scan_project walk while Pass-1 still yields import-resolved edges.
+        carried_units: Optional carried-forward units (parse-skip) so Pass-2 can
+            link their (unchanged) calls without scan_project.
+
+    The complete ``units`` list is forwarded as ``all_units`` so Pass-1 can build
+    the func_index registry from already-parsed units (no scan_project).
+    """
+    if not units:
+        return
+
+    # Bare names of every code unit, used to scope name-based call linking.
+    unit_names: set = set()
+    for u in units:
+        if u.unit_type in ("function", "method"):
+            unit_names.add(u.name)
+
+    calls_map, called_by_map = _build_reapply_call_maps(
+        project_path, lang, unit_names,
+        ctx=_ReapplyContext(
+            call_graph=call_graph,
+            file_calls_cache=file_calls_cache,
+            carried_units=carried_units,
+            all_units=units,
+        ),
+    )
+    if not calls_map and not called_by_map:
+        return
+
+    for unit in units:
+        if unit.unit_type == "method":
+            bare = unit.name
+            # cls is the component just before the method in the qualified name.
+            parts = unit.qualified_name.rsplit(".", 2)
+            cls = parts[-2] if len(parts) >= 2 else ""
+            bare_cls = cls.rsplit("\\", 1)[-1]
+            unit.calls = _stable_call_list(
+                calls_map.get(f"{bare_cls}::{bare}") or calls_map.get(bare, [])
+            )
+            unit.called_by = _stable_call_list(
+                called_by_map.get(f"{bare_cls}::{bare}") or called_by_map.get(bare, [])
+            )
+        elif unit.unit_type == "function":
+            bare = unit.name
+            unit.calls = _stable_call_list(
+                calls_map.get(bare) or calls_map.get(bare.rsplit(".", 1)[-1], [])
+            )
+            unit.called_by = _stable_call_list(
+                called_by_map.get(bare) or called_by_map.get(bare.rsplit(".", 1)[-1], [])
+            )
+
+
+def _normalize_dirty_files(dirty_files: Iterable[str], project_root: Path) -> Set[str]:
+    """Normalize daemon-supplied dirty paths to project-relative posix strings.
+
+    The daemon writes ABSOLUTE file paths to its dirty set; ``unit.file`` is
+    always project-relative posix. The parse-skip carry-forward filter compares
+    the two, so the dirty paths must be normalized first (G-4/I-10) — otherwise
+    every comparison misses and all units are silently carried (stale index).
+
+    Each entry is converted via ``Path(p).relative_to(project_root).as_posix()``.
+    Paths outside ``project_root`` (which cannot belong to this project's units)
+    raise ``ValueError`` on ``relative_to`` and are silently skipped.
+    """
+    root = Path(project_root).resolve()
+    result: Set[str] = set()
+    for p in dirty_files:
+        try:
+            rel = Path(p).resolve().relative_to(root).as_posix()
+        except ValueError:
+            # Out-of-tree path: cannot belong to this project's units. Skip.
+            continue
+        result.add(rel)
+    return result
+
+
+def _compute_current_file_hashes(units: List["EmbeddingUnit"], project_root: str) -> Dict[str, str]:
+    """Compute SHA-1 hashes for the project files that produced ``units``.
+
+    Returns a {rel_path -> sha1} map for the next run's L2 hint. Best-effort:
+    files that vanish between extraction and hashing are skipped.
+    """
+    from tldr.patch import compute_file_hash
+
+    root = Path(project_root)
+    hashes: Dict[str, str] = {}
+    for unit in units:
+        rel = unit.file
+        if rel in hashes:
+            continue
+        abs_path = root / rel
+        try:
+            hashes[rel] = compute_file_hash(str(abs_path))
+        except (FileNotFoundError, OSError):
+            continue
+    return hashes
+
+
 def build_semantic_index(
     project_path: str,
     lang: str = "python",
@@ -1555,8 +2177,24 @@ def build_semantic_index(
     respect_ignore: bool = True,
     *,
     device: Optional[str] = None,
+    full: bool = False,
+    # dirty_files: WATCHER-AUTHORITATIVE parse-skip hint from the daemon. When
+    # non-empty (and not a forced full rebuild) the daemon's watcher has observed
+    # every change since the last reindex, so only those files are re-parsed and
+    # the rest are carried forward from metadata. None (manual index) or [] (daemon
+    # restart, possibly-missed events) falls back to a full scan.
+    dirty_files: Optional[Iterable[str]] = None,
 ) -> int:
     """Build and save FAISS index + metadata for a project.
+
+    Incremental by default: only units whose embedding text changed (gated by a
+    per-unit ``text_hash``) are re-embedded; unchanged units reuse their old
+    vector via FAISS ``reconstruct_n``. When ``dirty_files`` is provided, only
+    changed files are re-parsed and unchanged files are carried forward from
+    persisted metadata (parse-skip); otherwise every file is re-parsed. Either
+    way the call graph is re-APPLIED to the complete (fresh + carried) unit list
+    every run, so cross-file caller drift is always reflected. Pass ``full=True``
+    to force a clean rebuild.
 
     Creates:
     - .tldr/cache/semantic/index.faiss - Vector index
@@ -1568,8 +2206,18 @@ def build_semantic_index(
         model: Model name from SUPPORTED_MODELS or HuggingFace name.
         show_progress: Show progress spinner (default: True).
         respect_ignore: If True, respect .tldrignore patterns (default True).
-        device: Compute device ('cpu' or 'metal'). If None, defaults to TLDR_DEVICE
-                environment variable. Defaults to 'cpu' if env var is not set.
+        device: Compute device ('cpu' or 'metal'). If None, honours TLDR_DEVICE,
+                then falls back to the platform default ('metal' on Apple Silicon,
+                'cpu' otherwise).
+        full: If True, force a full rebuild ignoring all cached vectors/hashes.
+        dirty_files: Optional WATCHER-AUTHORITATIVE list of changed file paths
+                (absolute, from the daemon). When non-empty and not a forced full
+                rebuild, only these files are re-parsed; unchanged files are
+                carried forward from metadata (parse-skip). ``None`` (manual index)
+                or ``[]`` (daemon restart with possibly-missed events) triggers a
+                full file scan. The L1 text_hash gate still decides re-embedding,
+                so a stale hint can never corrupt the index — only over- or
+                under-skip parsing, both self-correcting on the next full scan.
 
     Returns:
         Number of indexed units.
@@ -1579,7 +2227,10 @@ def build_semantic_index(
     from tldr.tldrignore import ensure_tldrignore
 
     if device is None:
-        device = os.environ.get("TLDR_DEVICE") or "cpu"
+        # GPU-first default: honour an explicit TLDR_DEVICE first (so
+        # TLDR_DEVICE=cpu still wins), then fall back to the platform default
+        # (metal on Apple Silicon, cpu otherwise).
+        device = os.environ.get("TLDR_DEVICE") or _resolve_default_device()
 
     console = _get_progress_console() if show_progress else None
 
@@ -1603,44 +2254,107 @@ def build_semantic_index(
     cache_dir = project_root / ".tldr" / "cache" / "semantic"
     cache_dir.mkdir(parents=True, exist_ok=True)
 
-    # Extract all units (respecting .tldrignore) - scan from scan_path, not project_root
+    from tldr.incremental_indexer import IncrementalIndexer, text_hash
+
+    # Incremental decision: load prior state (vectors + per-unit hashes + the
+    # persisted unit dicts for parse-skip carry-forward). --full short-circuits
+    # this (no reconstruct_n I/O), forces every unit to encode, and returns
+    # old_units=[] so the parse-skip guard below falls through to a full parse.
+    # Loaded BEFORE extraction so the parse-skip path can consult full_rebuild /
+    # old_units to decide whether to skip parsing unchanged files.
+    indexer = IncrementalIndexer(str(project_root))
+    state = indexer.load_previous(hf_name, force_full=full)
+
+    # Single expansion seam (I-3): the retired per-language `lang=="all"` loop is
+    # replaced by delegating to extract_units_from_project(lang=None), which
+    # auto-detects + merges all languages internally. A concrete `lang` is passed
+    # through unchanged. The same effective lang drives the call-graph re-apply.
+    extract_lang: Optional[str] = None if lang == "all" else lang
+
+    # WATCHER-AUTHORITATIVE parse-skip decision (folded guard — T-7):
+    #   - dirty_files is None      -> manual index: full scan (unchanged behavior).
+    #   - dirty_files == []        -> daemon restart with possibly-missed events:
+    #                                 suspicious, fall back to FULL scan (not a
+    #                                 carry-all no-op).
+    #   - state.full_rebuild       -> cached vectors unusable: parse everything.
+    normalized_changed: set = set()
+    use_parse_skip = (
+        dirty_files is not None
+        and len(dirty_files) > 0
+        and not state.full_rebuild
+    )
+    if use_parse_skip:
+        # G-4/I-10: normalize the daemon's absolute paths to scan_path-relative
+        # posix so they compare against unit.file (which extract_units_from_project
+        # keys relative to scan_path, NOT project_root). Basing this on project_root
+        # would prefix a 'src/'-style component on subdir / CLAUDE_PROJECT_DIR scans
+        # (scan_path != project_root), so every carry-filter comparison would miss
+        # and the whole index would silently go stale. The daemon passes
+        # project_root==scan_path, so its absolute paths normalize identically.
+        # An empty normalized set (all paths out-of-tree) falls back to a full parse.
+        normalized_changed = _normalize_dirty_files(dirty_files, scan_path)
+        if not normalized_changed:
+            use_parse_skip = False
+
+    _extracted_call_graph = None
+    file_calls_cache: Dict[Tuple[str, str], Dict[str, List[Tuple[str, str]]]] = {}
+    carried_units: List[EmbeddingUnit] = []
+
+    def _full_extract(progress_cb=None):
+        """Parse every file; collect the file_calls_cache for the Pass-2 fast path."""
+        return extract_units_from_project(
+            str(scan_path), lang=extract_lang, respect_ignore=respect_ignore,
+            progress_callback=progress_cb, return_file_calls_cache=True,
+        )
+
+    def _parse_skip_extract(progress_cb=None):
+        """Parse ONLY changed/new files (files_to_parse allowlist); carry the rest
+        forward from the persisted metadata via EmbeddingUnit.from_dict (preserving
+        text_hash / calls / called_by) so they are never re-parsed or re-embedded."""
+        fresh, _cg, fcache = extract_units_from_project(
+            str(scan_path), lang=extract_lang, respect_ignore=respect_ignore,
+            progress_callback=progress_cb, files_to_parse=normalized_changed,
+            return_file_calls_cache=True,
+        )
+        carried = [
+            EmbeddingUnit.from_dict(u)
+            for u in state.old_units
+            if u.get("file") not in normalized_changed
+        ]
+        # Deterministic merged order (row i <-> units[i]); plan/assemble are
+        # qualified_name-keyed, so the exact order only needs to be stable.
+        merged = sorted(fresh + carried, key=lambda u: (u.file, u.line))
+        return merged, fcache, carried
+
+    def _dispatch_extract(progress_cb=None):
+        """Run the chosen extraction path ONCE. progress_cb (or None when there is
+        no console) is the only thing that varies between the console / no-console
+        arms — the parse-skip vs full split lives here, not duplicated per arm."""
+        nonlocal units, file_calls_cache, carried_units, _extracted_call_graph
+        if use_parse_skip:
+            units, file_calls_cache, carried_units = _parse_skip_extract(progress_cb)
+        else:
+            units, _extracted_call_graph, file_calls_cache = _full_extract(progress_cb)
+
+    units = []
     if console:
         with console.status("[bold green]Extracting code units...") as status:
             def update_progress(file_path, units_count, total_files):
                 short_path = file_path if len(file_path) < 50 else "..." + file_path[-47:]
                 status.update(f"[bold green]Processing {short_path}... ({units_count} units)")
 
-            if lang == "all":
-                status.update("[bold green]Scanning project languages...")
-                target_languages = _detect_project_language_tags(scan_path, respect_ignore=respect_ignore)
-                if not target_languages:
-                    console.print("[yellow]No supported languages detected in project[/yellow]")
-                    return 0
-                if console:
-                    console.print(f"[dim]Detected languages: {', '.join(target_languages)}[/dim]")
-
-                units = []
-                for lang_name in target_languages:
-                    status.update(f"[bold green]Extracting {lang_name} code units...")
-                    units.extend(extract_units_from_project(str(scan_path), lang=lang_name, respect_ignore=respect_ignore, progress_callback=update_progress))
-            else:
-                units = extract_units_from_project(str(scan_path), lang=lang, respect_ignore=respect_ignore, progress_callback=update_progress)
+            if use_parse_skip:
+                status.update("[bold green]Extracting changed code units (parse-skip)...")
+            _dispatch_extract(update_progress)
             status.update(f"[bold green]Extracted {len(units)} code units")
     else:
-        if lang == "all":
-            target_languages = _detect_project_language_tags(scan_path, respect_ignore=respect_ignore)
-            if not target_languages:
-                return 0
-            units = []
-            for lang_name in target_languages:
-                units.extend(extract_units_from_project(str(scan_path), lang=lang_name, respect_ignore=respect_ignore))
-        else:
-            units = extract_units_from_project(str(scan_path), lang=lang, respect_ignore=respect_ignore)
+        _dispatch_extract(None)
 
-    # Bug 004 (C-3): when multiple code languages are dispatched under `--lang all`,
-    # each pass unions NON_CODE_EXTENSIONS into get_code_structure, so the same
-    # non-code file (e.g. build.sh) gets emitted N times. Dedupe by qualified_name
-    # to ensure each file/function appears at most once in the FAISS index.
+    # Bug 004 (C-3): when multiple code languages are dispatched (lang=None), each
+    # pass unions NON_CODE_EXTENSIONS into get_code_structure, so the same non-code
+    # file (e.g. build.sh) gets emitted N times. Dedupe by qualified_name to ensure
+    # each file/function appears at most once in the FAISS index. (Also collapses
+    # any carried/fresh overlap on the parse-skip path.)
     if units:
         seen_qn: set = set()
         deduped: List[EmbeddingUnit] = []
@@ -1654,74 +2368,114 @@ def build_semantic_index(
     if not units:
         return 0
 
-    import numpy as np
+    # 4b: re-apply calls/called_by to every unit (fresh AND carried) from the
+    # project call graph, then fold that into each unit's text_hash. A new caller
+    # changes build_embedding_text -> changes the hash -> routes the unit to
+    # encode_units. The file_calls_cache (+ carried_units) lets Pass-2 serve every
+    # file without re-walking the project via scan_project.
+    _reapply_call_graph(
+        units, str(scan_path), extract_lang, call_graph=_extracted_call_graph,
+        file_calls_cache=file_calls_cache, carried_units=carried_units,
+    )
+    # G2-7: recompute over the COMPLETE merged list (fresh + carried) — a carried
+    # unit's called_by may have changed (e.g. a newly-parsed file now calls it),
+    # so plan() must see its up-to-date text_hash. Do NOT skip carried units here.
+    for unit in units:
+        unit.text_hash = text_hash(build_embedding_text(unit))
+
+    plan = indexer.plan(units, state)
 
     BATCH_SIZE = 128
-    num_units = len(units)
-    texts = [build_embedding_text(unit) for unit in units]
 
-    if console:
-        from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[bold green]{task.description}"),
-            BarColumn(),
-            TaskProgressColumn(),
-            console=console,
-        ) as progress:
-            task = progress.add_task("Computing embeddings...", total=num_units)
-
-            model_obj = get_model(model, device=device)
-            all_embeddings = []
-
-            for i in range(0, num_units, BATCH_SIZE):
-                chunk_end = min(i + BATCH_SIZE, num_units)
-                chunk_texts = texts[i:chunk_end]
-
-                current_unit = units[i]
-                short_path = current_unit.file if len(current_unit.file) < 40 else "..." + current_unit.file[-37:]
-                progress.update(task, description=f"[bold green]Embedding {short_path}::{current_unit.name}")
-
-                result = model_obj.encode(
-                    chunk_texts,
-                    batch_size=BATCH_SIZE,
-                    normalize_embeddings=True,
-                    show_progress_bar=False
-                )
-                all_embeddings.extend(np.array(result, dtype=np.float32))
-
-                progress.update(task, completed=chunk_end)
-
-            embeddings_matrix = np.vstack(all_embeddings)
-    else:
+    def _encode_units(units_to_encode):
+        """Encode the embedding text for the given units into a float32 matrix."""
+        if not units_to_encode:
+            # state.old_dimension may be 0 ONLY on a first run, but then every unit
+            # is unseen so plan.encode_units is non-empty and this branch is not
+            # reached — so the (0, 0) shape that would break IndexFlatIP is
+            # unreachable in practice (the empty-units case returns 0 earlier).
+            return np.empty((0, state.old_dimension), dtype=np.float32)
+        enc_texts = [build_embedding_text(u) for u in units_to_encode]
+        n = len(enc_texts)
         model_obj = get_model(model, device=device)
+        if console:
+            from rich.progress import (
+                BarColumn,
+                Progress,
+                SpinnerColumn,
+                TaskProgressColumn,
+                TextColumn,
+            )
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[bold green]{task.description}"),
+                BarColumn(),
+                TaskProgressColumn(),
+                console=console,
+            ) as progress:
+                task = progress.add_task("Computing embeddings...", total=n)
+                chunks = []
+                for i in range(0, n, BATCH_SIZE):
+                    chunk_end = min(i + BATCH_SIZE, n)
+                    current_unit = units_to_encode[i]
+                    short_path = (
+                        current_unit.file
+                        if len(current_unit.file) < 40
+                        else "..." + current_unit.file[-37:]
+                    )
+                    progress.update(
+                        task,
+                        description=f"[bold green]Embedding {short_path}::{current_unit.name}",
+                    )
+                    result = model_obj.encode(
+                        enc_texts[i:chunk_end],
+                        batch_size=BATCH_SIZE,
+                        normalize_embeddings=True,
+                        show_progress_bar=False,
+                    )
+                    chunks.extend(np.array(result, dtype=np.float32))
+                    progress.update(task, completed=chunk_end)
+                return np.vstack(chunks)
         result = model_obj.encode(
-            texts,
-            batch_size=BATCH_SIZE,
-            normalize_embeddings=True
+            enc_texts, batch_size=BATCH_SIZE, normalize_embeddings=True
         )
-        embeddings_matrix = np.array(result, dtype=np.float32)
+        return np.array(result, dtype=np.float32)
 
-    dimension = embeddings_matrix.shape[1]
+    fresh = _encode_units(plan.encode_units)
+
+    # Post-encode dimension check (I-9/N-1): for custom HF models the dim is not
+    # known until the first encode. If it disagrees with the stored dimension,
+    # the reused vectors are incomparable — force a full rebuild, re-plan (so all
+    # units land in encode_units and reuse_rows is empty), and re-encode.
+    if plan.encode_units and state.old_dimension and fresh.shape[1] != state.old_dimension:
+        state.full_rebuild = True
+        state.old_hashes = {}
+        plan = indexer.plan(units, state)
+        fresh = _encode_units(plan.encode_units)
+
+    matrix = indexer.assemble(units, plan, state.old_matrix, fresh)
+    dimension = matrix.shape[1]
+
     index = faiss.IndexFlatIP(dimension)
-    index.add(embeddings_matrix)
+    index.add(matrix)
 
-    # Save index
-    index_file = cache_dir / "index.faiss"
-    faiss.write_index(index, str(index_file))
+    # Compute current file hashes (orchestrator hint for the next run); persist
+    # writes index.faiss + metadata.json atomically and saves the cache.
+    current_file_hashes = _compute_current_file_hashes(units, str(project_root))
+    indexer.persist(index, units, hf_name, dimension, current_file_hashes)
 
-    # Save metadata with actual model used
-    metadata = {
-        "units": [u.to_dict() for u in units],
-        "model": hf_name,
-        "dimension": dimension,
-        "count": len(units),
-    }
-    metadata_file = cache_dir / "metadata.json"
-    metadata_file.write_text(json.dumps(metadata, indent=2))
-
-    if console:
-        console.print(f"[bold green]✓[/] Indexed {len(units)} code units")
+    # One-line run summary: how many units were re-embedded this run vs reused
+    # via the text_hash gate, plus the active device. Counts come from the FINAL
+    # plan, so a --full run (or a post-encode dim-mismatch reset) correctly shows
+    # reused 0. Emitted to stderr on every run (independent of show_progress) so
+    # direct callers and the CLI both get the feedback.
+    embedded_count = len(plan.encode_units)
+    reused_count = len(plan.reuse_rows)
+    print(
+        f"Semantic index: embedded {embedded_count}, reused {reused_count} "
+        f"units (device={device})",
+        file=sys.stderr,
+    )
 
     return len(units)
 
@@ -1771,8 +2525,9 @@ def semantic_search(
         model: Model to use for query embedding. If None, uses
                the model from the index metadata.
         language: Filter results to this language. None or "all" returns all.
-        device: Compute device ('cpu' or 'metal'). If None, defaults to TLDR_DEVICE
-                environment variable. Must match the device used to build the index.
+        device: Compute device ('cpu' or 'metal'). If None, honours TLDR_DEVICE,
+                then falls back to the platform default ('metal' on Apple Silicon,
+                'cpu' otherwise).
 
     Returns:
         List of result dictionaries with name, file, line, score, etc.
@@ -1783,6 +2538,12 @@ def semantic_search(
     # Handle empty query
     if not query or not query.strip():
         return []
+
+    # Symmetric device default (I-11): resolve the same GPU-first default the
+    # index used so query embedding shares the model cache key and the daemon
+    # never reloads the model on an index/search device switch.
+    if device is None:
+        device = os.environ.get("TLDR_DEVICE") or _resolve_default_device()
 
     # Find project root for cache location (matches build_semantic_index behavior)
     scan_path = Path(project_path).resolve()

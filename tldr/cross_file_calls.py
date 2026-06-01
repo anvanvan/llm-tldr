@@ -2246,6 +2246,20 @@ def _parse_csharp_using_node(node, source: bytes) -> dict | None:
     return result
 
 
+def _derive_module_name(rel_path: Path, language: str) -> tuple[str, str]:
+    """Return ``(module_name, simple_module)`` for a project-relative path.
+
+    Shared by ``build_function_index`` and ``build_func_index_from_units`` so the
+    two MUST produce byte-for-byte identical func_index keys (key parity is
+    mandatory — a divergence here silently breaks cross-file edge resolution on
+    the cache path). e.g. ``pkg/core.py`` -> ``("pkg.core", "core")``;
+    ``utils.ts`` -> ``("utils", "utils")`` (``/`` separator for TS/JS).
+    """
+    module_parts = list(rel_path.parts[:-1]) + [rel_path.stem]
+    sep = "/" if language in ("typescript", "javascript") else "."
+    return sep.join(module_parts), rel_path.stem
+
+
 def build_function_index(
     root: str | Path,
     language: str = "python",
@@ -2269,13 +2283,9 @@ def build_function_index(
         src_path = Path(src_file)
         rel_path = src_path.relative_to(root)
 
-        # Derive module name from file path
-        # e.g., pkg/core.py -> pkg.core, utils.ts -> utils
-        module_parts = list(rel_path.parts[:-1]) + [rel_path.stem]
-        module_name = '/'.join(module_parts) if language in ("typescript", "javascript") else '.'.join(module_parts)
-
-        # Also track the simple module name (last component)
-        simple_module = rel_path.stem
+        # Derive module name from file path (shared helper — keeps key parity with
+        # build_func_index_from_units). e.g. pkg/core.py -> pkg.core, utils.ts -> utils
+        module_name, simple_module = _derive_module_name(rel_path, language)
 
         if language == "python":
             _index_python_file(src_path, rel_path, module_name, simple_module, index)
@@ -2299,6 +2309,99 @@ def build_function_index(
         # ``elif language == "swift": _index_swift_file(...)`` branch called
         # a function that was never defined — a latent NameError if anyone
         # removed Swift from self_contained_languages. Branch deleted.
+
+    return index
+
+
+def build_func_index_from_units(
+    units: list,
+    root: str | Path,
+) -> dict[tuple[str, str], str]:
+    """Build the func_index from already-parsed EmbeddingUnit objects WITHOUT
+    walking the project (``scan_project`` is never called).
+
+    Produces a func_index byte-for-byte identical to ``build_function_index`` for
+    the call-graph languages, so it is a drop-in replacement on the semantic-index
+    cache path. The file list is derived from ``{unit.file for unit in units}``
+    (the set of files already discovered during extraction) instead of from a
+    fresh ``scan_project`` / ``os.walk`` — eliminating the duplicate project walk
+    the parse-skip / initial-index path exists to avoid.
+
+    Key parity is mandatory: ``build_project_call_graph``'s per-language builders
+    look up ``(simple_module, name)`` / ``(module_name, name)`` tuple keys AND the
+    qualified method keys (Java ``(module, "Class.method")``, Go
+    ``(module, "Receiver.method")``, Rust ``(module, "Type::method")``) that the
+    ``_index_*_file`` helpers emit. The EmbeddingUnit's ``name`` field does NOT
+    reliably carry the bare/qualified method name across languages (Go yields
+    ``"(s *Server) Start"``, Rust yields both ``"start"`` and ``"Server.start"``,
+    Java yields a flat ``"hello"`` with the class only on a sibling unit), so
+    deriving keys from unit metadata alone cannot reproduce ``build_function_index``.
+    Instead this re-runs the SAME ``_index_*_file`` indexers used by
+    ``build_function_index`` over the unit-derived file list — guaranteeing parity.
+
+    The per-file ``_index_*_file`` read is the same lightweight name-extraction
+    ``build_function_index`` already performs (O(lines), no CFG/DFG/embeddings);
+    the only thing removed is the ``scan_project`` walk. This matches the
+    architecture's goal (scan_project.call_count == 0 on the cache path while
+    preserving import-resolved ``ClassName::method`` edges).
+
+    Args:
+        units: List of EmbeddingUnit objects (duck-typed on ``file`` and
+            ``language``). Non-code/``file`` units contribute their file to the
+            walk-free file list but add no symbol keys (the indexers skip files
+            with no functions/classes). Empty list → empty index.
+        root: Project root directory. The per-file indexers key paths relative to
+            this root, exactly as ``build_function_index`` does.
+
+    Returns:
+        Dict mapping ``(module, name)`` tuples (and string-form keys) to relative
+        file paths — identical in shape and content to ``build_function_index``.
+    """
+    root = Path(root).resolve()
+    index: dict = {}
+
+    # Collect, per language, the set of files that language's indexer should see.
+    # Derived from the already-parsed units — NO scan_project / os.walk.
+    files_by_lang: dict[str, set] = {}
+    for unit in units:
+        language = getattr(unit, "language", "") or ""
+        rel_file = getattr(unit, "file", "")
+        if not language or not rel_file:
+            continue
+        files_by_lang.setdefault(language, set()).add(rel_file)
+
+    for language, rel_files in files_by_lang.items():
+        for rel_file in rel_files:
+            rel_path_obj = Path(rel_file)
+            src_path = (root / rel_path_obj).resolve()
+
+            # Mirror build_function_index's module-name derivation exactly (shared
+            # helper guarantees byte-for-byte key parity between the two builders).
+            module_name, simple_module = _derive_module_name(rel_path_obj, language)
+
+            if language == "python":
+                _index_python_file(src_path, rel_path_obj, module_name, simple_module, index)
+            elif language in ("typescript", "javascript"):
+                _index_typescript_file(src_path, rel_path_obj, module_name, simple_module, index, language=language)
+            elif language == "go":
+                _index_go_file(src_path, rel_path_obj, module_name, simple_module, index)
+            elif language == "rust":
+                _index_rust_file(src_path, rel_path_obj, module_name, simple_module, index)
+            elif language == "java":
+                _index_java_file(src_path, rel_path_obj, module_name, simple_module, index)
+            elif language == "c":
+                _index_c_file(src_path, rel_path_obj, module_name, simple_module, index)
+            elif language == "php":
+                _index_php_file(src_path, rel_path_obj, module_name, simple_module, index)
+            elif language == "elixir":
+                # Elixir is indexed here for parity with build_function_index even
+                # though build_project_call_graph treats it as self-contained
+                # (func_index=None), so these keys are presently unconsumed. Kept
+                # deliberately so the two builders stay key-identical and a future
+                # elixir func_index consumer needs no change here.
+                _index_elixir_file(src_path, rel_path_obj, module_name, simple_module, index)
+            # Other self-contained languages (swift, ruby, kotlin, csharp, lua, luau,
+            # scala, cpp) have no func_index in build_project_call_graph; skip them.
 
     return index
 
@@ -3029,6 +3132,46 @@ class CallVisitor(ast.NodeVisitor):
                 if elt.id not in self.refs:
                     self.refs.append(elt.id)
         self.generic_visit(node)
+
+
+def extract_file_calls_for_language(
+    file_path: Path, root: Path, language: str
+) -> dict[str, list[tuple[str, str]]]:
+    """Extract per-file calls using the extractor for ``language``.
+
+    Dispatches to the correct ``_extract_*_file_calls`` for the 8 import-index
+    languages (the ones whose ``_build_*_call_graph`` resolves edges via an import
+    map + func_index): python, typescript, javascript, go, rust, java, c, php.
+    Returns the SAME ``dict[str, list[tuple[str, str]]]`` shape the builders'
+    default path consumes, so a cache populated through here is interchangeable
+    with calling the extractor inside the builder.
+
+    For any other language (the self-contained builders, which keep their own
+    internal walk and do not consume ``prebuilt_file_calls``) this returns ``{}``:
+    populating their calls here would be wasted work. Best-effort — any extractor
+    failure yields ``{}`` (each extractor already swallows parse/read errors).
+    """
+    try:
+        if language == "python":
+            return _extract_file_calls(file_path, root)
+        if language in ("typescript", "javascript"):
+            return _extract_ts_file_calls(file_path, root, language=language)
+        if language == "go":
+            return _extract_go_file_calls(file_path, root)
+        if language == "rust":
+            return _extract_rust_file_calls(file_path, root)
+        if language == "java":
+            return _extract_java_file_calls(file_path, root)
+        if language == "c":
+            return _extract_c_file_calls(file_path, root)
+        if language == "php":
+            return _extract_php_file_calls(file_path, root)
+    except Exception:
+        # An extractor raised (parse/read error) — best-effort empty result.
+        return {}
+    # Fell through the if/elif chain: a self-contained language (swift, ruby, …)
+    # that produces no file_calls. Distinct from the except-path above.
+    return {}
 
 
 def _extract_file_calls(file_path: Path, root: Path) -> dict[str, list[tuple[str, str]]]:
@@ -3836,7 +3979,9 @@ def _extract_php_file_calls(file_path: Path, root: Path) -> dict[str, list[tuple
 def build_project_call_graph(
     root: str | Path,
     language: str = "python",
-    use_workspace_config: bool = True
+    use_workspace_config: bool = True,
+    prebuilt_func_index: Optional[dict] = None,
+    prebuilt_file_calls: Optional[dict] = None,
 ) -> ProjectCallGraph:
     """
     Build a complete project-wide call graph.
@@ -3853,9 +3998,30 @@ def build_project_call_graph(
         use_workspace_config: If True, loads .claude/workspace.json to scope
                              indexing to activePackages and excludePatterns.
                              Defaults to True for monorepo support.
+        prebuilt_func_index: Optional pre-built func_index (same shape as
+                             ``build_function_index``) — e.g. from
+                             ``build_func_index_from_units``. When provided, the
+                             eager ``build_function_index`` scan is SKIPPED and
+                             this index is used directly. Defaults to None
+                             (build it the normal way) so existing callers are
+                             byte-for-byte unchanged.
+        prebuilt_file_calls: Optional ``{(abs_path_str, lang): file_calls}`` map
+                             (the file_calls_cache collected during extraction).
+                             When provided, the per-language builder iterates this
+                             cache instead of calling ``scan_project`` + the
+                             per-file call extractor — eliminating the project
+                             os.walk. Applies to the 8 import-index languages
+                             (python, typescript, javascript, go, rust, java, c,
+                             php); the 9 self-contained builders keep their
+                             internal walk. Defaults to None (unchanged behavior).
 
     Returns:
         ProjectCallGraph with edges as (src_file, src_func, dst_file, dst_func)
+
+    When BOTH ``prebuilt_func_index`` and ``prebuilt_file_calls`` are None (the
+    default for every existing caller), behavior is identical to before — this is
+    the blast-radius fence keeping ``tldr context/impact/calls/dead/arch`` and the
+    existing test suite unaffected.
     """
     root = Path(root).resolve()
     graph = ProjectCallGraph()
@@ -3872,23 +4038,28 @@ def build_project_call_graph(
     }
     if language in self_contained_languages:
         func_index = None
+    elif prebuilt_func_index is not None:
+        # AGGRESSIVE cache path: reuse the O(n) registry built from already-parsed
+        # units instead of re-walking the project via build_function_index (which
+        # itself calls scan_project). No file I/O for the func_index here.
+        func_index = prebuilt_func_index
     else:
         func_index = build_function_index(root, language, workspace_config)
 
     if language == "python":
-        _build_python_call_graph(root, graph, func_index, workspace_config)
+        _build_python_call_graph(root, graph, func_index, workspace_config, prebuilt_file_calls=prebuilt_file_calls)
     elif language in ("typescript", "javascript"):
-        _build_typescript_call_graph(root, graph, func_index, workspace_config, language=language)
+        _build_typescript_call_graph(root, graph, func_index, workspace_config, language=language, prebuilt_file_calls=prebuilt_file_calls)
     elif language == "go":
-        _build_go_call_graph(root, graph, func_index, workspace_config)
+        _build_go_call_graph(root, graph, func_index, workspace_config, prebuilt_file_calls=prebuilt_file_calls)
     elif language == "rust":
-        _build_rust_call_graph(root, graph, func_index, workspace_config)
+        _build_rust_call_graph(root, graph, func_index, workspace_config, prebuilt_file_calls=prebuilt_file_calls)
     elif language == "java":
-        _build_java_call_graph(root, graph, func_index, workspace_config)
+        _build_java_call_graph(root, graph, func_index, workspace_config, prebuilt_file_calls=prebuilt_file_calls)
     elif language == "c":
-        _build_c_call_graph(root, graph, func_index, workspace_config)
+        _build_c_call_graph(root, graph, func_index, workspace_config, prebuilt_file_calls=prebuilt_file_calls)
     elif language == "php":
-        _build_php_call_graph(root, graph, func_index, workspace_config)
+        _build_php_call_graph(root, graph, func_index, workspace_config, prebuilt_file_calls=prebuilt_file_calls)
     elif language == "elixir":
         _build_elixir_call_graph(root, graph, workspace_config)
     elif language == "swift":
@@ -3911,17 +4082,59 @@ def build_project_call_graph(
     return graph
 
 
+def _iter_call_graph_files(
+    root: Path,
+    language: str,
+    workspace_config: Optional[WorkspaceConfig],
+    extractor,  # Callable[[Path, Path], dict] — the per-language _extract_*_file_calls
+    prebuilt_file_calls: Optional[dict],
+) -> "Iterator[tuple[Path, str, dict]]":
+    """Yield ``(file_path, rel_path, calls_by_func)`` for each project file.
+
+    Single source of truth for the per-language builders' file/call enumeration:
+
+    - DEFAULT (``prebuilt_file_calls is None``): walk the project via
+      ``scan_project`` and extract calls per file via ``extractor(path, root)`` —
+      byte-for-byte the original behavior.
+    - AGGRESSIVE (``prebuilt_file_calls`` provided): iterate the file_calls_cache,
+      filtering to this ``language``; the call data comes straight from the cache,
+      so ``scan_project`` and ``extractor`` are NEVER called. Import parsing
+      (done by the caller) still reads each file — cheap, O(lines), and the file
+      is unchanged on disk / in page cache.
+
+    ``extractor`` is the per-language ``_extract_*_file_calls`` callable; it is
+    invoked as ``extractor(file_path, root)`` only on the default path.
+    """
+    if prebuilt_file_calls is not None:
+        for (abs_path_str, cache_lang), file_calls in prebuilt_file_calls.items():
+            if cache_lang != language:
+                continue
+            file_path = Path(abs_path_str)
+            try:
+                rel_path = str(file_path.relative_to(root))
+            except ValueError:
+                # Cached path outside this root (defensive) — skip.
+                continue
+            yield file_path, rel_path, file_calls
+    else:
+        for src_file in scan_project(root, language, workspace_config):
+            file_path = Path(src_file)
+            rel_path = str(file_path.relative_to(root))
+            calls_by_func = extractor(file_path, root)
+            yield file_path, rel_path, calls_by_func
+
+
 def _build_python_call_graph(
     root: Path,
     graph: ProjectCallGraph,
     func_index: dict,
-    workspace_config: Optional[WorkspaceConfig] = None
+    workspace_config: Optional[WorkspaceConfig] = None,
+    prebuilt_file_calls: Optional[dict] = None,
 ):
     """Build call graph for Python files."""
-    for py_file in scan_project(root, "python", workspace_config):
-        py_path = Path(py_file)
-        rel_path = str(py_path.relative_to(root))
-
+    for py_path, rel_path, calls_by_func in _iter_call_graph_files(
+        root, "python", workspace_config, _extract_file_calls, prebuilt_file_calls
+    ):
         # Get imports for this file
         imports = parse_imports(py_path)
 
@@ -3949,9 +4162,6 @@ def _build_python_call_graph(
                     module_imports[alias] = module
                 else:
                     module_imports[module] = module
-
-        # Get calls from this file
-        calls_by_func = _extract_file_calls(py_path, root)
 
         for caller_func, calls in calls_by_func.items():
             for call_type, call_target in calls:
@@ -3991,14 +4201,17 @@ def _build_typescript_call_graph(
     func_index: dict,
     workspace_config: Optional[WorkspaceConfig] = None,
     language: str = "typescript",
+    prebuilt_file_calls: Optional[dict] = None,
 ):
     """Build call graph for TypeScript/JavaScript files."""
     commonjs_exports_cache = {}
 
-    for ts_file in scan_project(root, language, workspace_config):
-        ts_path = Path(ts_file)
-        rel_path = str(ts_path.relative_to(root))
+    def _ts_extractor(path, root_):
+        return _extract_ts_file_calls(path, root_, language=language)
 
+    for ts_path, rel_path, calls_by_func in _iter_call_graph_files(
+        root, language, workspace_config, _ts_extractor, prebuilt_file_calls
+    ):
         # Get imports for this file
         imports = parse_ts_imports(ts_path, language=language)
 
@@ -4031,9 +4244,6 @@ def _build_typescript_call_graph(
             # Default import: import Foo from "./module"
             if imp.get('default'):
                 default_imports[imp['default']] = module_path
-
-        # Get calls from this file
-        calls_by_func = _extract_ts_file_calls(ts_path, root, language=language)
 
         for caller_func, calls in calls_by_func.items():
             for call_type, call_target in calls:
@@ -4115,13 +4325,13 @@ def _build_go_call_graph(
     root: Path,
     graph: ProjectCallGraph,
     func_index: dict,
-    workspace_config: Optional[WorkspaceConfig] = None
+    workspace_config: Optional[WorkspaceConfig] = None,
+    prebuilt_file_calls: Optional[dict] = None,
 ):
     """Build call graph for Go files."""
-    for go_file in scan_project(root, "go", workspace_config):
-        go_path = Path(go_file)
-        rel_path = str(go_path.relative_to(root))
-
+    for go_path, rel_path, calls_by_func in _iter_call_graph_files(
+        root, "go", workspace_config, _extract_go_file_calls, prebuilt_file_calls
+    ):
         # Get imports for this file
         imports = parse_go_imports(go_path)
 
@@ -4147,9 +4357,6 @@ def _build_go_call_graph(
                 local_name = module.rstrip('/').split('/')[-1]
 
             package_imports[local_name] = module_path
-
-        # Get calls from this file
-        calls_by_func = _extract_go_file_calls(go_path, root)
 
         for caller_func, calls in calls_by_func.items():
             for call_type, call_target in calls:
@@ -4204,13 +4411,13 @@ def _build_rust_call_graph(
     root: Path,
     graph: ProjectCallGraph,
     func_index: dict,
-    workspace_config: Optional[WorkspaceConfig] = None
+    workspace_config: Optional[WorkspaceConfig] = None,
+    prebuilt_file_calls: Optional[dict] = None,
 ):
     """Build call graph for Rust files."""
-    for rs_file in scan_project(root, "rust", workspace_config):
-        rs_path = Path(rs_file)
-        rel_path = str(rs_path.relative_to(root))
-
+    for rs_path, rel_path, calls_by_func in _iter_call_graph_files(
+        root, "rust", workspace_config, _extract_rust_file_calls, prebuilt_file_calls
+    ):
         # Get imports for this file
         imports = parse_rust_imports(rs_path)
 
@@ -4245,9 +4452,6 @@ def _build_rust_call_graph(
                         # Glob import - can't resolve specific names
                         continue
                     import_map[name] = (resolved_module, name)
-
-        # Get calls from this file
-        calls_by_func = _extract_rust_file_calls(rs_path, root)
 
         # Note: edges stored dot-form; display conversion (dot→::) happens at
         # output sites in api.py (RelevantContext.to_llm_string) and cli.py
@@ -4350,15 +4554,15 @@ def _build_java_call_graph(
     root: Path,
     graph: ProjectCallGraph,
     func_index: dict,
-    workspace_config: Optional[WorkspaceConfig] = None
+    workspace_config: Optional[WorkspaceConfig] = None,
+    prebuilt_file_calls: Optional[dict] = None,
 ):
     """Build call graph for Java files."""
     name_index = _build_name_index(func_index)
 
-    for java_file in scan_project(root, "java", workspace_config):
-        java_path = Path(java_file)
-        rel_path = str(java_path.relative_to(root))
-
+    for java_path, rel_path, calls_by_func in _iter_call_graph_files(
+        root, "java", workspace_config, _extract_java_file_calls, prebuilt_file_calls
+    ):
         # Get imports for this file
         imports = parse_java_imports(java_path)
 
@@ -4380,9 +4584,6 @@ def _build_java_call_graph(
                 # e.g., java.util.List -> List
                 simple_name = module.split('.')[-1]
                 import_map[simple_name] = module
-
-        # Get calls from this file
-        calls_by_func = _extract_java_file_calls(java_path, root)
 
         for caller_func, calls in calls_by_func.items():
             for call_type, call_target in calls:
@@ -4441,15 +4642,15 @@ def _build_c_call_graph(
     root: Path,
     graph: ProjectCallGraph,
     func_index: dict,
-    workspace_config: Optional[WorkspaceConfig] = None
+    workspace_config: Optional[WorkspaceConfig] = None,
+    prebuilt_file_calls: Optional[dict] = None,
 ):
     """Build call graph for C files."""
     name_index = _build_name_index(func_index)
 
-    for c_file in scan_project(root, "c", workspace_config):
-        c_path = Path(c_file)
-        rel_path = str(c_path.relative_to(root))
-
+    for c_path, rel_path, calls_by_func in _iter_call_graph_files(
+        root, "c", workspace_config, _extract_c_file_calls, prebuilt_file_calls
+    ):
         # Get includes for this file
         includes = parse_c_imports(c_path)
 
@@ -4462,9 +4663,6 @@ def _build_c_call_graph(
             is_system = inc.get('is_system', False)
             header_name = module.split('/')[-1] if '/' in module else module
             include_map[header_name] = module
-
-        # Get calls from this file
-        calls_by_func = _extract_c_file_calls(c_path, root)
 
         for caller_func, calls in calls_by_func.items():
             for call_type, call_target in calls:
@@ -4502,7 +4700,8 @@ def _build_php_call_graph(
     root: Path,
     graph: ProjectCallGraph,
     func_index: dict,
-    workspace_config: Optional[WorkspaceConfig] = None
+    workspace_config: Optional[WorkspaceConfig] = None,
+    prebuilt_file_calls: Optional[dict] = None,
 ):
     """Build call graph for PHP files."""
     # Pre-build method_name -> [(key, file_path)] for O(1) lookups
@@ -4512,10 +4711,9 @@ def _build_php_call_graph(
             _, name = key
             method_index.setdefault(name, []).append((key, file_path))
 
-    for php_file in scan_project(root, "php", workspace_config):
-        php_path = Path(php_file)
-        rel_path = str(php_path.relative_to(root))
-
+    for php_path, rel_path, calls_by_func in _iter_call_graph_files(
+        root, "php", workspace_config, _extract_php_file_calls, prebuilt_file_calls
+    ):
         # Get imports for this file
         imports = parse_php_imports(php_path)
 
@@ -4535,9 +4733,6 @@ def _build_php_call_graph(
                     alias = imp.get('alias', name)
                     import_map[alias] = (namespace, name)
                     import_map[name] = (namespace, name)
-
-        # Get calls from this file
-        calls_by_func = _extract_php_file_calls(php_path, root)
 
         for caller_func, calls in calls_by_func.items():
             for call_type, call_target in calls:

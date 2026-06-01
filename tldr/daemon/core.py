@@ -837,15 +837,37 @@ class TLDRDaemon:
         dirty_files = list(self._dirty_files)
         logger.info(f"Triggering background semantic re-index for {len(dirty_files)} files")
 
+        # Write the tracked dirty set to a temp file BEFORE spawning the reindex
+        # thread (I-6/I-12), then hand its path to the subprocess via
+        # --dirty-files. This list is an OPTIMIZATION HINT only: correctness is
+        # gated by the per-unit L1 text_hash check, and a missing/stale/empty hint
+        # falls through to a FULL file scan (not a carry-all no-op). On the
+        # parse-skip path only the hinted files are re-parsed, but the call graph
+        # is still re-applied to the full unit set. The temp file is removed in the
+        # do_reindex finally block.
+        dirty_files_path = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w", suffix=".json", prefix="tldr-dirty-", delete=False
+            ) as df:
+                json.dump(dirty_files, df)
+                dirty_files_path = df.name
+        except OSError as e:
+            # If we cannot stage the hint, proceed without it (full scan).
+            logger.warning(f"Could not write dirty-files hint, falling back to full scan: {e}")
+            dirty_files_path = None
+
         def do_reindex():
             try:
                 import subprocess
 
-                # Run semantic index command
+                # Run semantic index command (blocking subprocess.run — N-5)
                 cmd = [
                     sys.executable, "-m", "tldr.cli",
                     "semantic", "index", str(self.project)
                 ]
+                if dirty_files_path is not None:
+                    cmd += ["--dirty-files", dirty_files_path]
                 result = subprocess.run(
                     cmd,
                     capture_output=True,
@@ -861,6 +883,12 @@ class TLDRDaemon:
             except Exception as e:
                 logger.exception(f"Background semantic re-index error: {e}")
             finally:
+                # Remove the dirty-files hint temp file.
+                if dirty_files_path is not None:
+                    try:
+                        os.unlink(dirty_files_path)
+                    except OSError:
+                        pass
                 # Reset dirty tracking
                 self._dirty_files.clear()
                 self._dirty_count = 0

@@ -39,13 +39,7 @@ from .cross_file_calls import (
     RUBY_ORPHAN_SENTINEL,
     is_orphan_sentinel as _is_orphan_sentinel,
 )
-from .semantic import ALL_LANGUAGES, EXTENSION_TO_LANGUAGE
-
-# Re-export under the legacy private alias to avoid touching every existing
-# call site in this module. Single source of truth lives in cross_file_calls.
-# `_is_orphan_sentinel` is now imported directly from cross_file_calls (S-8).
-_RUBY_ORPHAN_SENTINEL = RUBY_ORPHAN_SENTINEL
-_ELIXIR_ORPHAN_SENTINEL = ELIXIR_ORPHAN_SENTINEL
+from .semantic import ALL_LANGUAGES, EXTENSION_TO_LANGUAGE, _resolve_device_arg
 
 
 def _get_subprocess_detach_kwargs():
@@ -517,7 +511,24 @@ Semantic Search:
         default=None,
         choices=["cpu", "metal"],
         help="Compute device for embedding inference: 'cpu' or 'metal'. "
-             "If omitted, falls back to TLDR_DEVICE env var (default: 'cpu').",
+             "If omitted, falls back to TLDR_DEVICE env var "
+             "(default: 'metal' on Apple Silicon, 'cpu' otherwise).",
+    )
+    index_p.add_argument(
+        "--full",
+        action="store_true",
+        default=False,
+        help="Force a full rebuild, ignoring all cached state.",
+    )
+    # --dirty-files is an internal optimization hint (path to a temp file listing
+    # changed files) passed by the daemon's background reindex. Registered BEFORE
+    # the daemon wiring (I-12) so the subprocess call is never rejected by argparse.
+    # Correctness never depends on it: the full call graph + L1 text_hash gate run
+    # regardless, so a missing/unreadable file just falls back to a full scan.
+    index_p.add_argument(
+        "--dirty-files",
+        default=None,
+        help=argparse.SUPPRESS,
     )
 
     # tldr semantic search <query>
@@ -542,7 +553,8 @@ Semantic Search:
         default=None,
         choices=["cpu", "metal"],
         help="Compute device for embedding inference: 'cpu' or 'metal'. "
-             "If omitted, falls back to TLDR_DEVICE env var (default: 'cpu').",
+             "If omitted, falls back to TLDR_DEVICE env var "
+             "(default: 'metal' on Apple Silicon, 'cpu' otherwise).",
     )
 
     # tldr daemon start/stop/status/query
@@ -691,21 +703,23 @@ Semantic Search:
         """Resolve compute device: CLI arg > TLDR_DEVICE env > None (auto-pick).
 
         Validates TLDR_DEVICE if set. Exits with code 2 on invalid env value.
-        Returns 'cpu', 'metal', or None (let downstream pick the default).
+        Returns 'cpu', 'metal', 'mps' (the last only via a legacy ``TLDR_DEVICE``
+        env value — it is not an argparse ``--device`` choice), or None (let
+        downstream pick the default).
         """
-        if args_device is not None:
-            return args_device
-        env_device = os.environ.get("TLDR_DEVICE")
-        if env_device:
-            if env_device not in ("cpu", "metal"):
+        device = _resolve_device_arg(args_device)
+        if device is None:
+            # _resolve_device_arg only accepts recognised values; if TLDR_DEVICE was
+            # set but not recognised, it returned None — validate and exit here.
+            env_device = os.environ.get("TLDR_DEVICE")
+            if env_device and env_device not in ("cpu", "metal"):
                 print(
                     f"tldr: error: TLDR_DEVICE: invalid choice: {env_device!r} "
                     f"(choose from 'cpu', 'metal')",
                     file=sys.stderr,
                 )
                 sys.exit(2)
-            return env_device
-        return None
+        return device
 
     def resolve_language(lang_arg: str, project_path: str | Path) -> str:
         """Resolve 'auto' to actual language (single language for non-context commands).
@@ -1163,12 +1177,40 @@ Semantic Search:
 
             if args.action == "index":
                 respect_ignore = not getattr(args, 'no_ignore', False)
-                lang = resolve_language(args.lang, args.path)
+                # Mirror the `search` action below: "auto"/"all" map to lang=None so
+                # build_semantic_index -> extract_units_from_project(lang=None) takes
+                # the multi-language expansion path (Goal C: index ALL languages by
+                # default). resolve_language("auto") collapses to a SINGLE language,
+                # which would silently index only that one language.
+                lang = None if args.lang in ("auto", "all") else resolve_language(args.lang, args.path)
                 device = _resolve_device(getattr(args, "device", None))
-                count = build_semantic_index(
-                    args.path, lang=lang, model=args.model,
+
+                # --dirty-files arg is an OPTIMIZATION HINT only: read the temp
+                # file's JSON list of changed paths if present, and silently fall
+                # back to a full scan if it is missing or unreadable (correctness
+                # never depends on it — the full call graph + L1 text_hash gate
+                # run regardless).
+                dirty_files_path = getattr(args, "dirty_files", None)
+                changed_files = None
+                if dirty_files_path:
+                    try:
+                        with open(dirty_files_path, "r") as _df:
+                            loaded = json.load(_df)
+                        if isinstance(loaded, list):
+                            changed_files = {str(p) for p in loaded}
+                    except (OSError, ValueError):
+                        # Missing or unreadable hint file: ignore and full-scan.
+                        changed_files = None
+
+                index_kwargs = dict(
+                    lang=lang, model=args.model,
                     respect_ignore=respect_ignore, device=device,
+                    full=getattr(args, "full", False),
                 )
+                if changed_files is not None:
+                    index_kwargs["dirty_files"] = changed_files
+
+                count = build_semantic_index(args.path, **index_kwargs)
                 print(f"Indexed {count} code units")
 
             elif args.action == "search":
