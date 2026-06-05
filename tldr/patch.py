@@ -20,11 +20,12 @@ Usage:
 
 from __future__ import annotations
 
-import ast
 import hashlib
+import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, TypedDict
 
 from tldr.cross_file_calls import (
     ProjectCallGraph,
@@ -33,6 +34,166 @@ from tldr.cross_file_calls import (
     _extract_go_file_calls,
     _extract_rust_file_calls,
 )
+
+
+# ---------------------------------------------------------------------------
+# SnapshotStore — wider file-hash snapshot with atomic writes + back-compat.
+#
+# The wider snapshot stores, per file, enough metadata for the self-validating
+# hash floor to fast-path the common no-change case via a stat() comparison
+# before falling back to a SHA-1 confirm. All narrow->wide normalization happens
+# inside load_snapshot so the deriver never sees a raw string and never branches
+# on schema_version.
+# ---------------------------------------------------------------------------
+
+
+class SnapshotEntry(TypedDict):
+    """Per-file snapshot metadata for the self-validating hash floor."""
+    sha1: str
+    mtime_ns: int
+    size: int
+    inode: int
+
+
+# SCHEMA_VERSION is a write-only forward-compat format marker: it is stamped into
+# every snapshot but is NEVER branched on during load_snapshot normalization (the
+# narrow->wide sentinel logic is version-agnostic). It exists so a FUTURE format
+# change can detect+migrate old snapshots without guessing the layout.
+SCHEMA_VERSION = 2
+_SCHEMA_KEY = "__schema_version__"
+# A-1: reserved header recording the scan_path the snapshot keys are relative to.
+# Snapshot keys are scan_path-relative, but the file lives at project_root; when a
+# later run scans a DIFFERENT scan_path under the same project_root every key
+# misses. The header lets load_snapshot detect that mismatch (or an OLD snapshot
+# with no header) and fall back to the safe re-hash-all path instead of trusting
+# keys that cannot match. Like _SCHEMA_KEY it is consumed internally and never
+# surfaced to callers.
+_SCAN_PATH_KEY = "__scan_path__"
+
+
+def _snapshot_path(project_root: str) -> Path:
+    return Path(project_root) / ".tldr" / "cache" / "file_hashes.json"
+
+
+def _normalize_scan_path(scan_path: "str | Path") -> str:
+    """Resolve a scan_path to a stable absolute posix string for header compare."""
+    return Path(scan_path).resolve().as_posix()
+
+
+def _safe_int(value, default: int = 0) -> int:
+    """Coerce ``value`` to int, returning ``default`` on bad input.
+
+    A hand-edited/corrupt snapshot entry like ``{"mtime_ns": "abc"}`` must
+    self-heal (the sentinel default forces a re-hash in the deriver) instead of
+    raising ``ValueError`` up through the indexing run.
+    """
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def load_snapshot(
+    project_root: str, scan_path: "str | Path | None" = None
+) -> dict[str, "SnapshotEntry"]:
+    """Load the file-hash snapshot, returning fully-formed SnapshotEntry dicts.
+
+    Back-compat: a narrow ``{rel_path: sha1}`` value is normalized to a
+    SnapshotEntry with sentinel ``mtime_ns=0 / size=-1 / inode=-1`` — these
+    sentinels force a hash-confirm on the first post-upgrade run (the deriver's
+    stat comparisons always trip) WITHOUT any schema branch in the deriver.
+
+    A corrupt or missing file returns ``{}`` (never raises). The internal
+    ``__schema_version__`` / ``__scan_path__`` keys are consumed here and never
+    surfaced to callers.
+
+    A-1: when ``scan_path`` is given, the stored ``__scan_path__`` header MUST
+    match it. A mismatch — or an OLD snapshot with no header (back-compat) —
+    returns ``{}`` so the caller falls back to the safe re-hash-all path instead
+    of trusting scan_path-relative keys that cannot match the current scan. When
+    ``scan_path`` is None (round-trip / deprecated callers) no validation runs.
+    """
+    cache_path = _snapshot_path(project_root)
+    if not cache_path.exists():
+        return {}
+
+    try:
+        raw = json.loads(cache_path.read_text())
+    except (json.JSONDecodeError, OSError, ValueError):
+        return {}
+
+    if not isinstance(raw, dict):
+        return {}
+
+    # Pop the schema version + scan_path header (consumed internally only).
+    raw.pop(_SCHEMA_KEY, None)
+    stored_scan_path = raw.pop(_SCAN_PATH_KEY, None)
+
+    # A-1 validation: only when the caller supplied a scan_path to check against.
+    if scan_path is not None:
+        if stored_scan_path != _normalize_scan_path(scan_path):
+            # Mismatched scan_path OR an old header-less snapshot -> distrust keys,
+            # fall back to re-hash-all.
+            return {}
+
+    entries: dict[str, SnapshotEntry] = {}
+    for rel_path, value in raw.items():
+        if isinstance(value, str):
+            # Narrow format: plain SHA-1 string -> normalize to sentinel entry.
+            entries[rel_path] = {
+                "sha1": value,
+                "mtime_ns": 0,
+                "size": -1,
+                "inode": -1,
+            }
+        elif isinstance(value, dict):
+            entries[rel_path] = {
+                "sha1": value.get("sha1", ""),
+                "mtime_ns": _safe_int(value.get("mtime_ns", 0), 0),
+                "size": _safe_int(value.get("size", -1), -1),
+                "inode": _safe_int(value.get("inode", -1), -1),
+            }
+        # Any other (unexpected) value type is ignored.
+    return entries
+
+
+def save_snapshot(
+    project_root: str,
+    entries: dict[str, "SnapshotEntry"],
+    scan_path: "str | Path | None" = None,
+) -> None:
+    """Atomically write the wider snapshot to file_hashes.json.
+
+    Writes to a tmpfile in the same directory then ``os.replace`` (POSIX
+    atomic). A crash before ``os.replace`` leaves the original file intact.
+
+    A-1: when ``scan_path`` is given, a ``__scan_path__`` header is stamped so a
+    later ``load_snapshot(project_root, scan_path=...)`` can detect a scan_path
+    mismatch and fall back to re-hash-all. Omitted when ``scan_path`` is None
+    (round-trip / deprecated callers) — no header is written.
+    """
+    cache_path = _snapshot_path(project_root)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+
+    payload: dict = {_SCHEMA_KEY: SCHEMA_VERSION}
+    if scan_path is not None:
+        payload[_SCAN_PATH_KEY] = _normalize_scan_path(scan_path)
+    payload.update(entries)
+
+    tmp_path = cache_path.with_name(cache_path.name + ".tmp")
+    tmp_path.write_text(json.dumps(payload, indent=2))
+    try:
+        os.replace(str(tmp_path), str(cache_path))
+    except OSError:
+        # Clean up the orphaned tmpfile so a failed replace (cross-device,
+        # permission) does not leave a stale .json.tmp behind; the original
+        # snapshot stays intact (atomicity preserved). Re-raise per the
+        # metadata.json persist pattern.
+        try:
+            tmp_path.unlink()
+        except OSError:
+            pass
+        raise
 
 
 @dataclass(frozen=True)
@@ -69,7 +230,7 @@ def compute_file_hash(file_path: str) -> str:
     """
     path = Path(file_path)
     content = path.read_bytes()
-    return hashlib.sha1(content).hexdigest()
+    return hashlib.sha1(content, usedforsecurity=False).hexdigest()
 
 
 def has_file_changed(file_path: str, cached_hash: str) -> bool:
@@ -217,7 +378,11 @@ def patch_call_graph(
 
 
 def get_file_hash_cache(project_root: str) -> dict[str, str]:
-    """Load cached file hashes from project cache directory.
+    """DEPRECATED: Use load_snapshot instead.
+
+    This narrow interface is superseded by load_snapshot which returns the
+    wider SnapshotEntry format (sha1, mtime_ns, size, inode). Kept for
+    back-compat only; all internal callers have migrated to load_snapshot.
 
     Args:
         project_root: Project root directory
@@ -225,29 +390,41 @@ def get_file_hash_cache(project_root: str) -> dict[str, str]:
     Returns:
         Dict mapping relative file paths to their SHA-1 hashes
     """
-    import json
-    cache_path = Path(project_root) / ".tldr" / "cache" / "file_hashes.json"
-
-    if not cache_path.exists():
-        return {}
-
-    try:
-        return json.loads(cache_path.read_text())
-    except (json.JSONDecodeError, IOError):
-        return {}
+    import warnings
+    warnings.warn(
+        "get_file_hash_cache is deprecated; use load_snapshot instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    # A-3: the snapshot on disk is now WIDE (SnapshotEntry dicts). Delegate to
+    # load_snapshot and re-narrow to the legacy {rel: sha1} shape so back-compat
+    # callers still get the string map they expect (not dict-of-dicts).
+    return {rel: entry["sha1"] for rel, entry in load_snapshot(project_root).items()}
 
 
 def save_file_hash_cache(project_root: str, cache: dict[str, str]) -> None:
-    """Save file hash cache to project cache directory.
+    """DEPRECATED: Use save_snapshot instead.
+
+    This narrow interface is superseded by save_snapshot which handles the
+    wider SnapshotEntry format (sha1, mtime_ns, size, inode). Kept for
+    back-compat only; all internal callers have migrated to save_snapshot.
 
     Args:
         project_root: Project root directory
         cache: Dict mapping relative file paths to their SHA-1 hashes
     """
-    import json
-    cache_path = Path(project_root) / ".tldr" / "cache" / "file_hashes.json"
-    cache_path.parent.mkdir(parents=True, exist_ok=True)
-    cache_path.write_text(json.dumps(cache, indent=2))
+    import warnings
+    warnings.warn(
+        "save_file_hash_cache is deprecated; use save_snapshot instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    # A-3: delegate to save_snapshot, wrapping the narrow {rel: sha1} into
+    # the wide SnapshotEntry format so the on-disk snapshot is always current.
+    from tldr.patch import save_snapshot
+    entries = {rel: {"sha1": sha1, "mtime_ns": 0, "size": -1, "inode": -1}
+               for rel, sha1 in cache.items()}
+    save_snapshot(project_root, entries)
 
 
 def patch_dirty_files(

@@ -22,7 +22,11 @@ from collections.abc import Iterator
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable, List, Optional, Set, Tuple, Dict, Any
+from typing import Iterable, List, Literal, Optional, Set, Tuple, Dict, Any, TYPE_CHECKING, overload
+
+if TYPE_CHECKING:
+    from tldr.patch import SnapshotEntry
+    from tldr.incremental_indexer import IncrementalState
 
 logger = logging.getLogger("tldr.semantic")
 
@@ -774,6 +778,35 @@ def _init_extraction_worker(lang: Optional[str]) -> None:
         pass
 
 
+# QLT-1932-1935: @overload signatures so callers narrow the union return type by
+# the literal value of return_file_calls_cache — True yields the 3-tuple, the
+# default False yields the bare list. Type-annotation only; the single
+# implementation below is unchanged at runtime.
+@overload
+def extract_units_from_project(
+    project_path: str,
+    lang: Optional[str] = ...,
+    respect_ignore: bool = ...,
+    progress_callback=...,
+    files_to_parse: Optional[Set[str]] = ...,
+    *,
+    return_file_calls_cache: Literal[True],
+    fresh_file_sha1s: Optional[Dict[str, str]] = ...,
+) -> "Tuple[List[EmbeddingUnit], Optional[ProjectCallGraph], dict]": ...
+
+
+@overload
+def extract_units_from_project(
+    project_path: str,
+    lang: Optional[str] = ...,
+    respect_ignore: bool = ...,
+    progress_callback=...,
+    files_to_parse: Optional[Set[str]] = ...,
+    return_file_calls_cache: Literal[False] = ...,
+    fresh_file_sha1s: Optional[Dict[str, str]] = ...,
+) -> "List[EmbeddingUnit]": ...
+
+
 def extract_units_from_project(
     project_path: str,
     lang: Optional[str] = None,
@@ -781,6 +814,7 @@ def extract_units_from_project(
     progress_callback=None,
     files_to_parse: Optional[Set[str]] = None,
     return_file_calls_cache: bool = False,
+    fresh_file_sha1s: Optional[Dict[str, str]] = None,
 ) -> "List[EmbeddingUnit] | Tuple[List[EmbeddingUnit], Optional[ProjectCallGraph], dict]":
     """Extract all functions/methods/classes from a project.
 
@@ -812,6 +846,12 @@ def extract_units_from_project(
             for each freshly-parsed file. Consumed by ``_build_reapply_call_maps``
             Pass-2 so it can skip the scan_project walk. When False (default — all
             pre-existing callers), the existing return shape is preserved.
+        fresh_file_sha1s: Optional mutable ``{rel_posix_path: sha1}`` sink. When
+            provided, it is FILLED (not returned) with the raw-bytes SHA-1 of every
+            freshly-parsed file, computed from the single read the parser performs
+            (S-5 read-once). The persist-time snapshot reuses these instead of
+            re-hashing changed files. ``None`` (default) skips collection. This is
+            an out-param, not a return value — the 3-tuple return shape is unchanged.
 
     Returns:
         List of EmbeddingUnit objects with enriched metadata, or a
@@ -888,15 +928,22 @@ def extract_units_from_project(
         want_calls = return_file_calls_cache
 
         def _accumulate(file_info, result):
-            """Accumulate one worker result (units, or (units, file_calls))."""
+            """Accumulate one worker result (units, or (units, file_calls, sha1))."""
             if want_calls:
-                f_units, f_calls = result
+                f_units, f_calls, f_sha1 = result
                 if f_calls:
                     # Key lang is the DISPATCH language (structure_lang) — the same
                     # value _iter_call_graph_files filters on — NOT unit.language.
                     # On the non-code sentinel path this is "python" by design.
                     key = (str((project / file_info.get("path", "")).resolve()), structure_lang)
                     file_calls_cache[key] = f_calls
+                # S-5 read-once: record the freshly-parsed file's raw-bytes sha1
+                # (keyed by the project-relative posix path, matching unit.file)
+                # so persist reuses it instead of re-hashing. Only collected when
+                # the caller passes a fresh_file_sha1s sink.
+                if f_sha1 is not None and fresh_file_sha1s is not None:
+                    rel_key = Path(file_info.get("path", "")).as_posix()
+                    fresh_file_sha1s[rel_key] = f_sha1
             else:
                 f_units = result
             lang_units.extend(f_units)
@@ -1248,8 +1295,16 @@ def _process_file_for_extraction(
     project = Path(project_path)
     file_path = file_info.get("path", "")
 
+    # S-5 read-once: the raw-bytes SHA-1 of this file, computed from the SAME read
+    # the parser uses (set below). Threaded back via _ret so the persist-time
+    # snapshot reuses it instead of re-hashing — the changed-file path reads each
+    # file exactly ONCE. Parity: identical to ``compute_file_hash`` (raw-bytes
+    # SHA-1), so the next run's deriver hash-compare stays consistent.
+    file_sha1: Optional[str] = None
+
     def _ret(result_units):
-        """Wrap the return value with file_calls when requested.
+        """Wrap the return value with file_calls (and the read-once sha1) when
+        requested.
 
         file_calls is computed best-effort from the resolved on-disk path using the
         extractor for ``lang`` (so the cache carries correct per-language call data
@@ -1258,6 +1313,10 @@ def _process_file_for_extraction(
         non-existent files (every ``_extract_*_file_calls`` swallows parse/read
         errors). This is what lets the registry-injected Pass-1 build_project_call_graph
         produce import-resolved edges WITHOUT re-walking via scan_project.
+
+        The third tuple element is the read-once raw-bytes sha1 (``None`` when the
+        file could not be read). It is consumed only by ``_accumulate`` in
+        ``extract_units_from_project``; the public 3-tuple return is unchanged.
         """
         if not return_file_calls:
             return result_units
@@ -1271,7 +1330,7 @@ def _process_file_for_extraction(
             )
         except Exception:
             file_calls = {}
-        return result_units, file_calls
+        return result_units, file_calls, file_sha1
     # Bug 004 R-5: when project_path is a single file (passed through from
     # build_semantic_index's scan_path), get_code_structure stores root.name as
     # file_path. Reconstruct full_path from the parent in that case; otherwise
@@ -1285,16 +1344,19 @@ def _process_file_for_extraction(
         return _ret(units)
 
     try:
-        # Read file content ONCE.
-        # C-7: use utf-8-sig so a UTF-8 BOM (U+FEFF) is stripped instead of
-        # polluting the embedding preview / first source line.
-        # C-8: best-effort fallback to latin-1 for non-UTF-8 legacy config
-        # files (common in older .yaml/.toml/.ini) so we don't silently drop
-        # them via the broad except below.
+        # Read file bytes ONCE; derive both the parse text AND the snapshot sha1
+        # from that single read (S-5 read-once — no separate compute_file_hash).
+        # C-7: utf-8-sig so a UTF-8 BOM (U+FEFF) is stripped instead of polluting
+        # the embedding preview / first source line. C-8: best-effort latin-1
+        # fallback for non-UTF-8 legacy config files so we don't silently drop
+        # them. The sha1 is over the RAW bytes (matching compute_file_hash).
+        raw_bytes = full_path.read_bytes()
+        import hashlib as _hashlib
+        file_sha1 = _hashlib.sha1(raw_bytes, usedforsecurity=False).hexdigest()
         try:
-            content = full_path.read_text(encoding="utf-8-sig")
+            content = raw_bytes.decode("utf-8-sig")
         except UnicodeDecodeError:
-            content = full_path.read_text(encoding="latin-1")
+            content = raw_bytes.decode("latin-1")
         lines = content.split('\n')
     except Exception as e:
         logger.warning(f"Failed to read {file_path}: {e}")
@@ -1849,6 +1911,98 @@ def _build_calls_maps(call_graph) -> Tuple[Dict[str, List[str]], Dict[str, List[
     return calls_map, called_by_map
 
 
+def _augment_cache_with_carried(
+    file_calls_cache: dict,
+    carried_units: List["EmbeddingUnit"],
+    scan_path: Path,
+) -> dict:
+    """Return a NEW cache merging ``file_calls_cache`` with RE-PARSED entries for
+    carried (parse-skipped, unchanged) files.
+
+    DEL-1 single-point fix: on the incremental path ``file_calls_cache`` holds
+    ONLY the freshly-parsed (changed) files, so a naive Pass-1/Pass-2 sees a
+    PARTIAL project and diverges from a ``--full`` rebuild (which parses every
+    file and therefore has every file in its cache). This helper fills in the
+    ``{(abs_path_str, lang): {caller: [(call_type, target)]}}`` entry for each
+    carried file so the augmented cache covers EVERY live file — exactly the file
+    set (and the file-call data) a ``--full`` rebuild would see.
+
+    Parity with ``--full`` (Option C — re-parse, not synthesize):
+      Each carried file is RE-PARSED with the SAME per-language extractor a
+      ``--full`` rebuild uses — ``extract_file_calls_for_language`` (the exact
+      dispatcher the extraction worker's ``_ret`` calls to populate the fresh
+      cache). The carried file is UNCHANGED on disk and page-cached, so the
+      tree-sitter / AST re-parse is O(lines) and cheap; the expensive embedding
+      reuse is untouched.
+
+      This produces NATIVE, language-correct caller keys BY CONSTRUCTION. The
+      previous implementation synthesized a single ``('intra', callee)`` list
+      under ONLY the BARE ``unit.name`` key — but class-method languages dual-key
+      callers: Java's ``_extract_java_file_calls`` stores each method's calls
+      under BOTH the bare ``methodA`` AND the qualified ``ClassA.methodA`` (Go
+      ``Receiver.method``, Rust ``Type::method`` similarly). A ``--full`` rebuild
+      therefore emits the caller into ``called_by`` under BOTH names, while the
+      bare-only synthesis emitted only the bare form → incremental ``called_by``
+      diverged from ``--full`` on ~81% of Java units. Re-parsing restores both
+      caller forms exactly as ``--full`` does, for all import-index languages.
+
+      The re-parsed dict is the extractor's verbatim output: a changed file's
+      ``('intra'|'direct'|'attr'|'ref', target)`` tuples drive Pass-1's
+      import-resolved edges AND the cross-file class CONSTRUCTOR edges (callee = a
+      bare class name from ``d = Dog()``), and Pass-2a's name-based linking — the
+      same way the fresh cache entries do.
+
+    Keying: the cache key is ``(str(scan_path / unit.file), unit.language)`` —
+    ``unit.language`` is the dispatch language a ``--full`` rebuild keyed the file
+    under (in single-language mode it equals the structure_lang; in multi-language
+    mode it is the file's own dispatch language), so the augmented entry is
+    interchangeable with a fresh one and ``_iter_call_graph_files`` filters it
+    correctly.
+
+    Files already present in ``file_calls_cache`` (the changed files) are NEVER
+    re-parsed or overridden — a changed file's FRESH per-caller edges always win.
+    Each carried file is re-parsed AT MOST ONCE even when several carried units
+    share it. A file whose re-parse yields no calls contributes no entry.
+
+    No-op guard (S-5): when ``file_calls_cache`` is empty there were no fresh
+    (changed) files this run — a true no-op reindex — so NO carried file is
+    re-parsed (the empty cache is returned unchanged). Only a real change (a
+    non-empty fresh cache) triggers the carried-file re-parse.
+
+    The input cache is NOT mutated; a shallow copy plus the re-parsed entries is
+    returned.
+    """
+    augmented = dict(file_calls_cache)
+    # No-op guard: an empty fresh cache means nothing changed on disk this run —
+    # do not re-parse carried files (no churn for a true no-op reindex).
+    if not file_calls_cache:
+        return augmented
+
+    from tldr.cross_file_calls import extract_file_calls_for_language
+
+    root = Path(scan_path)
+    # Deduplicate by (file, language) BEFORE constructing keys/paths
+    unique_files = {}
+    for unit in carried_units or []:
+        file_lang_key = (unit.file, unit.language)
+        if file_lang_key not in unique_files:
+            unique_files[file_lang_key] = unit
+
+    for (file_path, language), unit in unique_files.items():
+        key = (str(scan_path / file_path), language)
+        if key in file_calls_cache:
+            # Changed file already in the fresh cache: its freshly-parsed edges
+            # are authoritative; never re-parse / override it from a carried unit.
+            continue
+        file_path_obj = Path(key[0])
+        # Re-parse with the EXACT extractor --full uses for this language. Cheap
+        # (file unchanged, page-cached); yields native dual-keyed caller entries.
+        file_calls = extract_file_calls_for_language(file_path_obj, root, language)
+        if file_calls:
+            augmented[key] = file_calls
+    return augmented
+
+
 @dataclass
 class _ReapplyContext:
     """The cache-context bundle for the 4b call-graph re-apply.
@@ -1930,6 +2084,22 @@ def _build_reapply_call_maps(
     # The registry is language-agnostic (it indexes all units' files), so hoisting
     # it out is safe regardless of how many languages are processed.
     _prebuilt_func_idx = None
+    # DEL-1: when a file_calls_cache is supplied it covers ONLY the freshly-parsed
+    # (changed) files. Augment it by RE-PARSING the carried (unchanged) files with
+    # the SAME per-language extractors --full uses (extract_file_calls_for_language)
+    # so BOTH Pass-1 and Pass-2 see EVERY live file — the same file set AND the same
+    # native dual-keyed caller entries a --full rebuild produces — making the
+    # incremental per-unit calls/called_by BYTE-IDENTICAL to --full for every
+    # import-index language. The augmented cache feeds Pass-1's registry build and
+    # Pass-2a's name-based linking. Re-parsing (Option C) replaces the former
+    # bare-only synthesis from unit.calls, which dropped the qualified
+    # ClassName.method caller key for class-method languages (Java/Go/Rust) and so
+    # diverged from --full's called_by.
+    _augmented_cache = file_calls_cache
+    if file_calls_cache is not None:
+        _augmented_cache = _augment_cache_with_carried(
+            file_calls_cache, carried_units or [], Path(project_path).resolve()
+        )
     if file_calls_cache is not None and all_units is not None:
         from tldr.cross_file_calls import build_func_index_from_units
         _prebuilt_func_idx = build_func_index_from_units(all_units, Path(project_path))
@@ -1970,11 +2140,13 @@ def _build_reapply_call_maps(
                 from tldr.api import build_project_call_graph
                 if file_calls_cache is not None and _prebuilt_func_idx is not None:
                     # Reuse the func-index built once outside the loop (O(n) vs O(n*L)).
+                    # DEL-1: feed the AUGMENTED cache (changed + carried files) so
+                    # import resolution covers every file, matching --full.
                     graph = build_project_call_graph(
                         project_path,
                         language=one_lang,
                         prebuilt_func_index=_prebuilt_func_idx,
-                        prebuilt_file_calls=file_calls_cache,
+                        prebuilt_file_calls=_augmented_cache,
                     )
                 elif file_calls_cache is None:
                     graph = build_project_call_graph(project_path, language=one_lang)
@@ -1995,27 +2167,24 @@ def _build_reapply_call_maps(
         # Pass 2: name-based linking for un-imported same-name calls (Python/TS-style
         # direct calls). Best-effort — failures here never break indexing.
         if file_calls_cache is not None:
-            # Cache-driven Pass-2 (no scan_project os.walk): freshly-parsed files
-            # come from the cache; carried (unchanged) files are read directly via
-            # the per-language extractor (cheap — unchanged on disk). scan_project
-            # is NEVER called on this path.
+            # Cache-driven Pass-2 (no scan_project os.walk): the AUGMENTED cache
+            # already covers freshly-parsed (changed) files AND carried (unchanged)
+            # files — the latter RE-PARSED by ``_augment_cache_with_carried`` via the
+            # SAME per-language ``extract_file_calls_for_language`` a --full rebuild
+            # uses, so every carried entry is byte-identical to the one --full would
+            # produce. Iterating it here makes Pass-2a's name-based linking identical
+            # to the --full ``else`` branch below (scan_project + _link_file_calls
+            # over all files), so NO separate carried-unit supplement is needed.
+            #
+            # [T-9/I-6 #12] Carried entries carry the extractor's native
+            # ``(call_type, target)`` tuples (including the dual-keyed
+            # ClassName.method caller form for Java/Go/Rust); Pass-2a's
+            # _link_file_calls reads only ``target`` while Pass-1 USES call_type
+            # ('intra' -> unconditional edge) to restore the cross-file constructor
+            # (class-name) callees Pass-2a cannot link.
             try:
-                from tldr.cross_file_calls import extract_file_calls_for_language
-
-                # (a) Freshly-parsed files: iterate the cache for this language.
-                for (cache_path, cache_lang), fcalls in file_calls_cache.items():
+                for (cache_path, cache_lang), fcalls in _augmented_cache.items():
                     if cache_lang != one_lang:
-                        continue
-                    _link_file_calls(fcalls)
-
-                # (b) Carried files: per-language extraction (no os.walk).
-                for unit in (carried_units or []):
-                    if unit.language != one_lang:
-                        continue
-                    spath = (root / unit.file)
-                    try:
-                        fcalls = extract_file_calls_for_language(spath, root, one_lang)
-                    except Exception:
                         continue
                     _link_file_calls(fcalls)
             except Exception as e:
@@ -2123,19 +2292,19 @@ def _reapply_call_graph(
             )
 
 
-def _normalize_dirty_files(dirty_files: Iterable[str], project_root: Path) -> Set[str]:
-    """Normalize daemon-supplied dirty paths to project-relative posix strings.
+def _normalize_dirty_files(dirty_files: Iterable[str], scan_path: Path) -> Set[str]:
+    """Normalize daemon-supplied dirty paths to scan_path-relative posix strings.
 
     The daemon writes ABSOLUTE file paths to its dirty set; ``unit.file`` is
-    always project-relative posix. The parse-skip carry-forward filter compares
+    always scan_path-relative posix. The parse-skip carry-forward filter compares
     the two, so the dirty paths must be normalized first (G-4/I-10) — otherwise
     every comparison misses and all units are silently carried (stale index).
 
-    Each entry is converted via ``Path(p).relative_to(project_root).as_posix()``.
-    Paths outside ``project_root`` (which cannot belong to this project's units)
+    Each entry is converted via ``Path(p).relative_to(scan_path).as_posix()``.
+    Paths outside ``scan_path`` (which cannot belong to this project's units)
     raise ``ValueError`` on ``relative_to`` and are silently skipped.
     """
-    root = Path(project_root).resolve()
+    root = Path(scan_path).resolve()
     result: Set[str] = set()
     for p in dirty_files:
         try:
@@ -2147,26 +2316,374 @@ def _normalize_dirty_files(dirty_files: Iterable[str], project_root: Path) -> Se
     return result
 
 
-def _compute_current_file_hashes(units: List["EmbeddingUnit"], project_root: str) -> Dict[str, str]:
-    """Compute SHA-1 hashes for the project files that produced ``units``.
+def _compute_current_file_hashes(
+    units: List["EmbeddingUnit"],
+    scan_path: str,
+    deriver_sha1_map: Optional[Dict[str, str]] = None,
+    fresh_file_sha1s: Optional[Dict[str, str]] = None,
+    old_snapshot: Optional[Dict[str, "SnapshotEntry"]] = None,
+    changed_set: "Optional[Set[str]]" = None,
+) -> Dict[str, "SnapshotEntry"]:
+    """Build the WIDE per-file snapshot entries for the files that produced ``units``.
 
-    Returns a {rel_path -> sha1} map for the next run's L2 hint. Best-effort:
-    files that vanish between extraction and hashing are skipped.
+    Returns a ``{rel_path -> {sha1, mtime_ns, size, inode}}`` map for the next
+    run's self-validating floor. Each file is stat'd exactly once here (for
+    mtime_ns/size/inode); best-effort — files that vanish between extraction and
+    stat are skipped.
+
+    S-5 (no second hash pass): the SHA-1 is sourced WITHOUT re-hashing whenever
+    possible, via a four-case lookup keyed by the file's scan_path-relative rel
+    path (``unit.file`` — the SAME key the snapshot is written/read under). The
+    cases are tried in this order, matching the code below:
+
+      1. ``rel in fresh_file_sha1s`` -> the parser already computed this file's
+         raw-bytes sha1 from its single read this run (the primary S-5 read-once
+         source). Reuse that sha1.
+      2. ``rel in deriver_sha1_map`` -> the deriver already hashed this file in
+         the branch-(b) floor (a confirmed-changed file). Reuse that sha1.
+      3. ``rel not in changed_set`` AND ``rel in old_snapshot`` -> the file is
+         stat-unchanged this run; reuse its sha1 from the previous snapshot.
+      4. otherwise -> ``compute_file_hash`` (new files, the daemon-hint path's
+         changed files that neither the parser nor the deriver hashed, and the
+         first-run / --full path where all reuse sources are empty).
+
+    The ``changed_set`` guard in case 3 is critical for the daemon-hint path: a
+    hint-supplied changed file IS present in ``old_snapshot`` with its STALE sha1,
+    so reusing it would persist a stale hash and make the file look clean next
+    run even though it changed. Forcing such files to case 4 guarantees a fresh
+    sha1 for any known-changed file; a stat-unchanged file can never get a stale
+    sha1. On a true no-op every live file hits case 3 -> ``compute_file_hash`` is
+    called ZERO times.
     """
     from tldr.patch import compute_file_hash
 
-    root = Path(project_root)
-    hashes: Dict[str, str] = {}
+    deriver_sha1_map = deriver_sha1_map or {}
+    fresh_file_sha1s = fresh_file_sha1s or {}
+    old_snapshot = old_snapshot or {}
+    changed_set = changed_set or set()
+
+    root = Path(scan_path)
+    entries: Dict[str, "SnapshotEntry"] = {}
     for unit in units:
         rel = unit.file
-        if rel in hashes:
+        if rel in entries:
             continue
         abs_path = root / rel
         try:
-            hashes[rel] = compute_file_hash(str(abs_path))
+            # stat-before-hash TOCTOU: a concurrent write between os.stat and the
+            # hash could pair an old mtime_ns with a new sha1. This is covered by
+            # the deriver's `st.st_mtime >= index_start_time` re-hash guard, which
+            # forces a hash-confirm for any file touched during the index run.
+            st = os.stat(str(abs_path))
         except (FileNotFoundError, OSError):
             continue
-    return hashes
+
+        # Case 1: fresh parser read (wins over deriver confirm per S-5).
+        sha1 = fresh_file_sha1s.get(rel)
+        if sha1 is None:
+            # Case 2: deriver confirmed-changed sha1.
+            sha1 = deriver_sha1_map.get(rel)
+        if sha1 is None:
+            # Case 3: stat-unchanged file -> reuse the prior snapshot's sha1.
+            # Guarded by changed_set so a known-changed file never reuses a stale
+            # hash (daemon-hint path: changed file is in old_snapshot w/ old sha1).
+            if rel not in changed_set:
+                prior = old_snapshot.get(rel)
+                if prior is not None:
+                    prior_sha1 = prior.get("sha1")
+                    if prior_sha1:
+                        sha1 = prior_sha1
+        if sha1 is None:
+            # Case 4: no reusable sha1 -> hash fresh (new / hint-changed / --full).
+            try:
+                sha1 = compute_file_hash(str(abs_path))
+            except (FileNotFoundError, OSError):
+                continue
+
+        entries[rel] = {
+            "sha1": sha1,
+            "mtime_ns": int(st.st_mtime_ns),
+            "size": int(st.st_size),
+            "inode": int(st.st_ino),
+        }
+    return entries
+
+
+def _enumerate_live_files(
+    scan_path: "str | Path",
+    lang: Optional[str] = None,
+    respect_ignore: bool = True,
+) -> Set[str]:
+    """Enumerate the set of project-relative posix files that WOULD be indexed.
+
+    [G-11/I-5 LOCKED — shared discovery, no divergence] This helper MUST NOT
+    rebuild its own extension set. It reuses the EXACT same file-discovery that
+    ``get_code_structure`` (and therefore ``extract_units_from_project``) uses:
+
+      - the accepted-extension set is ``code_extensions | NON_CODE_EXTENSIONS``
+        where ``code_extensions`` comes from the SAME ``_EXT_MAP_ALL_LANGUAGES``
+        map ``get_code_structure`` consumes;
+      - for ``lang=None`` (the multi-language default) the union is taken over
+        every dispatch tag ``extract_units_from_project`` would resolve via
+        ``_detect_project_language_tags`` (sentinel -> "python");
+      - the SAME rglob walk, hidden-path skip, and ``ignore_spec.match_file``
+        filtering as ``get_code_structure``.
+
+    Returning the walk's relative posix paths (matching ``unit.file`` keys) makes
+    it structurally impossible for the live set to diverge from the parsed set —
+    proven by the mandatory parity test
+    ``_enumerate_live_files(scan_path) == {u.file for u in units}``.
+    """
+    from tldr.api import _EXT_MAP_ALL_LANGUAGES
+    from tldr.tldrignore import load_ignore_patterns, should_ignore
+
+    project = Path(scan_path).resolve()
+
+    # Resolve the dispatch tags EXACTLY as extract_units_from_project does, so the
+    # extension union matches the set of get_code_structure passes that run.
+    if lang is None or lang == "all":
+        tags = _detect_project_language_tags(project, respect_ignore=respect_ignore)
+        structure_langs = [
+            "python" if t == NON_CODE_DISPATCH_SENTINEL else t for t in tags
+        ]
+    else:
+        structure_langs = [lang]
+
+    # Union of accepted extensions across every dispatch pass (same as the union
+    # of the per-pass ``code_extensions | NON_CODE_EXTENSIONS`` in get_code_structure).
+    extensions: Set[str] = set(NON_CODE_EXTENSIONS)
+    for sl in structure_langs:
+        extensions |= _EXT_MAP_ALL_LANGUAGES.get(sl, {".py"})
+
+    ignore_spec = load_ignore_patterns(project) if respect_ignore else None
+
+    live: Set[str] = set()
+    if project.is_file():
+        if project.suffix in extensions:
+            live.add(project.name)
+        return live
+
+    for file_path in project.rglob("*"):
+        # Skip entire hidden-name components (not just .tldr, but any .xxx)
+        try:
+            rel_path = file_path.relative_to(project)
+        except ValueError:
+            continue
+        if any(part.startswith(".") for part in rel_path.parts):
+            continue
+        # Check extension FIRST (no syscall needed)
+        if file_path.suffix not in extensions:
+            continue
+        if not file_path.is_file():
+            continue
+        # [G-3] Apply the SAME effective ignore filter as the index path: not just
+        # .tldrignore (ignore_spec.match_file) but ALSO .gitignore. The index path
+        # filters via should_ignore (get_code_structure's match_file + the
+        # should_ignore pass in extract_units_from_project), so a gitignored file
+        # is NEVER parsed/indexed. Mirroring should_ignore here keeps the live set
+        # equal to the parsed set — a gitignored file absent from the snapshot can
+        # no longer appear as a false-dirty "new" file on every reindex.
+        if respect_ignore and should_ignore(file_path, project, ignore_spec):
+            continue
+        live.add(rel_path.as_posix())
+    return live
+
+
+def _derive_dirty_set(
+    scan_path: Path,
+    project_root: Path,
+    state: "IncrementalState",
+    dirty_files_hint: Optional[Iterable[str]],
+    trust_hint: bool,
+    full: bool,
+    index_start_time: float,
+    lang: Optional[str] = None,
+    respect_ignore: bool = True,
+    live_files: Optional[Set[str]] = None,
+) -> Tuple[Set[str], Set[str], Dict[str, str]]:
+    """Return ``(changed, deleted, sha1_map)`` — the single dirty-set seam that
+    unifies all run patterns (manual / aqm / daemon / full).
+
+    ``changed`` / ``deleted`` are scan_path-relative posix sets. ``sha1_map`` is a
+    ``{rel_path: sha1}`` map of the freshly-computed SHA-1s for files confirmed
+    dirty via the branch-(b) hash floor (S-5): the persist-time hasher reuses
+    these instead of re-hashing. It is ``{}`` for the early return and branch (a)
+    (those paths compute no hashes here).
+
+    [T-1/T-2 LOCKED] Structure — early return + TWO branches:
+
+      - EARLY RETURN (forced-full / first-run): ``full or state.full_rebuild or
+        not state.old_units`` -> ``(all_live, set())``. The degenerate
+        empty-snapshot case on the SAME path as manual.
+      - Branch (a): daemon hint present AND epoch-continuous -> trust the hint.
+      - Branch (b): everything else -> the self-validating hash floor (two-phase
+        stat fast-path then SHA-1 confirm).
+
+    [G-7 LOCKED] Deletion source = index metadata (``state.old_units``), NOT the
+    snapshot — robust to a narrow/stale/partial snapshot or a crash mid-persist.
+    """
+    from tldr.patch import load_snapshot, compute_file_hash
+
+    # Reuse pre-computed live set if provided; otherwise enumerate.
+    # Use `is not None` guard (NOT `or`) so an empty set is respected correctly.
+    live = live_files if live_files is not None else _enumerate_live_files(scan_path, lang=lang, respect_ignore=respect_ignore)
+
+    # EARLY RETURN: forced full / first run — carry nothing.
+    if full or state.full_rebuild or not state.old_units:
+        return live, set(), {}
+
+    # Deletion = index metadata minus live (G-7). old_units is authoritative.
+    indexed = {u.get("file") for u in (state.old_units or [])}
+    deleted = {f for f in indexed if f is not None} - live
+
+    # Branch (a): daemon hint AND epoch provably continuous -> trust the hint.
+    # The caller materializes the hint to a list before passing it here, so
+    # re-iteration is safe.
+    #
+    # [G-6 FALL-THROUGH] A non-empty hint may normalize to an EMPTY changed set
+    # when every hinted path is out-of-scope (not under scan_path → filtered by
+    # _normalize_dirty_files). An empty changed set on the trusted-hint path would
+    # carry ALL files (no-op) and silently miss a real edit the hint failed to
+    # mention. So only SHORT-CIRCUIT on a NON-EMPTY normalized set; an empty one
+    # falls through to the branch-(b) hash floor, which independently detects the
+    # real change. (No sha1 is computed on the hint path → empty sha1_map.)
+    hint = list(dirty_files_hint) if dirty_files_hint is not None else []
+    if hint and trust_hint:
+        changed = _normalize_dirty_files(hint, scan_path)
+        if changed:
+            return changed, deleted, {}
+        # else: hint normalized to empty (all out-of-scope) — fall through.
+
+    # Branch (b): everything else — self-validating hash floor.
+    # load_snapshot is fully normalized to SnapshotEntry dicts; NO isinstance /
+    # schema_version guards here (T-2). Narrow->wide sentinels (mtime_ns=0,
+    # size=-1, inode=-1) force a hash-confirm on the first post-upgrade run.
+    #
+    # S-5: a changed file's content is read EXACTLY ONCE here for its sha1, which
+    # is recorded in ``sha1_map`` so persist reuses it (case-1) and never re-hashes.
+    # A stat-unchanged file is never read here (persist reuses the prior snapshot's
+    # sha1 via case-2). On a true no-op every file takes the stat fast-path -> ZERO
+    # reads/hashes in this loop AND zero at persist.
+    #
+    # The floor's one legitimate per-changed-file hash is computed via
+    # ``compute_file_hash`` on confirmed-ambiguous files only (size+inode match but
+    # timestamp moved). On a true no-op every file takes the stat fast-path -> ZERO
+    # hashes here. A first-run / --full build skips this branch (early return) and
+    # hashes at persist, so it still exercises ``compute_file_hash`` there.
+    # A-1: validate the stored scan_path header against the current scan; a
+    # mismatch (or an old header-less snapshot) returns {} so every live file is
+    # treated as new and re-hashed — correct, just slower — instead of trusting
+    # scan_path-relative keys written under a different scan.
+    snapshot = load_snapshot(str(project_root), scan_path=str(scan_path))
+    changed = set()
+    sha1_map: Dict[str, str] = {}
+
+    for rel_path in live:
+        entry = snapshot.get(rel_path)
+        if entry is None:
+            changed.add(rel_path)  # new file (not yet in snapshot)
+            continue
+        abs_path = scan_path / rel_path  # only construct for existing entries
+        try:
+            st = os.stat(str(abs_path))
+        except (FileNotFoundError, OSError):
+            # File vanished between enumeration and stat — treat as changed so the
+            # next parse drops it (it won't appear in fresh units).
+            changed.add(rel_path)
+            continue
+        # Definitive content change — different byte count or replaced inode. A
+        # different size CANNOT be the same content, so mark dirty by STAT ALONE,
+        # with NO hash here: the parse step reads this file once and supplies its
+        # sha1 (threaded via fresh_file_sha1s into _compute_current_file_hashes), so
+        # the whole changed-file path reads each file exactly ONCE (S-5 read-once).
+        if st.st_size != entry["size"] or st.st_ino != entry["inode"]:
+            changed.add(rel_path)
+            continue
+        # Ambiguous — size+inode match but the timestamp moved (or fell inside the
+        # index run's ccache window): a possible touch-without-content-change. One
+        # SHA-1 confirm; skip if it still matches. The confirmed sha1 is recorded in
+        # sha1_map so persist reuses it (no second hash for that file either).
+        ambiguous = (
+            st.st_mtime_ns != entry["mtime_ns"]      # timestamp changed
+            or st.st_mtime >= index_start_time       # ccache sub-second race guard
+        )
+        if ambiguous:
+            try:
+                fresh_sha1 = compute_file_hash(str(abs_path))
+                if fresh_sha1 != entry["sha1"]:
+                    changed.add(rel_path)
+                    sha1_map[rel_path] = fresh_sha1
+            except (FileNotFoundError, OSError):
+                changed.add(rel_path)
+        # else: stat fast-path match -> clean, skip (persist reuses old sha1).
+    return changed, deleted, sha1_map
+
+
+def _unified_extract(
+    scan_path: "str | Path",
+    extract_lang: Optional[str],
+    respect_ignore: bool,
+    changed: Set[str],
+    deleted: Set[str],
+    old_units: List[dict],
+    all_live: Set[str],
+    progress_cb=None,
+) -> "Tuple[List[EmbeddingUnit], dict, List[EmbeddingUnit], Dict[str, str]]":
+    """Single extraction path replacing _full_extract + _parse_skip_extract.
+
+    Receives the ``(changed, deleted)`` dirty set from ``_derive_dirty_set``;
+    parses ONLY the changed files; carries forward every unchanged, non-deleted
+    unit from the persisted metadata (``EmbeddingUnit.from_dict`` — preserving
+    text_hash / calls / called_by) so they are never re-parsed or re-embedded.
+
+    Returns ``(merged_units, file_calls_cache, carried_units, fresh_file_sha1s)``
+    where ``fresh_file_sha1s`` is the ``{rel: sha1}`` read-once map for the
+    freshly-parsed files (S-5) — persist reuses it instead of re-hashing.
+
+    Degenerate full-rebuild case: when ``changed == all_live`` (forced full /
+    first run) ``files_to_parse`` is passed as ``None`` (parse every file) and the
+    carry filter excludes everything — strictly identical output to the old
+    _full_extract (which returned a dead None call_graph that is simply dropped).
+    """
+    # Full parse when everything is dirty (first-run / --full): pass None so the
+    # extractor parses every file (no allowlist) and produces an empty carry.
+    full_parse = (all_live is not None) and (changed == all_live)
+    files_to_parse = None if full_parse else changed
+
+    # S-5 read-once sink: on an INCREMENTAL parse it is filled with the raw-bytes
+    # sha1 of every freshly-parsed (changed) file so persist reuses it instead of
+    # re-hashing. On a FULL parse (first run / --full) it is intentionally left
+    # EMPTY: there is no prior snapshot to make the run incremental, so persist
+    # hashes every file fresh (case-3) — identical to the historical --full
+    # snapshot and keeping the floor's hash provenance unambiguous on a cold build.
+    fresh_sha1s: Dict[str, str] = {}
+    fresh, _cg, fcache = extract_units_from_project(
+        str(scan_path), lang=extract_lang, respect_ignore=respect_ignore,
+        progress_callback=progress_cb, files_to_parse=files_to_parse,
+        return_file_calls_cache=True,
+        fresh_file_sha1s=(None if full_parse else fresh_sha1s),
+    )
+
+    if full_parse:
+        carried: List[EmbeddingUnit] = []
+        merged = sorted(fresh, key=lambda u: (u.file, u.line))
+        return merged, fcache, carried, {}
+
+    # Carry filter with deletion drop (G-7): a carried unit can never reference a
+    # file removed from disk because both ``changed`` and ``deleted`` are computed
+    # against the same old_units record.
+    carried = [
+        EmbeddingUnit.from_dict(u)
+        for u in old_units
+        if u.get("file") is not None         # drop null-file units (nothing to validate; avoids TypeError in the sort below)
+        and u.get("file") not in changed     # unchanged
+        and u.get("file") not in deleted     # still exists — MANDATORY
+    ]
+    # Deterministic merged order (row i <-> units[i]); this single sort is the
+    # row-order source. plan/assemble are qualified_name-keyed, so the exact order
+    # only needs to be stable.
+    merged = sorted(fresh + carried, key=lambda u: (u.file, u.line))
+    return merged, fcache, carried, fresh_sha1s
 
 
 def build_semantic_index(
@@ -2178,23 +2695,23 @@ def build_semantic_index(
     *,
     device: Optional[str] = None,
     full: bool = False,
-    # dirty_files: WATCHER-AUTHORITATIVE parse-skip hint from the daemon. When
-    # non-empty (and not a forced full rebuild) the daemon's watcher has observed
-    # every change since the last reindex, so only those files are re-parsed and
-    # the rest are carried forward from metadata. None (manual index) or [] (daemon
-    # restart, possibly-missed events) falls back to a full scan.
+    # dirty_files: Optional hint from the daemon (when epoch-continuous). When
+    # present and epoch-continuous, only those files are re-parsed; unchanged files
+    # are carried forward from metadata (parse-skip). When None, empty, or
+    # epoch-discontinuous, the self-validating hash floor derives the dirty set
+    # from file stat + content hashes, enabling incremental indexing on manual paths.
     dirty_files: Optional[Iterable[str]] = None,
 ) -> int:
     """Build and save FAISS index + metadata for a project.
 
     Incremental by default: only units whose embedding text changed (gated by a
     per-unit ``text_hash``) are re-embedded; unchanged units reuse their old
-    vector via FAISS ``reconstruct_n``. When ``dirty_files`` is provided, only
-    changed files are re-parsed and unchanged files are carried forward from
-    persisted metadata (parse-skip); otherwise every file is re-parsed. Either
-    way the call graph is re-APPLIED to the complete (fresh + carried) unit list
-    every run, so cross-file caller drift is always reflected. Pass ``full=True``
-    to force a clean rebuild.
+    vector via FAISS ``reconstruct_n``. Changed/deleted files are derived from:
+    (1) the daemon's dirty_files hint if provided and epoch-continuous, OR (2) the
+    self-validating hash floor (file stat + content hashes) for manual and
+    epoch-discontinuous paths. Either way the call graph is re-APPLIED to the
+    complete (fresh + carried) unit list every run, so cross-file caller drift is
+    always reflected. Pass ``full=True`` to force a clean rebuild.
 
     Creates:
     - .tldr/cache/semantic/index.faiss - Vector index
@@ -2211,13 +2728,15 @@ def build_semantic_index(
                 'cpu' otherwise).
         full: If True, force a full rebuild ignoring all cached vectors/hashes.
         dirty_files: Optional WATCHER-AUTHORITATIVE list of changed file paths
-                (absolute, from the daemon). When non-empty and not a forced full
-                rebuild, only these files are re-parsed; unchanged files are
-                carried forward from metadata (parse-skip). ``None`` (manual index)
-                or ``[]`` (daemon restart with possibly-missed events) triggers a
-                full file scan. The L1 text_hash gate still decides re-embedding,
-                so a stale hint can never corrupt the index — only over- or
-                under-skip parsing, both self-correcting on the next full scan.
+                (absolute, from the daemon). When non-empty and the daemon's epoch
+                is provably continuous (indicating unbroken watcher activity), these
+                files are re-parsed and unchanged files are carried forward from
+                metadata (parse-skip). When absent, empty, or epoch-discontinuous,
+                the self-validating hash floor derives the dirty set from file stat
+                and content hashes — enabling incremental indexing on manual paths.
+                The L1 text_hash gate still decides re-embedding, so a stale hint
+                can never corrupt the index — only over- or under-skip parsing, both
+                self-correcting on the next full rebuild.
 
     Returns:
         Number of indexed units.
@@ -2262,7 +2781,11 @@ def build_semantic_index(
     # old_units=[] so the parse-skip guard below falls through to a full parse.
     # Loaded BEFORE extraction so the parse-skip path can consult full_rebuild /
     # old_units to decide whether to skip parsing unchanged files.
-    indexer = IncrementalIndexer(str(project_root))
+    # A-1: pass scan_path so the wide snapshot is stamped + validated against the
+    # scan it was keyed under; a scan_path mismatch (or an old header-less
+    # snapshot) falls back to the safe re-hash-all path instead of trusting
+    # scan_path-relative keys that cannot match the current scan.
+    indexer = IncrementalIndexer(str(project_root), scan_path=str(scan_path))
     state = indexer.load_previous(hf_name, force_full=full)
 
     # Single expansion seam (I-3): the retired per-language `lang=="all"` loop is
@@ -2271,70 +2794,43 @@ def build_semantic_index(
     # through unchanged. The same effective lang drives the call-graph re-apply.
     extract_lang: Optional[str] = None if lang == "all" else lang
 
-    # WATCHER-AUTHORITATIVE parse-skip decision (folded guard — T-7):
-    #   - dirty_files is None      -> manual index: full scan (unchanged behavior).
-    #   - dirty_files == []        -> daemon restart with possibly-missed events:
-    #                                 suspicious, fall back to FULL scan (not a
-    #                                 carry-all no-op).
-    #   - state.full_rebuild       -> cached vectors unusable: parse everything.
-    normalized_changed: set = set()
-    use_parse_skip = (
-        dirty_files is not None
-        and len(dirty_files) > 0
-        and not state.full_rebuild
-    )
-    if use_parse_skip:
-        # G-4/I-10: normalize the daemon's absolute paths to scan_path-relative
-        # posix so they compare against unit.file (which extract_units_from_project
-        # keys relative to scan_path, NOT project_root). Basing this on project_root
-        # would prefix a 'src/'-style component on subdir / CLAUDE_PROJECT_DIR scans
-        # (scan_path != project_root), so every carry-filter comparison would miss
-        # and the whole index would silently go stale. The daemon passes
-        # project_root==scan_path, so its absolute paths normalize identically.
-        # An empty normalized set (all paths out-of-tree) falls back to a full parse.
-        normalized_changed = _normalize_dirty_files(dirty_files, scan_path)
-        if not normalized_changed:
-            use_parse_skip = False
+    # UNIFIED DIRTY-SET DERIVATION (replaces the use_parse_skip guard — T-1/T-7).
+    # ONE seam derives (changed, deleted) for every run pattern (manual / aqm /
+    # daemon / full): a daemon dirty-files hint is trusted only when epoch is
+    # provably continuous (the daemon already gates this and omits the hint when
+    # gapped); otherwise the self-validating hash floor re-derives the change set
+    # from the wide snapshot. ``index_start_time`` is captured BEFORE any file read
+    # so the floor can force a re-hash of any file touched during this run
+    # (sub-second ccache race guard).
+    import time as _time
+    index_start_time = _time.time()
 
-    _extracted_call_graph = None
+    # Materialize the hint once (it may be a set/list/None — never a generator
+    # from the CLI/daemon, but materialize defensively so both reads below see the
+    # same contents).
+    dirty_files_list = list(dirty_files) if dirty_files is not None else None
+
+    all_live = _enumerate_live_files(scan_path, lang=extract_lang, respect_ignore=respect_ignore)
+
+    # epoch_continuity is the daemon's responsibility: when the daemon cannot
+    # prove continuity it OMITS --dirty-files, so a present dirty_files hint here is
+    # already epoch-validated. We therefore trust a non-empty hint.
+    changed, deleted, deriver_sha1_map = _derive_dirty_set(
+        scan_path=scan_path,
+        project_root=project_root,
+        state=state,
+        dirty_files_hint=dirty_files_list,
+        trust_hint=dirty_files_list is not None and len(dirty_files_list) > 0,
+        full=full,
+        index_start_time=index_start_time,
+        lang=extract_lang,
+        respect_ignore=respect_ignore,
+        live_files=all_live,
+    )
+
     file_calls_cache: Dict[Tuple[str, str], Dict[str, List[Tuple[str, str]]]] = {}
     carried_units: List[EmbeddingUnit] = []
-
-    def _full_extract(progress_cb=None):
-        """Parse every file; collect the file_calls_cache for the Pass-2 fast path."""
-        return extract_units_from_project(
-            str(scan_path), lang=extract_lang, respect_ignore=respect_ignore,
-            progress_callback=progress_cb, return_file_calls_cache=True,
-        )
-
-    def _parse_skip_extract(progress_cb=None):
-        """Parse ONLY changed/new files (files_to_parse allowlist); carry the rest
-        forward from the persisted metadata via EmbeddingUnit.from_dict (preserving
-        text_hash / calls / called_by) so they are never re-parsed or re-embedded."""
-        fresh, _cg, fcache = extract_units_from_project(
-            str(scan_path), lang=extract_lang, respect_ignore=respect_ignore,
-            progress_callback=progress_cb, files_to_parse=normalized_changed,
-            return_file_calls_cache=True,
-        )
-        carried = [
-            EmbeddingUnit.from_dict(u)
-            for u in state.old_units
-            if u.get("file") not in normalized_changed
-        ]
-        # Deterministic merged order (row i <-> units[i]); plan/assemble are
-        # qualified_name-keyed, so the exact order only needs to be stable.
-        merged = sorted(fresh + carried, key=lambda u: (u.file, u.line))
-        return merged, fcache, carried
-
-    def _dispatch_extract(progress_cb=None):
-        """Run the chosen extraction path ONCE. progress_cb (or None when there is
-        no console) is the only thing that varies between the console / no-console
-        arms — the parse-skip vs full split lives here, not duplicated per arm."""
-        nonlocal units, file_calls_cache, carried_units, _extracted_call_graph
-        if use_parse_skip:
-            units, file_calls_cache, carried_units = _parse_skip_extract(progress_cb)
-        else:
-            units, _extracted_call_graph, file_calls_cache = _full_extract(progress_cb)
+    fresh_file_sha1s: Dict[str, str] = {}
 
     units = []
     if console:
@@ -2343,12 +2839,21 @@ def build_semantic_index(
                 short_path = file_path if len(file_path) < 50 else "..." + file_path[-47:]
                 status.update(f"[bold green]Processing {short_path}... ({units_count} units)")
 
-            if use_parse_skip:
+            # I-7: orphaned use_parse_skip UI text re-derived from the dirty-set sizes.
+            if len(changed) < len(all_live):
                 status.update("[bold green]Extracting changed code units (parse-skip)...")
-            _dispatch_extract(update_progress)
+            # I-11 dual-arm assignment (console arm): bind the return tuple.
+            units, file_calls_cache, carried_units, fresh_file_sha1s = _unified_extract(
+                scan_path, extract_lang, respect_ignore, changed, deleted,
+                state.old_units, all_live, progress_cb=update_progress,
+            )
             status.update(f"[bold green]Extracted {len(units)} code units")
     else:
-        _dispatch_extract(None)
+        # I-11 dual-arm assignment (plain arm): bind the return tuple.
+        units, file_calls_cache, carried_units, fresh_file_sha1s = _unified_extract(
+            scan_path, extract_lang, respect_ignore, changed, deleted,
+            state.old_units, all_live, progress_cb=None,
+        )
 
     # Bug 004 (C-3): when multiple code languages are dispatched (lang=None), each
     # pass unions NON_CODE_EXTENSIONS into get_code_structure, so the same non-code
@@ -2356,6 +2861,31 @@ def build_semantic_index(
     # each file/function appears at most once in the FAISS index. (Also collapses
     # any carried/fresh overlap on the parse-skip path.)
     if units:
+        # Phantom function-form-of-method collapse: the per-file extraction emits a
+        # class method BOTH as a ``method`` unit (qualified_name
+        # ``file.Class.method``) AND, for some language paths, as a phantom
+        # ``function`` unit (qualified_name ``file.method``) at the SAME (file, line).
+        # The two describe one source construct, so the phantom inflates the index
+        # and double-counts re-embeds when the (shared) called_by changes. Drop the
+        # ``function`` twin when a ``method`` unit covers the same (file, name, line);
+        # the ``method`` unit (richer signature/docstring) is authoritative. This is
+        # keyed on an EXACT (file, line, name) collision so a genuine module-level
+        # function that merely shares a name with a method in another region is never
+        # removed.
+        _method_sites = {
+            (u.file, u.line, u.name)
+            for u in units
+            if u.unit_type == "method"
+        }
+        if _method_sites:
+            units = [
+                u for u in units
+                if not (
+                    u.unit_type == "function"
+                    and (u.file, u.line, u.name) in _method_sites
+                )
+            ]
+
         seen_qn: set = set()
         deduped: List[EmbeddingUnit] = []
         for u in units:
@@ -2373,8 +2903,11 @@ def build_semantic_index(
     # changes build_embedding_text -> changes the hash -> routes the unit to
     # encode_units. The file_calls_cache (+ carried_units) lets Pass-2 serve every
     # file without re-walking the project via scan_project.
+    # call_graph is always None on the unified path: extract_units_from_project is
+    # called with return_file_calls_cache=True, which forces call_graph_obj=None
+    # (the authoritative edges come from the cache-driven Pass-2 re-apply).
     _reapply_call_graph(
-        units, str(scan_path), extract_lang, call_graph=_extracted_call_graph,
+        units, str(scan_path), extract_lang, call_graph=None,
         file_calls_cache=file_calls_cache, carried_units=carried_units,
     )
     # G2-7: recompute over the COMPLETE merged list (fresh + carried) — a carried
@@ -2461,7 +2994,20 @@ def build_semantic_index(
 
     # Compute current file hashes (orchestrator hint for the next run); persist
     # writes index.faiss + metadata.json atomically and saves the cache.
-    current_file_hashes = _compute_current_file_hashes(units, str(project_root))
+    # NOTE: pass scan_path (NOT project_root) — unit.file keys are scan_path-relative,
+    # so the floor keys must align with _enumerate_live_files / _derive_dirty_set
+    # (which also key off scan_path) for parse-skip to activate on subdir scans.
+    # S-5: changed files' sha1s come from the single parse read (fresh_file_sha1s);
+    # the deriver's ambiguous-confirm sha1s (sha1_map) are a fallback for files the
+    # extractor didn't re-parse. fresh_file_sha1s wins (it reflects the exact bytes
+    # just parsed). Together they let persist avoid re-hashing any changed file.
+    current_file_hashes = _compute_current_file_hashes(
+        units, str(scan_path),
+        deriver_sha1_map=deriver_sha1_map,
+        fresh_file_sha1s=fresh_file_sha1s,
+        old_snapshot=state.old_snapshot,
+        changed_set=changed,
+    )
     indexer.persist(index, units, hf_name, dimension, current_file_hashes)
 
     # One-line run summary: how many units were re-embedded this run vs reused

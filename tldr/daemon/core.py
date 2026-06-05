@@ -87,6 +87,13 @@ class TLDRDaemon:
         self._reindex_in_progress: bool = False
         self._semantic_config = self._load_semantic_config()
 
+        # DAEMON-EPOCH: the index_epoch (int(time.time_ns())) read from
+        # metadata.json at daemon startup. The dirty-files hint is trusted as
+        # provably continuous ONLY when this still equals the index's current
+        # epoch — i.e. the watcher has been active since the last complete index
+        # write. 0 when no prior index exists (cold default). See #4/T-4.
+        self._watch_start_epoch: int = self._read_index_epoch(self.project)
+
         # P7 Features: Per-session token stats tracking
         self._session_stats: dict[str, SessionStats] = {}
         self._stats_store: StatsStore = get_default_store()
@@ -823,6 +830,22 @@ class TLDRDaemon:
             "reindex_triggered": should_reindex,
         }
 
+    def _read_index_epoch(self, project: Path) -> int:
+        """Read the ``index_epoch`` token from the project's semantic metadata.json.
+
+        [I-9/I-10 LOCKED] Error containment: catches ``OSError`` /
+        ``json.JSONDecodeError`` / ``KeyError`` and returns ``0`` (the cold-daemon
+        default). A crash here would abort the reindex trigger and STALL all
+        reindexing, so every read/parse/key failure degrades to "epoch 0" — which
+        the continuity check then treats as gapped (hash floor handles correctness).
+        """
+        meta_path = Path(project) / ".tldr" / "cache" / "semantic" / "metadata.json"
+        try:
+            meta = json.loads(meta_path.read_text())
+            return int(meta["index_epoch"])
+        except (OSError, json.JSONDecodeError, KeyError, ValueError, TypeError):
+            return 0
+
     def _trigger_background_reindex(self):
         """Trigger background semantic re-indexing.
 
@@ -834,7 +857,12 @@ class TLDRDaemon:
             return
 
         self._reindex_in_progress = True
-        dirty_files = list(self._dirty_files)
+        # GIL-safe snapshot of the dirty set BEFORE spawning the subprocess. Only
+        # these files are subtracted on success (transactional clear, G-6); any
+        # file added by _handle_notify DURING the reindex survives into the next
+        # run. set() copy + set.__isub__ are atomic under CPython — no Lock.
+        files_this_run = set(self._dirty_files)
+        dirty_files = list(files_this_run)
         logger.info(f"Triggering background semantic re-index for {len(dirty_files)} files")
 
         # Write the tracked dirty set to a temp file BEFORE spawning the reindex
@@ -858,15 +886,32 @@ class TLDRDaemon:
             dirty_files_path = None
 
         def do_reindex():
+            succeeded = False
             try:
                 import subprocess
+
+                # Epoch continuity (T-4): trust the dirty-files hint ONLY when the
+                # daemon's watcher has been active since the last complete index
+                # write — i.e. the current index_epoch still equals the epoch the
+                # daemon started watching from. _read_index_epoch returns 0 on any
+                # error (I-10), which fails the equality and falls back to the
+                # self-validating hash floor in _derive_dirty_set.
+                # B-1: a 0 == 0 match on the first post-upgrade / cold-start run is
+                # NOT real continuity (no epoch was ever written), so require a
+                # non-zero current epoch — forces the hash floor on cold start.
+                current_epoch = self._read_index_epoch(self.project)
+                epoch_continuous = (
+                    current_epoch != 0 and current_epoch == self._watch_start_epoch
+                )
 
                 # Run semantic index command (blocking subprocess.run — N-5)
                 cmd = [
                     sys.executable, "-m", "tldr.cli",
                     "semantic", "index", str(self.project)
                 ]
-                if dirty_files_path is not None:
+                # Include --dirty-files only when epoch is provably continuous;
+                # else OMIT it so the indexer falls back to the Step-A hash floor.
+                if dirty_files_path is not None and epoch_continuous:
                     cmd += ["--dirty-files", dirty_files_path]
                 result = subprocess.run(
                     cmd,
@@ -876,6 +921,7 @@ class TLDRDaemon:
                 )
 
                 if result.returncode == 0:
+                    succeeded = True
                     logger.info("Background semantic re-index completed successfully")
                 else:
                     logger.error(f"Background semantic re-index failed: {result.stderr}")
@@ -889,9 +935,24 @@ class TLDRDaemon:
                         os.unlink(dirty_files_path)
                     except OSError:
                         pass
-                # Reset dirty tracking
-                self._dirty_files.clear()
-                self._dirty_count = 0
+                if succeeded:
+                    # Transactional clear (G-6, replaces the blanket .clear()):
+                    # remove ONLY the files folded into THIS reindex. Files added
+                    # by _handle_notify during the subprocess survive in
+                    # _dirty_files for the next run. set.__isub__ is GIL-atomic —
+                    # no Lock. Advance the watch epoch to the freshly-written index.
+                    self._dirty_files -= files_this_run
+                    # Only advance the watch epoch when the read actually
+                    # succeeded (non-zero). A failed read returns 0; trusting that
+                    # would make a later `0 == 0` continuity check accept a stale
+                    # hint instead of falling back to the hash floor. Leaving the
+                    # epoch unchanged on a 0 read keeps the hash floor as fallback.
+                    new_epoch = self._read_index_epoch(self.project)
+                    if new_epoch != 0:
+                        self._watch_start_epoch = new_epoch
+                # else: leave _dirty_files intact; the next trigger retries and the
+                # hash floor provides correctness.
+                self._dirty_count = len(self._dirty_files)
                 self._reindex_in_progress = False
 
         # Run in thread to not block daemon
