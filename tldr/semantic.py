@@ -1952,12 +1952,15 @@ def _augment_cache_with_carried(
       bare class name from ``d = Dog()``), and Pass-2a's name-based linking — the
       same way the fresh cache entries do.
 
-    Keying: the cache key is ``(str(scan_path / unit.file), unit.language)`` —
-    ``unit.language`` is the dispatch language a ``--full`` rebuild keyed the file
-    under (in single-language mode it equals the structure_lang; in multi-language
-    mode it is the file's own dispatch language), so the augmented entry is
-    interchangeable with a fresh one and ``_iter_call_graph_files`` filters it
-    correctly.
+    Keying: the cache key is ``(str(scan_path / unit.file), dispatch_lang)`` where
+    ``dispatch_lang`` is extracted from the set of languages present in the fresh
+    ``file_calls_cache`` (line 2001: ``dispatch_langs = {lang for (_path, lang) in file_calls_cache}``).
+    This ensures carried files are keyed under the SAME dispatch language(s) that
+    ``--full`` uses, so cross-language code-fence callers in non-source files
+    (e.g. Rust code inside ``.md``) are correctly harvested. In single-language mode,
+    there is one dispatch language; in multi-language mode (``--lang all``/auto/None),
+    each carried file is re-parsed under each dispatch language present in the fresh
+    cache, exactly as ``--full`` would.
 
     Files already present in ``file_calls_cache`` (the changed files) are NEVER
     re-parsed or overridden — a changed file's FRESH per-caller edges always win.
@@ -1981,25 +1984,59 @@ def _augment_cache_with_carried(
     from tldr.cross_file_calls import extract_file_calls_for_language
 
     root = Path(scan_path)
-    # Deduplicate by (file, language) BEFORE constructing keys/paths
-    unique_files = {}
-    for unit in carried_units or []:
-        file_lang_key = (unit.file, unit.language)
-        if file_lang_key not in unique_files:
-            unique_files[file_lang_key] = unit
 
-    for (file_path, language), unit in unique_files.items():
-        key = (str(scan_path / file_path), language)
-        if key in file_calls_cache:
-            # Changed file already in the fresh cache: its freshly-parsed edges
-            # are authoritative; never re-parse / override it from a carried unit.
-            continue
-        file_path_obj = Path(key[0])
-        # Re-parse with the EXACT extractor --full uses for this language. Cheap
-        # (file unchanged, page-cached); yields native dual-keyed caller entries.
-        file_calls = extract_file_calls_for_language(file_path_obj, root, language)
-        if file_calls:
-            augmented[key] = file_calls
+    # --full keys EVERY file under the DISPATCH language (``structure_lang``) the
+    # run extracted with — see ``_extract_one_language._accumulate`` (this file,
+    # ~line 938: ``key = (resolved_path, structure_lang)``). A non-source carried
+    # file (e.g. ``spec.md``, ``unit.language == 'markdown'``) whose content the
+    # dispatch extractor parses into caller keys (a Rust code fence harvested by
+    # ``_extract_rust_file_calls``) is keyed by --full under the DISPATCH language
+    # (``'rust'``), NOT under ``unit.language`` (``'markdown'``). Keying carried
+    # files under ``unit.language`` therefore misses those cross-language
+    # code-fence caller keys (``extract_file_calls_for_language(spec.md, 'markdown')``
+    # returns ``{}``), so they vanish from incremental ``called_by``/``calls``.
+    #
+    # Parity by construction: re-extract each carried file under EACH dispatch
+    # language PRESENT IN THE FRESH cache (single-lang run → one dispatch lang;
+    # multi-lang ``--lang all``/auto/None run → several), exactly as --full keyed
+    # them. ``(path, lang)`` keys already in the fresh cache are skipped — a
+    # changed file's freshly-parsed edges always win.
+    dispatch_langs = {lang for (_path, lang) in file_calls_cache}
+    # Multi-language parity: in a ``--lang all``/auto/None run where only ONE
+    # language's files changed, the fresh cache only contains that language's
+    # dispatch key. Carried files of the OTHER languages must STILL be re-extracted
+    # under their own dispatch language, or their call edges vanish from the
+    # incrementally-rebuilt graph (rebuilt FRESH from the augmented cache). Union
+    # the carried units' languages into the keying set so each carried file is
+    # re-extracted under its dispatch language too. The ``if file_calls:`` guard
+    # below keeps non-code languages (e.g. markdown) harmless (empty → not added).
+    dispatch_langs |= {u.language for u in (carried_units or [])}
+
+    # Deduplicate carried files BEFORE constructing keys/paths. The file's own
+    # ``unit.language`` no longer determines the cache key — the dispatch
+    # language(s) in the fresh cache do — so dedupe on ``unit.file`` alone.
+    unique_files = set()
+    for unit in carried_units or []:
+        unique_files.add(unit.file)
+
+    for file_path in unique_files:
+        full_path_str = str(scan_path / file_path)
+        file_path_obj = Path(full_path_str)
+        for dispatch_lang in dispatch_langs:
+            key = (full_path_str, dispatch_lang)
+            if key in file_calls_cache:
+                # Changed file already in the fresh cache: its freshly-parsed
+                # edges are authoritative; never re-parse / override it.
+                continue
+            # Re-parse with the EXACT extractor --full uses for this DISPATCH
+            # language. Cheap (file unchanged, page-cached); yields native
+            # dual-keyed caller entries, including cross-language code-fence
+            # callers a non-source file's own ``unit.language`` would miss.
+            file_calls = extract_file_calls_for_language(
+                file_path_obj, root, dispatch_lang
+            )
+            if file_calls:
+                augmented[key] = file_calls
     return augmented
 
 

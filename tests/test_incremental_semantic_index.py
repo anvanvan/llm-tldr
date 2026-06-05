@@ -27,9 +27,14 @@ import json
 import sys
 import tempfile
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import numpy as np
+
+# Shared deterministic fake embedder lives in conftest.py (importable as a
+# module — rootdir is on sys.path during the pytest run). De-duped local copy.
+# It is a MagicMock whose encode.call_count / call args remain observable.
+from conftest import make_fake_model as _make_fake_model
 
 # ---------------------------------------------------------------------------
 # Repo root (for CLI subprocess tests)
@@ -40,30 +45,6 @@ _REPO_ROOT = str(Path(__file__).parent.parent)
 # Embedding dimension used by the fake model
 # ---------------------------------------------------------------------------
 _DIM = 4
-
-
-# ---------------------------------------------------------------------------
-# Fake embedder factory — returns L2-normalised unit vectors, counts calls
-# ---------------------------------------------------------------------------
-def _make_fake_model() -> MagicMock:
-    """Return a MagicMock whose encode() returns np.ones-normalised dim-4 vectors.
-
-    Call count is observable via mock.encode.call_count.
-    We track every text passed to encode so tests can assert which units triggered
-    a fresh embedding.
-    """
-    mock_model = MagicMock()
-
-    def fake_encode(texts, batch_size=128, normalize_embeddings=True,
-                    show_progress_bar=False):
-        n = len(texts) if isinstance(texts, list) else 1
-        # All-ones then L2-normalize so scores are comparable
-        vecs = np.ones((n, _DIM), dtype=np.float32)
-        norms = np.linalg.norm(vecs, axis=1, keepdims=True)
-        return vecs / norms
-
-    mock_model.encode.side_effect = fake_encode
-    return mock_model
 
 
 # ---------------------------------------------------------------------------

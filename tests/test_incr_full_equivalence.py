@@ -26,30 +26,14 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import List
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
-import numpy as np
-
-# ---------------------------------------------------------------------------
-# Fake model (matches convention from test_incremental_call_graph.py)
-# ---------------------------------------------------------------------------
-_DIM = 4
-
-
-def _make_fake_model() -> MagicMock:
-    """Deterministic fake embedder: L2-normalised np.ones dim-4 vectors."""
-    mock_model = MagicMock()
-
-    def fake_encode(texts, batch_size=128, normalize_embeddings=True,
-                    show_progress_bar=False):
-        n = len(texts) if isinstance(texts, list) else 1
-        vecs = np.ones((n, _DIM), dtype=np.float32)
-        norms = np.linalg.norm(vecs, axis=1, keepdims=True)
-        return vecs / norms
-
-    mock_model.encode.side_effect = fake_encode
-    return mock_model
+# Shared test helpers live in conftest.py (importable as a module — rootdir is
+# on sys.path during the pytest run). De-duped from local copies.
+from conftest import (
+    make_fake_model as _make_fake_model,
+    validate_incr_full_equivalence as _validate_incr_full_equivalence,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -139,45 +123,6 @@ def _read_metadata(project_root: Path) -> dict:
 
 def _unit_by_name(meta: dict, name: str) -> dict | None:
     return next((u for u in meta["units"] if u.get("name") == name), None)
-
-
-def _validate_incr_full_equivalence(
-    meta_incr: dict, meta_full: dict
-) -> List[str]:
-    """Return a list of per-unit divergence messages (empty = all equal).
-
-    For every unit present in BOTH indexes, checks that the sorted calls list
-    AND the sorted called_by list are IDENTICAL.  Presence mismatch (unit
-    exists in one but not the other) is also reported.
-    """
-    incr_by_name = {u["name"]: u for u in meta_incr["units"]}
-    full_by_name = {u["name"]: u for u in meta_full["units"]}
-    problems = []
-
-    only_incr = set(incr_by_name) - set(full_by_name)
-    only_full = set(full_by_name) - set(incr_by_name)
-    if only_incr:
-        problems.append(f"Units only in incremental (not in full): {sorted(only_incr)}")
-    if only_full:
-        problems.append(f"Units only in full (not in incremental): {sorted(only_full)}")
-
-    for name in set(incr_by_name) & set(full_by_name):
-        u_i = incr_by_name[name]
-        u_f = full_by_name[name]
-        i_calls = sorted(u_i.get("calls") or [])
-        f_calls = sorted(u_f.get("calls") or [])
-        i_cb = sorted(u_i.get("called_by") or [])
-        f_cb = sorted(u_f.get("called_by") or [])
-        if i_calls != f_calls:
-            problems.append(
-                f"{name}.calls: incremental={i_calls!r} != full={f_calls!r}"
-            )
-        if i_cb != f_cb:
-            problems.append(
-                f"{name}.called_by: incremental={i_cb!r} != full={f_cb!r}"
-            )
-
-    return problems
 
 
 # ===========================================================================

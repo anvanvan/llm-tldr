@@ -28,28 +28,11 @@ import threading
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-import numpy as np
 import pytest
 
-# ---------------------------------------------------------------------------
-# Embedding dimension used by the fake model (matches existing test convention)
-# ---------------------------------------------------------------------------
-_DIM = 4
-
-
-def _make_fake_model() -> MagicMock:
-    """Return a MagicMock whose encode() returns np.ones-normalised dim-4 vectors."""
-    mock_model = MagicMock()
-
-    def fake_encode(texts, batch_size=128, normalize_embeddings=True,
-                    show_progress_bar=False):
-        n = len(texts) if isinstance(texts, list) else 1
-        vecs = np.ones((n, _DIM), dtype=np.float32)
-        norms = np.linalg.norm(vecs, axis=1, keepdims=True)
-        return vecs / norms
-
-    mock_model.encode.side_effect = fake_encode
-    return mock_model
+# Shared deterministic fake embedder lives in conftest.py (importable as a
+# module — rootdir is on sys.path during the pytest run). De-duped local copy.
+from conftest import make_fake_model as _make_fake_model
 
 
 def _build_tiny_repo(tmp_path: Path) -> Path:

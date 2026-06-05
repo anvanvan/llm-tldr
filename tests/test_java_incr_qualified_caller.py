@@ -42,32 +42,16 @@ Runner: python3 -m pytest --no-cov tests/test_java_incr_qualified_caller.py
 
 from __future__ import annotations
 
-import json
 import shutil
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
-import numpy as np
-
-# ---------------------------------------------------------------------------
-# Fake model — matches convention in test_incr_full_equivalence.py
-# ---------------------------------------------------------------------------
-_DIM = 4
-
-
-def _make_fake_model() -> MagicMock:
-    """Deterministic fake embedder: L2-normalised np.ones dim-4 vectors."""
-    mock_model = MagicMock()
-
-    def fake_encode(texts, batch_size=128, normalize_embeddings=True,
-                    show_progress_bar=False):
-        n = len(texts) if isinstance(texts, list) else 1
-        vecs = np.ones((n, _DIM), dtype=np.float32)
-        norms = np.linalg.norm(vecs, axis=1, keepdims=True)
-        return vecs / norms
-
-    mock_model.encode.side_effect = fake_encode
-    return mock_model
+from conftest import (
+    find_units_by_name,
+    make_fake_model,
+    read_semantic_metadata,
+    validate_incr_full_equivalence,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -121,56 +105,6 @@ def _build_java_repo(root: Path) -> None:
     (root / "ClassB.java").write_text(_CLASS_B_JAVA)
 
 
-def _read_metadata(project_root: Path) -> dict:
-    meta_path = project_root / ".tldr" / "cache" / "semantic" / "metadata.json"
-    assert meta_path.exists(), f"metadata.json missing: {meta_path}"
-    return json.loads(meta_path.read_text())
-
-
-def _units_by_name(meta: dict, name: str) -> list[dict]:
-    """Return all units whose bare 'name' field matches."""
-    return [u for u in meta["units"] if u.get("name") == name]
-
-
-def _validate_incr_full_equivalence(meta_incr: dict, meta_full: dict) -> list[str]:
-    """Return per-unit divergence messages (empty list == equal).
-
-    Mirrors _validate_incr_full_equivalence from test_incr_full_equivalence.py.
-    Keys by (file, name) pairs; units present in one index but not the other
-    are reported.  For shared units, sorted(calls) and sorted(called_by) must
-    match.
-    """
-    def _key(u: dict) -> tuple:
-        return (u.get("file", ""), u.get("name", ""))
-
-    incr_by_key = {_key(u): u for u in meta_incr["units"]}
-    full_by_key = {_key(u): u for u in meta_full["units"]}
-    problems: list[str] = []
-
-    only_incr = set(incr_by_key) - set(full_by_key)
-    only_full = set(full_by_key) - set(incr_by_key)
-    if only_incr:
-        problems.append(f"Units only in incremental: {sorted(str(k) for k in only_incr)}")
-    if only_full:
-        problems.append(f"Units only in --full:      {sorted(str(k) for k in only_full)}")
-
-    for k in set(incr_by_key) & set(full_by_key):
-        u_i = incr_by_key[k]
-        u_f = full_by_key[k]
-        i_calls = sorted(u_i.get("calls") or [])
-        f_calls = sorted(u_f.get("calls") or [])
-        i_cb = sorted(u_i.get("called_by") or [])
-        f_cb = sorted(u_f.get("called_by") or [])
-        if i_calls != f_calls:
-            problems.append(
-                f"{k}.calls: incremental={i_calls!r} != full={f_calls!r}"
-            )
-        if i_cb != f_cb:
-            problems.append(
-                f"{k}.called_by: incremental={i_cb!r} != full={f_cb!r}"
-            )
-
-    return problems
 
 
 # ===========================================================================
@@ -224,7 +158,7 @@ class TestJavaIncrQualifiedCallerInCalledBy:
         for proj in (project_incr, project_full):
             _build_java_repo(proj)
 
-        fake_model = _make_fake_model()
+        fake_model = make_fake_model()
 
         # ------------------------------------------------------------------
         # Step 1: Cold index on project_incr (creates the prior snapshot)
@@ -237,8 +171,8 @@ class TestJavaIncrQualifiedCallerInCalledBy:
 
         # Sanity: cold index must have indexed ClassB.methodB with ClassA.methodA
         # as a caller (the cold path does a full parse, same as --full).
-        meta_cold = _read_metadata(project_incr)
-        cold_method_b_units = _units_by_name(meta_cold, "methodB")
+        meta_cold = read_semantic_metadata(project_incr)
+        cold_method_b_units = find_units_by_name(meta_cold, "methodB")
         assert cold_method_b_units, (
             "methodB not found in cold index — Java tree-sitter parsing may be "
             "unavailable or the fixture Java source is not parseable."
@@ -281,8 +215,8 @@ class TestJavaIncrQualifiedCallerInCalledBy:
                 full=True,
             )
 
-        meta_incr = _read_metadata(project_incr)
-        meta_full = _read_metadata(project_full)
+        meta_incr = read_semantic_metadata(project_incr)
+        meta_full = read_semantic_metadata(project_full)
 
         # ------------------------------------------------------------------
         # Step 5: FOCUSED assertion — the qualified caller must be present
@@ -294,8 +228,8 @@ class TestJavaIncrQualifiedCallerInCalledBy:
         # The assertion below fails on HEAD because 'ClassA.methodA' is absent
         # from the incremental result.  After Option C it will pass.
         # ------------------------------------------------------------------
-        incr_method_b_units = _units_by_name(meta_incr, "methodB")
-        full_method_b_units = _units_by_name(meta_full, "methodB")
+        incr_method_b_units = find_units_by_name(meta_incr, "methodB")
+        full_method_b_units = find_units_by_name(meta_full, "methodB")
 
         assert incr_method_b_units, (
             "methodB not found in incremental metadata — index may have failed."
@@ -338,7 +272,7 @@ class TestJavaIncrQualifiedCallerInCalledBy:
         # Step 6: Full equivalence across ALL units (belt-and-suspenders).
         # Incremental and --full must agree on every unit's calls and called_by.
         # ------------------------------------------------------------------
-        all_problems = _validate_incr_full_equivalence(meta_incr, meta_full)
+        all_problems = validate_incr_full_equivalence(meta_incr, meta_full)
         assert not all_problems, (
             f"Incremental call-graph diverges from --full rebuild "
             f"({len(all_problems)} problem(s)) after adding Probe.java "
