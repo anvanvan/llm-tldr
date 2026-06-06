@@ -19,6 +19,12 @@ from typing import TYPE_CHECKING, Sequence
 if TYPE_CHECKING:
     from pathspec import PathSpec
 
+# Strong VCS/build markers identifying a real project root. Used to BOUND the
+# ancestor walk in ensure_tldrignore so it never looks above the project root
+# (kept local to avoid importing the heavy tldr.semantic module). Mirrors
+# tldr.semantic.PROJECT_ROOT_MARKERS.
+_STRONG_ROOT_MARKERS = (".git", "pyproject.toml", "package.json", "Cargo.toml", "go.mod")
+
 # Default .tldrignore template
 DEFAULT_TEMPLATE = """\
 # TLDR ignore patterns (gitignore syntax)
@@ -350,6 +356,37 @@ def ensure_tldrignore(project_dir: str | Path) -> tuple[bool, str]:
 
     if tldrignore_path.exists():
         return False, f".tldrignore already exists at {tldrignore_path}"
+
+    # Defense-in-depth: never scatter a NESTED .tldrignore when project_dir sits
+    # below a real project root that already owns one. Guards against a
+    # misresolved root (e.g. a stray .tldr cache in a subdir) dropping boilerplate
+    # ignore files down the tree.
+    #
+    # Strictly BOUNDED to within the project: we first locate the nearest strong
+    # (VCS/build) root at-or-above project_dir, then only consult ancestors up to
+    # that root. This avoids false positives from unrelated .tldrignore files in
+    # shared parents like /tmp or $HOME — if there is no strong root above
+    # project_dir, project_dir IS its own root and we create here.
+    resolved = project_path.resolve()
+    strong_root = next(
+        (
+            cand
+            for cand in (resolved, *resolved.parents)
+            if any((cand / m).exists() for m in _STRONG_ROOT_MARKERS)
+        ),
+        None,
+    )
+    if strong_root is not None and strong_root != resolved:
+        ancestor = resolved.parent
+        while True:
+            if (ancestor / ".tldrignore").exists():
+                return False, (
+                    f".tldrignore already exists at ancestor {ancestor / '.tldrignore'}; "
+                    f"not creating a nested one at {tldrignore_path}"
+                )
+            if ancestor == strong_root:
+                break
+            ancestor = ancestor.parent
 
     # Create with default template
     tldrignore_path.write_text(DEFAULT_TEMPLATE)

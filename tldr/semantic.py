@@ -224,7 +224,14 @@ SUPPORTED_MODELS = {
 DEFAULT_MODEL = "bge-large-en-v1.5"
 
 # Project root markers - files that indicate a project root
-PROJECT_ROOT_MARKERS = [".git", "pyproject.toml", "package.json", "Cargo.toml", "go.mod", ".tldr"]
+# Strong VCS/build markers that authoritatively identify a project root.
+PROJECT_ROOT_MARKERS = [".git", "pyproject.toml", "package.json", "Cargo.toml", "go.mod"]
+# Weak fallback marker: an existing .tldr cache dir identifies a previously
+# indexed root, but ONLY when no strong marker exists anywhere up the tree. It
+# must never shadow a real project root above it — otherwise a stray .tldr cache
+# left in a subdir (e.g. by a subdir-scoped `tldr ... --path sub` query) would
+# capture root detection, fragmenting the index and scattering .tldrignore files.
+TLDR_CACHE_MARKER = ".tldr"
 
 
 def _resolve_default_device() -> str:
@@ -280,16 +287,29 @@ def _find_project_root(start_path: Path) -> Path:
         if env_path.exists():
             return env_path
 
-    # Walk up looking for project markers
-    current = start_path.resolve()
+    start = start_path.resolve()
+
+    # Pass 1: strong VCS/build markers take precedence — the closest ancestor
+    # with one wins. A full upward pass here means a stray .tldr cache in a
+    # subdir can never shadow the real repo/build root above it.
+    current = start
     while current != current.parent:
         for marker in PROJECT_ROOT_MARKERS:
             if (current / marker).exists():
                 return current
         current = current.parent
 
-    # No markers found - use start_path
-    return start_path.resolve()
+    # Pass 2: no strong marker anywhere up the tree — fall back to the closest
+    # previously-indexed dir (.tldr cache), so a standalone non-VCS project still
+    # reuses its existing cache root instead of fragmenting per subdir.
+    current = start
+    while current != current.parent:
+        if (current / TLDR_CACHE_MARKER).exists():
+            return current
+        current = current.parent
+
+    # Nothing found - use start_path
+    return start
 
 
 @dataclass
