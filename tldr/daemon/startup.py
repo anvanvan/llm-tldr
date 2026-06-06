@@ -27,6 +27,8 @@ else:
 if TYPE_CHECKING:
     from .core import TLDRDaemon
 
+from tldr.model_server.transport import send_message, recv_message
+
 logger = logging.getLogger(__name__)
 
 
@@ -429,9 +431,8 @@ def query_daemon(project_path: str | Path, command: dict) -> dict:
 
     client = _create_client_socket(daemon)
     try:
-        client.sendall(json.dumps(command).encode() + b"\n")
-        response = client.recv(65536)
-        return json.loads(response.decode())
+        send_message(client, command)
+        return recv_message(client)
     finally:
         client.close()
 

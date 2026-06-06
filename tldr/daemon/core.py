@@ -13,6 +13,7 @@ import signal
 import socket
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 from typing import Any, Optional
@@ -43,8 +44,8 @@ from .cached_queries import (
     cached_tree,
 )
 
-# Idle timeout: 30 minutes
-IDLE_TIMEOUT = 30 * 60
+# Idle timeout: 1 hour (rolling — reset on every handled command)
+IDLE_TIMEOUT = 60 * 60
 
 logger = logging.getLogger(__name__)
 
@@ -57,16 +58,20 @@ class TLDRDaemon:
     Automatically shuts down after IDLE_TIMEOUT seconds of inactivity.
     """
 
-    def __init__(self, project_path: Path):
+    def __init__(self, project_path: Path, idle_timeout: int | None = None):
         """
         Initialize the daemon for a project.
 
         Args:
             project_path: Root path of the project to index
+            idle_timeout: Optional per-instance idle timeout (seconds). Defaults
+                to the module-level IDLE_TIMEOUT. Injectable so tests can verify
+                idle behaviour without sleeping real time.
         """
         self.project = project_path
         self.tldr_dir = project_path / ".tldr"
         self.socket_path = self._compute_socket_path()
+        self.idle_timeout = IDLE_TIMEOUT if idle_timeout is None else idle_timeout
         self.last_query = time.time()
         self.indexes: dict[str, Any] = {}
 
@@ -169,8 +174,35 @@ class TLDRDaemon:
             return (str(self.socket_path), None)
 
     def is_idle(self) -> bool:
-        """Check if daemon has been idle longer than IDLE_TIMEOUT."""
-        return (time.time() - self.last_query) > IDLE_TIMEOUT
+        """Check if daemon has been idle longer than its idle timeout.
+
+        The deadline is rolling: ``last_query`` is reset on every handled
+        command, so an actively-used daemon never reports idle.
+        """
+        return (time.time() - self.last_query) > self.idle_timeout
+
+    def _post_startup_init(self) -> None:
+        """Background warm + semantic-index after the daemon is ready.
+
+        Single-flight: skips entirely when a reindex is already in progress
+        (e.g. a user search raced ahead and triggered one first).
+        """
+        if self._reindex_in_progress:
+            return
+        # Mirror _trigger_background_reindex: claim the single-flight flag so a
+        # concurrent notify-driven reindex cannot run alongside the startup index.
+        self._reindex_in_progress = True
+        try:
+            try:
+                self._handle_warm({})
+            except Exception:
+                logger.exception("post-startup warm failed")
+            try:
+                self._handle_semantic({"action": "index"})
+            except Exception:
+                logger.exception("post-startup semantic index failed")
+        finally:
+            self._reindex_in_progress = False
 
     @property
     def call_graph(self) -> dict:
@@ -639,10 +671,18 @@ class TLDRDaemon:
 
         try:
             from tldr.semantic import build_semantic_index, semantic_search
+            from tldr.embedding_backend import get_server_backed_default
+
+            # The daemon delegates embedding to the shared model server (force=True)
+            # when possible, falling back silently to in-process if the server
+            # cannot be started or reached.
+            backend = get_server_backed_default(force=True)
 
             if action == "index":
                 language = command.get("language", "all")
-                count = build_semantic_index(str(self.project), lang=language)
+                count = build_semantic_index(
+                    str(self.project), lang=language, backend=backend
+                )
                 return {"status": "ok", "indexed": count}
 
             elif action == "search":
@@ -650,7 +690,11 @@ class TLDRDaemon:
                 if not query:
                     return {"status": "error", "message": "Missing required parameter: query"}
                 k = command.get("k", 10)
-                results = semantic_search(str(self.project), query, k=k)
+                expand = command.get("expand", False)
+                results = semantic_search(
+                    str(self.project), query, k=k, backend=backend,
+                    expand_graph=expand,
+                )
                 return {"status": "ok", "results": results}
 
             else:
@@ -913,11 +957,16 @@ class TLDRDaemon:
                 # else OMIT it so the indexer falls back to the Step-A hash floor.
                 if dirty_files_path is not None and epoch_continuous:
                     cmd += ["--dirty-files", dirty_files_path]
+                # Delegate embedding to the shared model server: the reindex
+                # subprocess is a fresh `python -m tldr.cli semantic index`, so it
+                # must opt into server delegation explicitly (the in-daemon path
+                # uses force=True; a subprocess inherits this flag instead).
                 result = subprocess.run(
                     cmd,
                     capture_output=True,
                     text=True,
                     timeout=600,  # 10 min max
+                    env={**os.environ, "TLDR_USE_MODEL_SERVER": "1"},
                 )
 
                 if result.returncode == 0:
@@ -1413,6 +1462,12 @@ class TLDRDaemon:
         try:
             self._create_socket()
             self.write_status("ready")
+
+            # Fire background warm + semantic-index after the socket is ready.
+            # Non-blocking and single-flight (guarded inside _post_startup_init).
+            threading.Thread(
+                target=self._post_startup_init, daemon=True
+            ).start()
 
             logger.info(f"TLDR daemon started for {self.project}")
 

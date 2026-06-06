@@ -30,6 +30,19 @@ if os.name == 'nt':
         pass
 
 from . import __version__
+# Daemon ensure-up: daemon-backed subcommands ensure the per-project daemon (and
+# shared model server) are running, then route through the daemon instead of
+# loading the embedding model in-process.
+from .daemon.ensure import ensure_daemon
+
+# Subcommands that are served by the long-lived daemon. For these we call
+# ensure_daemon(project) before dispatch so the in-memory index server handles
+# the request (no per-invocation cold start, no in-process model load).
+DAEMON_ROUTED_COMMANDS = {
+    "search", "context", "extract", "semantic", "warm", "impact", "dead",
+    "arch", "calls", "imports", "importers", "structure", "tree",
+    "diagnostics", "change_impact",
+}
 # Dual-gate idiom: api.py uses self.language=='rust' (RelevantContext owns language);
 # cli.py uses .endswith('.rs') (edge tuples have no language object).
 from .api import SUPPORTED_CONTEXT_LANGUAGES, _serialize_call_graph_to_cache, _rust_display_name
@@ -534,6 +547,12 @@ Semantic Search:
     # tldr semantic search <query>
     search_p = semantic_sub.add_parser("search", help="Search semantically")
     search_p.add_argument("query", help="Natural language query")
+    # Optional positional project root (in addition to --path) so
+    # `tldr semantic search "query" /path` works like other subcommands.
+    search_p.add_argument(
+        "path_pos", nargs="?", default=None,
+        help="Project root (positional; overrides --path)",
+    )
     search_p.add_argument("--path", default=".", help="Project root")
     search_p.add_argument("--k", type=int, default=5, help="Number of results")
     search_p.add_argument("--expand", action="store_true", help="Include call graph expansion")
@@ -597,6 +616,58 @@ Semantic Search:
     )
 
     args = parser.parse_args()
+
+    # `semantic search` accepts an optional positional project root that, when
+    # provided, overrides the --path option.
+    if getattr(args, "path_pos", None):
+        args.path = args.path_pos
+
+    def _routed_project(parsed) -> str | None:
+        """Resolve the project root for a daemon-routed subcommand."""
+        for attr in ("project", "path"):
+            val = getattr(parsed, attr, None)
+            if val:
+                p = Path(val)
+                return str((p.parent if p.is_file() else p).resolve())
+        file_val = getattr(parsed, "file", None)
+        if file_val:
+            return str(Path(file_val).resolve().parent)
+        return str(Path(".").resolve())
+
+    # Daemon ensure-up: for daemon-backed subcommands, make sure the per-project
+    # daemon is running before dispatch. Failures here are non-fatal — dispatch
+    # falls through to the existing in-process path.
+    if getattr(args, "command", None) in DAEMON_ROUTED_COMMANDS:
+        _routed_proj = _routed_project(args)
+        if _routed_proj is not None:
+            try:
+                ensure_daemon(_routed_proj)
+            except Exception:
+                pass
+
+            # 'semantic search' is embedding-backed: route it through the daemon
+            # so the model is loaded only in the daemon/server, never in this CLI
+            # process. ('semantic index' is also delegated when the daemon's reindex
+            # subprocess sets TLDR_USE_MODEL_SERVER=1, but stays in-process for
+            # standalone `tldr semantic index` invocations.)
+            if args.command == "semantic" and getattr(args, "action", None) == "search":
+                try:
+                    from .daemon.startup import query_daemon
+                    result = query_daemon(
+                        _routed_proj,
+                        {
+                            "cmd": "semantic",
+                            "action": "search",
+                            "query": getattr(args, "query", ""),
+                            "k": getattr(args, "k", 10),
+                            "expand": getattr(args, "expand", False),
+                        },
+                    )
+                    print(json.dumps(result.get("results", result), indent=2))
+                    return
+                except Exception:
+                    # Fall through to the in-process path on any routing failure.
+                    pass
 
     # Import here to avoid slow startup for --help
     from .api import (
@@ -1174,6 +1245,13 @@ Semantic Search:
 
         elif args.command == "semantic":
             from .semantic import build_semantic_index, semantic_search
+            from .embedding_backend import get_server_backed_default
+
+            # Server delegation is opt-in here (env-gated by TLDR_USE_MODEL_SERVER):
+            # the daemon's reindex subprocess sets it so this embeds via the shared
+            # model server; a standalone `tldr semantic …` stays in-process by
+            # default. Falls back silently to in-process if the server is down.
+            _semantic_backend = get_server_backed_default()
 
             if args.action == "index":
                 respect_ignore = not getattr(args, 'no_ignore', False)
@@ -1206,6 +1284,7 @@ Semantic Search:
                     lang=lang, model=args.model,
                     respect_ignore=respect_ignore, device=device,
                     full=getattr(args, "full", False),
+                    backend=_semantic_backend,
                 )
                 if changed_files is not None:
                     index_kwargs["dirty_files"] = changed_files
@@ -1224,6 +1303,7 @@ Semantic Search:
                     model=args.model,
                     language=lang,
                     device=device,
+                    backend=_semantic_backend,
                 )
                 print(json.dumps(results, indent=2))
 

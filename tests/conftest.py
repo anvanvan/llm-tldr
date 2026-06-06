@@ -129,6 +129,25 @@ def pytest_configure(config):
         "markers",
         "e2e: end-to-end tests using the real embedding model (opt-in via --run-e2e).",
     )
+    # Keep pytest's tmp_path short. On macOS the default basetemp lives under
+    # /private/var/folders/<...>/pytest-of-<user>/pytest-N/<test-name>/ which,
+    # combined with a socket filename, exceeds the AF_UNIX sun_path limit
+    # (~104 bytes) and makes socket.bind() in the model-server / embedding-backend
+    # tests fail with "AF_UNIX path too long". Relocating basetemp to a short
+    # path under the system temp dir only moves temp files — no test behaviour
+    # changes — and lets those Unix-socket tests bind successfully.
+    if config.option.basetemp is None:
+        import os
+        import tempfile
+
+        # Prefer the genuinely short "/tmp" over macOS's long
+        # /private/var/folders/<...>/T base (already ~48 bytes, which alone
+        # blows the AF_UNIX budget once a pytest test-name dir + socket name
+        # are appended). Fall back to the system temp dir if /tmp is unusable.
+        candidate = "/tmp" if os.path.isdir("/tmp") and os.access("/tmp", os.W_OK) else tempfile.gettempdir()
+        short_base = os.path.join(candidate, f"tldr-pt-{os.getuid() if hasattr(os, 'getuid') else os.getpid()}")
+        os.makedirs(short_base, exist_ok=True)
+        config.option.basetemp = short_base
 
 
 def pytest_collection_modifyitems(config, items):

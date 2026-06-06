@@ -832,7 +832,7 @@ class TestSearchDeviceSymmetry:
             # Spy on compute_embedding to capture the device used
             captured_device = {}
 
-            def spy_compute_embedding(text, model_name=None, *, device=None):
+            def spy_compute_embedding(text, model_name=None, *, device=None, backend=None):
                 captured_device["device"] = device
                 return np.ones(_DIM, dtype=np.float32)
 

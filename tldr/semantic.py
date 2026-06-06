@@ -718,7 +718,13 @@ def build_embedding_text(unit: EmbeddingUnit) -> str:
     return "\n".join(parts)
 
 
-def compute_embedding(text: str, model_name: Optional[str] = None, *, device: Optional[str] = None):
+def compute_embedding(
+    text: str,
+    model_name: Optional[str] = None,
+    *,
+    device: Optional[str] = None,
+    backend=None,
+):
     """Compute embedding vector for text.
 
     Args:
@@ -726,17 +732,40 @@ def compute_embedding(text: str, model_name: Optional[str] = None, *, device: Op
         model_name: Model to use (from SUPPORTED_MODELS or HF name).
         device: Compute device ('cpu' or 'metal'). If None, get_model
             falls back to TLDR_DEVICE env or auto-pick.
+        backend: Optional EmbeddingBackend. When provided, embedding is
+            delegated to ``backend.encode([text])`` (e.g. a shared model
+            server). When None, the existing in-process get_model() path is
+            used, which always returns an L2-normalized vector.
+            Note: when a backend is supplied, L2-normalization is the
+            BACKEND's responsibility (ServerClientBackend's server normalizes
+            via normalize_embeddings=True; InProcessBackend passes
+            normalize_embeddings=True).
 
     Returns:
         numpy array with L2-normalized embedding.
     """
     import numpy as np
 
+    if backend is not None:
+        vecs = np.asarray(backend.encode([text]), dtype=np.float32)
+        # Mirror the in-process contract: a single 1-D L2-normalized vector.
+        embedding = vecs[0] if vecs.ndim == 2 else vecs
+        return embedding  # already float32 from np.asarray above
+
     model = get_model(model_name, device=device)
 
     # BGE models work best with instruction prefix for queries
     # For document embedding, we use text directly
-    embedding = model.encode(text, normalize_embeddings=True)
+    embedding = np.array(
+        model.encode(text, normalize_embeddings=True), dtype=np.float32
+    )
+
+    # Defensively L2-normalize: the in-process model already normalizes, but
+    # this guarantees the documented contract regardless of model behaviour.
+    flat = embedding.reshape(-1)
+    norm = float(np.linalg.norm(flat))
+    if norm > 0:
+        embedding = embedding / norm
 
     return np.array(embedding, dtype=np.float32)
 
@@ -2738,6 +2767,7 @@ def build_semantic_index(
     # epoch-discontinuous, the self-validating hash floor derives the dirty set
     # from file stat + content hashes, enabling incremental indexing on manual paths.
     dirty_files: Optional[Iterable[str]] = None,
+    backend=None,
 ) -> int:
     """Build and save FAISS index + metadata for a project.
 
@@ -2774,6 +2804,10 @@ def build_semantic_index(
                 The L1 text_hash gate still decides re-embedding, so a stale hint
                 can never corrupt the index — only over- or under-skip parsing, both
                 self-correcting on the next full rebuild.
+        backend: Optional EmbeddingBackend. When provided, encoding is delegated
+                to the backend (e.g. a shared model server via ServerClientBackend).
+                When None, the existing in-process get_model() path is used, which
+                always returns L2-normalized embeddings.
 
     Returns:
         Number of indexed units.
@@ -2967,7 +3001,33 @@ def build_semantic_index(
             return np.empty((0, state.old_dimension), dtype=np.float32)
         enc_texts = [build_embedding_text(u) for u in units_to_encode]
         n = len(enc_texts)
-        model_obj = get_model(model, device=device)
+
+        # Encoding seam: when an EmbeddingBackend is injected, route encoding
+        # through it (e.g. a shared model server). The backend is responsible for
+        # L2-normalization (per EmbeddingBackend.encode contract); we don't apply
+        # defensive normalization here to match the protocol contract.
+        # When None, use the existing in-process model path (get_model().encode(...))
+        # with normalize_embeddings=True for L2-normalization.
+        if backend is not None:
+            def _encode_chunk(chunk_texts):
+                return np.array(
+                    backend.encode(chunk_texts, batch_size=BATCH_SIZE),
+                    dtype=np.float32,
+                )
+        else:
+            model_obj = get_model(model, device=device)
+
+            def _encode_chunk(chunk_texts):
+                return np.array(
+                    model_obj.encode(
+                        chunk_texts,
+                        batch_size=BATCH_SIZE,
+                        normalize_embeddings=True,
+                        show_progress_bar=False,
+                    ),
+                    dtype=np.float32,
+                )
+
         if console:
             from rich.progress import (
                 BarColumn,
@@ -2997,19 +3057,12 @@ def build_semantic_index(
                         task,
                         description=f"[bold green]Embedding {short_path}::{current_unit.name}",
                     )
-                    result = model_obj.encode(
-                        enc_texts[i:chunk_end],
-                        batch_size=BATCH_SIZE,
-                        normalize_embeddings=True,
-                        show_progress_bar=False,
-                    )
-                    chunks.extend(np.array(result, dtype=np.float32))
+                    result = _encode_chunk(enc_texts[i:chunk_end])
+                    chunks.extend(result)  # result is already np.float32
                     progress.update(task, completed=chunk_end)
                 return np.vstack(chunks)
-        result = model_obj.encode(
-            enc_texts, batch_size=BATCH_SIZE, normalize_embeddings=True
-        )
-        return np.array(result, dtype=np.float32)
+        result = _encode_chunk(enc_texts)
+        return result  # already np.float32 from _encode_chunk
 
     fresh = _encode_units(plan.encode_units)
 
@@ -3097,6 +3150,7 @@ def semantic_search(
     language: Optional[str] = None,
     *,
     device: Optional[str] = None,
+    backend=None,
 ) -> List[dict]:
     """Search for code units semantically.
 
@@ -3111,6 +3165,10 @@ def semantic_search(
         device: Compute device ('cpu' or 'metal'). If None, honours TLDR_DEVICE,
                 then falls back to the platform default ('metal' on Apple Silicon,
                 'cpu' otherwise).
+        backend: Optional EmbeddingBackend. When provided, query embedding is
+                delegated to the backend (e.g. a shared model server via
+                ServerClientBackend). When None, the existing in-process
+                get_model() path is used for embedding.
 
     Returns:
         List of result dictionaries with name, file, line, score, etc.
@@ -3181,9 +3239,13 @@ def semantic_search(
     if model is None and index_model:
         model = index_model
 
-    # Embed query (with instruction prefix for BGE)
+    # Embed query (with instruction prefix for BGE). When a backend is provided
+    # (e.g. a shared-model-server client from the daemon), the query embedding is
+    # delegated to it; otherwise compute_embedding loads the model in-process.
     query_text = f"Represent this code search query: {query}"
-    query_embedding = compute_embedding(query_text, model_name=model, device=device)
+    query_embedding = compute_embedding(
+        query_text, model_name=model, device=device, backend=backend
+    )
     query_embedding = query_embedding.reshape(1, -1)
 
     # Search -- request more results when filtering (by language and/or path),
