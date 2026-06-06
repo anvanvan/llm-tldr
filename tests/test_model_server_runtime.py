@@ -53,6 +53,64 @@ def test_encode_resets_socket_timeout_for_slow_embed(monkeypatch):
     )
 
 
+def test_maybe_unload_invokes_unloader_to_free_real_model():
+    """maybe_unload must call the model_unloader so the cached model is actually
+    freed (dropping the lifecycle's own reference alone does not reclaim memory:
+    tldr.semantic.get_model caches the model in a module-level global)."""
+    from tldr.model_server.lifecycle import ModelServerLifecycle
+
+    unload_calls = []
+    lc = ModelServerLifecycle(
+        idle_seconds=0,  # deadline already elapsed → eligible to unload
+        model_factory=lambda: object(),
+        model_unloader=lambda: unload_calls.append(True),
+    )
+    lc.get_model()  # load
+    assert lc.is_loaded
+    unloaded = lc.maybe_unload()
+    assert unloaded is True
+    assert not lc.is_loaded
+    assert unload_calls == [True], "maybe_unload must invoke the model_unloader"
+
+
+def test_maybe_unload_returns_false_when_unloader_raises_but_still_drops_ref():
+    """A failing unloader must NOT propagate out of the idle accept-loop tick, but
+    maybe_unload should report the incomplete device-memory reclaim by returning
+    False. The lifecycle reference is still dropped so the model reloads lazily."""
+    from tldr.model_server.lifecycle import ModelServerLifecycle
+
+    def boom():
+        raise RuntimeError("device free failed")
+
+    lc = ModelServerLifecycle(
+        idle_seconds=0,  # deadline already elapsed → eligible to unload
+        model_factory=lambda: object(),
+        model_unloader=boom,
+    )
+    lc.get_model()  # load
+    assert lc.is_loaded
+    # Must not raise even though the unloader does.
+    unloaded = lc.maybe_unload()
+    assert unloaded is False, "a failing unloader must report False (incomplete reclaim)"
+    assert not lc.is_loaded, "the lifecycle reference must still be dropped on unloader failure"
+
+
+def test_semantic_unload_model_clears_module_cache():
+    """semantic.unload_model() drops the module-level model cache so the ~1 GB is
+    released (next get_model reloads). This is what the server's idle-unload needs."""
+    import tldr.semantic as sem
+
+    sentinel = object()
+    sem._model = sentinel
+    sem._model_name = "fake/model"
+    sem._model_device = "metal"
+    was_loaded = sem.unload_model()
+    assert was_loaded is True
+    assert sem._model is None and sem._model_name is None and sem._model_device is None
+    # idempotent: a second call reports nothing was loaded
+    assert sem.unload_model() is False
+
+
 def test_run_calls_maybe_unload_on_idle_tick(monkeypatch):
     """ModelServer.run()'s accept-timeout branch must call lifecycle.maybe_unload."""
     server = ModelServer(socket_path="/tmp/does-not-matter.sock")

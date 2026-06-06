@@ -566,6 +566,41 @@ def get_model(model_name: Optional[str] = None, *, device: Optional[str] = None)
     return _model
 
 
+def unload_model() -> bool:
+    """Drop the cached embedding model and free its device memory.
+
+    ``get_model`` memoizes the model in module-level globals, so simply dropping
+    an external reference does NOT free the ~1 GB of weights — this clears the
+    cache here and releases the GPU/MPS allocator so the shared model server's
+    idle auto-unload actually reclaims memory. The next ``get_model`` reloads
+    lazily. Returns True if a model was loaded (and is now released), else False.
+    """
+    global _model, _model_name, _model_device
+    was_loaded = _model is not None
+
+    # Idempotent: skip expensive cleanup if model already unloaded
+    if not was_loaded:
+        return False
+
+    _model = None
+    _model_name = None
+    _model_device = None
+    # Best-effort device-memory reclamation; never raise from an unload.
+    import gc
+
+    gc.collect()
+    try:
+        import torch
+
+        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            torch.mps.empty_cache()
+        elif torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+    return was_loaded
+
+
 class _MLXEmbedder:
     """Wrapper around mlx-embeddings that mimics SentenceTransformer.encode()."""
 
