@@ -248,7 +248,7 @@ class TestIncrementalEqualsFullCorrectness:
 
         # Identical initial state in both
         for proj in (project_incr, project_full):
-            (proj / ".git").mkdir()
+            (proj / ".git").mkdir(exist_ok=True)
             (proj / "file_a.py").write_text(_PY_FILE_A)
             (proj / "file_b.py").write_text(_PY_FILE_B)
 
@@ -794,7 +794,7 @@ class TestSearchDeviceSymmetry:
         # Build a minimal real index so semantic_search can load it
         with tempfile.TemporaryDirectory() as tmp:
             project_root = Path(tmp)
-            (project_root / ".git").mkdir()
+            (project_root / ".git").mkdir(exist_ok=True)
             cache_dir = project_root / ".tldr" / "cache" / "semantic"
             cache_dir.mkdir(parents=True)
 
@@ -910,14 +910,14 @@ class TestDaemonDirtyFilesPlumbing:
         # Project with --dirty-files
         project_with = tmp_path / "with_dirty"
         project_with.mkdir()
-        (project_with / ".git").mkdir()
+        (project_with / ".git").mkdir(exist_ok=True)
         (project_with / "file_a.py").write_text(_PY_FILE_A)
         (project_with / "file_b.py").write_text(_PY_FILE_B)
 
         # Project without --dirty-files
         project_without = tmp_path / "without_dirty"
         project_without.mkdir()
-        (project_without / ".git").mkdir()
+        (project_without / ".git").mkdir(exist_ok=True)
         (project_without / "file_a.py").write_text(_PY_FILE_A)
         (project_without / "file_b.py").write_text(_PY_FILE_B)
 
