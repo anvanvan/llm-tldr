@@ -45,7 +45,11 @@ try:
 except ImportError:
     SentenceTransformer = None
 
-ALL_LANGUAGES = ["python", "typescript", "javascript", "go", "rust", "java", "c", "cpp", "ruby", "php", "kotlin", "swift", "csharp", "scala", "lua", "luau", "elixir"]
+from tldr.lang_constants import (  # re-exported for backward compatibility
+    ALL_LANGUAGES,
+    EXTENSION_TO_LANGUAGE,
+    _resolve_device_arg,
+)
 
 from tldr.cross_file_calls import CALL_GRAPH_LANGUAGES  # single source of truth
 from tldr.api import NON_CODE_EXTENSIONS  # single source of truth for non-code suffixes
@@ -99,56 +103,7 @@ _NON_CODE_EXTENSIONLESS_BASENAMES: frozenset[str] = frozenset(
     {"makefile", "dockerfile", "gemfile", "podfile"}
 )
 
-# Extension-to-language map (defined here to avoid circular import with cli.py)
-EXTENSION_TO_LANGUAGE = {
-    '.java': 'java',
-    '.py': 'python',
-    '.ts': 'typescript',
-    '.tsx': 'typescript',
-    '.js': 'javascript',
-    '.jsx': 'javascript',
-    '.go': 'go',
-    '.rs': 'rust',
-    '.c': 'c',
-    '.h': 'c',
-    '.cpp': 'cpp',
-    '.hpp': 'cpp',
-    '.cc': 'cpp',
-    '.cxx': 'cpp',
-    '.hh': 'cpp',
-    '.rb': 'ruby',
-    '.php': 'php',
-    '.swift': 'swift',
-    '.cs': 'csharp',
-    '.kt': 'kotlin',
-    '.kts': 'kotlin',
-    '.scala': 'scala',
-    '.sc': 'scala',
-    '.lua': 'lua',
-    '.luau': 'luau',
-    '.ex': 'elixir',
-    '.exs': 'elixir',
-    '.mjs': 'javascript',
-    '.cjs': 'javascript',
-    '.hxx': 'cpp',
-    # Bug 004 (Gate 3): non-code extensions mapped to stand-in "language" tags
-    # so _detect_project_languages returns a non-empty set for sh-only / doc-only
-    # repos. These tags are NOT in ALL_LANGUAGES and are dispatched separately
-    # (see NON_CODE_LANGUAGE_TAGS below); get_code_structure falls back to its
-    # default code_extensions ({".py"}) and unions in NON_CODE_EXTENSIONS, so the
-    # non-code files are still enumerated and reach _process_file_for_extraction
-    # Gate 2.
-    '.sh': 'shell',
-    '.bash': 'shell',
-    '.zsh': 'shell',
-    '.toml': 'toml',
-    '.yaml': 'yaml',
-    '.yml': 'yaml',
-    '.json': 'json',
-    '.md': 'markdown',
-    '.rst': 'rst',
-    '.txt': 'text',
-}
+# EXTENSION_TO_LANGUAGE is now imported from lang_constants (re-exported above)
 
 # Bug 004 (Gate 3): stand-in "language" tags for non-code files. When a project
 # has only non-code files (or `--lang all` is requested over such a tree),
@@ -246,26 +201,7 @@ def _resolve_default_device() -> str:
     return "metal" if sys.platform == "darwin" else "cpu"
 
 
-def _resolve_device_arg(device: Optional[str]) -> Optional[str]:
-    """Resolve device: explicit arg > TLDR_DEVICE env > None (auto-pick).
-
-    Shared helper used by both ``get_model`` (semantic.py) and ``_resolve_device``
-    (cli.py) so the TLDR_DEVICE lookup lives in exactly one place.
-
-    If TLDR_DEVICE is set to a recognised value ('cpu', 'metal', 'mps'), returns
-    it. Unrecognised values are silently ignored here — the CLI layer
-    (``_resolve_device``) is responsible for user-visible validation and exit.
-    Note the asymmetry: 'mps' is accepted from the env (legacy, predates this
-    refactor) but is NOT an argparse ``--device`` choice, so ``TLDR_DEVICE=mps``
-    works while ``--device mps`` is rejected by the CLI.
-    Returns the device string, or None if no device can be determined.
-    """
-    if device is not None:
-        return device
-    env_device = os.environ.get("TLDR_DEVICE")
-    if env_device in ("cpu", "metal", "mps"):
-        return env_device
-    return None
+# _resolve_device_arg is now imported from lang_constants (re-exported above)
 
 
 def _find_project_root(start_path: Path) -> Path:

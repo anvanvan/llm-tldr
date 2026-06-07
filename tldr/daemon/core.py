@@ -47,6 +47,10 @@ from .cached_queries import (
 # Idle timeout: 1 hour (rolling — reset on every handled command)
 IDLE_TIMEOUT = 60 * 60
 
+# Wire protocol keys for the notify command
+_WIRE_KEY_FILES = "files"      # Batch wire key (new)
+_WIRE_KEY_FILE = "file"        # Legacy single-file wire key
+
 logger = logging.getLogger(__name__)
 
 
@@ -833,31 +837,51 @@ class TLDRDaemon:
         when threshold is reached.
 
         Args:
-            command: Dict with 'file' (path to changed file)
+            command: Dict with 'files' (list of changed paths) or 'file'
+                (single changed path, legacy).
 
         Returns:
-            Response with dirty count and reindex status
+            Response with dirty count, reindex status, and files_received.
         """
-        file_path = command.get("file")
-        if not file_path:
-            return {"status": "error", "message": "Missing required parameter: file"}
+        # Normalize the two accepted wire shapes into a single list of paths.
+        files = command.get(_WIRE_KEY_FILES)
+        if isinstance(files, list) and files:
+            paths = files  # reuse the input list; daemon only reads, never mutates
+        else:
+            single = command.get(_WIRE_KEY_FILE)
+            if single:
+                paths = [single]
+            else:
+                return {
+                    "status": "error",
+                    "message": f"Missing required parameter: {_WIRE_KEY_FILE} or {_WIRE_KEY_FILES}",
+                }
+
+        # Normalize and track all paths regardless of semantic config
+        for file_path in paths:
+            # Track dirty file only if semantic search is enabled
+            is_new = file_path not in self._dirty_files
+            if self._semantic_config.get("enabled", True):
+                if is_new:
+                    self._dirty_files.add(file_path)
+                    self._dirty_count += 1
+                    logger.info(f"Dirty file tracked: {file_path} (count: {self._dirty_count})")
+
+            # Always notify Salsa for cache invalidation — only for newly-tracked files
+            if is_new:
+                self.notify_file_changed(file_path)
 
         # Check if semantic search is enabled
         if not self._semantic_config.get("enabled", True):
-            # Still notify for Salsa cache invalidation
-            self.notify_file_changed(file_path)
-            return {"status": "ok", "semantic_enabled": False}
+            return {
+                "status": "ok",
+                "semantic_enabled": False,
+                "files_received": len(paths),
+            }
 
-        # Track dirty file
-        if file_path not in self._dirty_files:
-            self._dirty_files.add(file_path)
-            self._dirty_count += 1
-            logger.info(f"Dirty file tracked: {file_path} (count: {self._dirty_count})")
-
-        # Notify Salsa for cache invalidation
-        self.notify_file_changed(file_path)
-
-        # Check if we should trigger background re-indexing
+        # Check if we should trigger background re-indexing — once, after the
+        # entire batch, so a batch that crosses the threshold triggers exactly
+        # one reindex.
         threshold = self._semantic_config.get("auto_reindex_threshold", 20)
         should_reindex = (
             self._dirty_count >= threshold
@@ -872,6 +896,7 @@ class TLDRDaemon:
             "dirty_count": self._dirty_count,
             "threshold": threshold,
             "reindex_triggered": should_reindex,
+            "files_received": len(paths),
         }
 
     def _read_index_epoch(self, project: Path) -> int:

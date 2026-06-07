@@ -52,7 +52,7 @@ from .cross_file_calls import (
     RUBY_ORPHAN_SENTINEL,
     is_orphan_sentinel as _is_orphan_sentinel,
 )
-from .semantic import ALL_LANGUAGES, EXTENSION_TO_LANGUAGE, _resolve_device_arg
+from .lang_constants import ALL_LANGUAGES, EXTENSION_TO_LANGUAGE, _resolve_device_arg
 
 
 def _get_subprocess_detach_kwargs():
@@ -599,9 +599,9 @@ Semantic Search:
     daemon_query_p.add_argument("cmd", help="Command to send (e.g., ping, status, search)")
     daemon_query_p.add_argument("--project", "-p", default=".", help="Project path (default: current directory)")
 
-    # tldr daemon notify FILE [--project PATH]
+    # tldr daemon notify FILES [--project PATH] — accepts one or more file paths
     daemon_notify_p = daemon_sub.add_parser("notify", help="Notify daemon of file change (triggers reindex at threshold)")
-    daemon_notify_p.add_argument("file", help="Path to changed file")
+    daemon_notify_p.add_argument("files", nargs="+", help="Paths to changed files")
     daemon_notify_p.add_argument("--project", "-p", default=".", help="Project path (default: current directory)")
 
     # tldr doctor [--install LANG]
@@ -1519,18 +1519,21 @@ Semantic Search:
 
             elif args.action == "notify":
                 try:
-                    file_path = Path(args.file).resolve()
+                    # Deduplicate input paths before resolving to avoid redundant filesystem ops
+                    unique_paths = list(dict.fromkeys(args.files))  # preserves order
+                    file_paths = [str(Path(f).resolve()) for f in unique_paths]
                     result = query_daemon(project_path, {
                         "cmd": "notify",
-                        "file": str(file_path)
+                        "files": file_paths
                     })
                     if result.get("status") == "ok":
-                        dirty = result.get("dirty_count", 0)
+                        dirty_count = result.get("dirty_count", 0)
                         threshold = result.get("threshold", 20)
+                        files_received = result.get("files_received", len(file_paths))
                         if result.get("reindex_triggered"):
-                            print(f"Reindex triggered ({dirty}/{threshold} files)")
+                            print(f"Reindex triggered ({dirty_count}/{threshold} files, sent {files_received} file(s))")
                         else:
-                            print(f"Tracked: {dirty}/{threshold} files")
+                            print(f"Tracked {files_received} file(s): {dirty_count}/{threshold} files")
                     else:
                         print(f"Error: {result.get('message', 'Unknown error')}", file=sys.stderr)
                         sys.exit(1)

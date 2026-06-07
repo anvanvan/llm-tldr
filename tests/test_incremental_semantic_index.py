@@ -88,7 +88,7 @@ def _build_tiny_repo(tmp_path: Path, *, with_git: bool = True) -> Path:
     Returns the project root (tmp_path).
     """
     if with_git:
-        (tmp_path / ".git").mkdir()
+        (tmp_path / ".git").mkdir(exist_ok=True)
     (tmp_path / "file_a.py").write_text(_PY_FILE_A)
     (tmp_path / "file_b.py").write_text(_PY_FILE_B)
     return tmp_path
@@ -96,7 +96,7 @@ def _build_tiny_repo(tmp_path: Path, *, with_git: bool = True) -> Path:
 
 def _build_tiny_repo_three_files(tmp_path: Path) -> Path:
     """Create a repo with three Python files."""
-    (tmp_path / ".git").mkdir()
+    (tmp_path / ".git").mkdir(exist_ok=True)
     (tmp_path / "file_a.py").write_text(_PY_FILE_A)
     (tmp_path / "file_b.py").write_text(_PY_FILE_B)
     (tmp_path / "file_c.py").write_text(_PY_FILE_C)

@@ -32,6 +32,7 @@ from .ast_extractor import (
     ImportInfo,  # Re-exported for API consumers
     extract_file as _extract_file_impl,
 )
+from .lang_constants import LANGUAGE_TO_EXTENSIONS_MAP as _LANGUAGE_TO_EXTENSIONS_MAP
 
 
 _logger = _logging.getLogger(__name__)
@@ -44,25 +45,8 @@ def _rust_display_name(name: str) -> str:
 
 # Authoritative extension map for all supported languages (used by get_module,
 # get_relevant_context, and scan_project_files to avoid duplication).
-_EXT_MAP_ALL_LANGUAGES: dict[str, set[str]] = {
-    "python": {".py"},
-    "typescript": {".ts", ".tsx"},
-    "javascript": {".js", ".jsx", ".mjs", ".cjs"},
-    "go": {".go"},
-    "rust": {".rs"},
-    "php": {".php"},
-    "java": {".java"},
-    "c": {".c", ".h"},
-    "elixir": {".ex", ".exs"},
-    "swift": {".swift"},
-    "ruby": {".rb"},
-    "kotlin": {".kt", ".kts"},
-    "csharp": {".cs"},
-    "lua": {".lua"},
-    "luau": {".luau"},
-    "scala": {".scala", ".sc"},
-    "cpp": {".cpp", ".cc", ".cxx", ".hpp", ".hh", ".hxx"},
-}
+# Derived from lang_constants.EXTENSION_TO_LANGUAGE — single source of truth.
+_EXT_MAP_ALL_LANGUAGES: dict[str, set[str]] = _LANGUAGE_TO_EXTENSIONS_MAP
 
 # Languages supported by get_relevant_context (ext_map used for file scanning).
 # Derived from _EXT_MAP_ALL_LANGUAGES to keep a single source of truth for
