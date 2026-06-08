@@ -37,8 +37,16 @@ def test_model_server_has_runnable_entry_point():
     )
 
 
-def test_default_socket_path_matches_ensure_helper():
-    """The server's default bind path must equal what ensure_server pings."""
+def test_default_socket_path_matches_ensure_helper(monkeypatch):
+    """The server's default bind path must equal what ensure_server pings.
+
+    Compares the env-UNSET defaults: ``default_socket_path()`` is the canonical
+    fallback and ``ensure._model_server_socket_path()`` honors
+    ``TLDR_MODEL_SERVER_SOCKET`` when set. The test suite pins that env var
+    session-wide (conftest isolation), so clear it here to compare the true
+    defaults — that drift is what would break a real, env-unset deployment.
+    """
+    monkeypatch.delenv("TLDR_MODEL_SERVER_SOCKET", raising=False)
     assert default_socket_path() == ensure._model_server_socket_path(), (
         "server.default_socket_path() and ensure._model_server_socket_path() "
         "have drifted — ensure_server would never find the server it spawned."

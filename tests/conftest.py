@@ -1,5 +1,10 @@
 """Shared pytest fixtures for the tldr test suite."""
+import contextlib
 import json
+import os
+import signal
+import tempfile
+import time
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -136,10 +141,18 @@ def pytest_configure(config):
     # tests fail with "AF_UNIX path too long". Relocating basetemp to a short
     # path under the system temp dir only moves temp files — no test behaviour
     # changes — and lets those Unix-socket tests bind successfully.
-    if config.option.basetemp is None:
-        import os
-        import tempfile
+    # Route the whole session off the real per-user model-server socket. Set the
+    # env BEFORE any test runs (ensure.py reads it at call time) so that any test
+    # touching the real ensure_server()/spawn path binds a throwaway socket
+    # instead of the production one. setdefault: respect a deliberate outer
+    # override (and then we never reap it — see pytest_sessionfinish).
+    global _OWNED_MODEL_SERVER_SOCKET
+    if "TLDR_MODEL_SERVER_SOCKET" not in os.environ:
+        sock = _isolated_model_server_socket()
+        os.environ["TLDR_MODEL_SERVER_SOCKET"] = sock
+        _OWNED_MODEL_SERVER_SOCKET = sock
 
+    if config.option.basetemp is None:
         # Prefer the genuinely short "/tmp" over macOS's long
         # /private/var/folders/<...>/T base (already ~48 bytes, which alone
         # blows the AF_UNIX budget once a pytest test-name dir + socket name
@@ -157,3 +170,79 @@ def pytest_collection_modifyitems(config, items):
     for item in items:
         if item.get_closest_marker("e2e"):
             item.add_marker(skip_e2e)
+
+
+# ---------------------------------------------------------------------------
+# Session-wide model-server socket isolation + reap
+# ---------------------------------------------------------------------------
+#
+# The shared embedding model server binds a per-USER canonical Unix socket
+# (tldr/daemon/ensure.py:_model_server_socket_path -> tldr-model-server-<uid>.sock).
+# Several tests exercise the real ensure_server()/spawn path. Without isolation
+# they spawn a real ~1 GB model server on the PRODUCTION per-user socket, and
+# because spawned servers detach into their own session (start_new_session=True),
+# per-test teardown cannot reliably reap them — leaked servers then accumulate
+# across full-suite runs. Pinning TLDR_MODEL_SERVER_SOCKET to a throwaway
+# per-session path for the WHOLE pytest session routes every such spawn off the
+# real socket; the session-finish reaper guarantees nothing survives the run.
+#
+# We only ever touch a socket we created: if the environment already carries a
+# TLDR_MODEL_SERVER_SOCKET (deliberate override / outer runner), we leave it and
+# its server alone.
+
+_OWNED_MODEL_SERVER_SOCKET: "str | None" = None
+
+
+def _isolated_model_server_socket() -> str:
+    """A short, per-session socket path off the real per-user canonical path.
+
+    Kept short (prefer ``/tmp``) so ``socket.bind`` stays within the AF_UNIX
+    ``sun_path`` budget — see the basetemp note in ``pytest_configure``.
+    """
+    candidate = "/tmp" if os.path.isdir("/tmp") and os.access("/tmp", os.W_OK) else tempfile.gettempdir()
+    uid = os.getuid() if hasattr(os, "getuid") else os.getpid()
+    return os.path.join(candidate, f"tldr-test-msrv-{uid}-{os.getpid()}.sock")
+
+
+def _reap_model_server(socket_path: str) -> None:
+    """Best-effort terminate any model server on ``socket_path`` and clean files.
+
+    Mirrors the server's own reap discipline: read ``{socket}.pid`` →
+    SIGTERM → 5s grace → SIGKILL, then unlink the socket, pid sidecar, and lock.
+    Never raises.
+    """
+    pid_path = socket_path + ".pid"
+    pid = None
+    try:
+        pid = int(Path(pid_path).read_text().strip())
+    except (OSError, ValueError):
+        pid = None
+
+    if pid is not None and hasattr(os, "kill"):
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pid = None  # already gone / not ours
+        else:
+            deadline = time.time() + 5.0
+            alive = True
+            while time.time() < deadline:
+                try:
+                    os.kill(pid, 0)
+                except OSError:
+                    alive = False
+                    break
+                time.sleep(0.1)
+            if alive:
+                with contextlib.suppress(OSError):
+                    os.kill(pid, signal.SIGKILL)
+
+    for path in (socket_path, pid_path, socket_path + ".lock"):
+        with contextlib.suppress(OSError):
+            os.unlink(path)
+
+
+def pytest_sessionfinish(session, exitstatus):
+    """Reap any model server this session spawned on its isolated socket."""
+    if _OWNED_MODEL_SERVER_SOCKET:
+        _reap_model_server(_OWNED_MODEL_SERVER_SOCKET)
