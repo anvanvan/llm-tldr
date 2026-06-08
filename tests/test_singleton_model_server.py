@@ -420,20 +420,22 @@ class TestSigtermGracefulShutdown:
 
 
 # ===========================================================================
-# B4 — maybe_unload() called from finally block on ALL exit paths
+# B4 — exit path must NOT run in-process GPU teardown (it wedges Metal)
 # ===========================================================================
 
-class TestMaybeUnloadInFinally:
-    """B4: maybe_unload() must be in the finally block of ModelServer.run().
+class TestNoGpuTeardownOnExit:
+    """run()'s finally must NOT call maybe_unload()/the model unloader.
 
-    RED: current finally block (server.py) only has srv.close() + os.unlink().
+    The model is freed only on the idle-accept tick (server alive, no in-flight
+    GPU work). On a real exit (clean shutdown, SIGTERM/orphan reap, OSError) we
+    must NOT run torch.mps.empty_cache()/model unload: it frees nothing the OS
+    won't reclaim on process death, and worse it can deadlock inside the Apple
+    GPU driver (AGXMetalG16X / IOGPU) when terminated mid-Metal-work — leaving a
+    wedged orphan that pins ~9 GB of MPS memory and resists SIGKILL.
     """
 
-    def test_maybe_unload_called_on_oserror_exit(self, monkeypatch):
-        """maybe_unload() must be called when run() exits via OSError in accept().
-
-        RED: current finally block has no maybe_unload() call.
-        """
+    def test_no_unload_on_oserror_exit(self, monkeypatch):
+        """run() exiting via OSError must NOT call maybe_unload() (no idle tick)."""
         from tldr.model_server.server import ModelServer
 
         maybe_unload_calls: list[bool] = []
@@ -469,20 +471,14 @@ class TestMaybeUnloadInFinally:
 
         server.run()
 
-        assert len(maybe_unload_calls) >= 1, (
-            "maybe_unload() must be called from the finally block of run() "
-            "when the accept loop exits via OSError. "
-            "RED: current finally block has no maybe_unload() call."
+        assert maybe_unload_calls == [], (
+            "run()'s exit path must NOT call maybe_unload(): the OSError exit "
+            "fires no idle tick, so any call would be the (removed) finally-block "
+            f"GPU teardown that wedges Metal. Got {len(maybe_unload_calls)} call(s)."
         )
 
-    def test_maybe_unload_called_on_shutdown_exit(self, monkeypatch):
-        """maybe_unload() must be called from BOTH the idle tick AND the finally block.
-
-        The idle-tick branch already calls maybe_unload(). The finally block does NOT.
-        Post-fix: both call it → total calls >= 2 for a single idle-tick + shutdown.
-
-        RED: current finally has no maybe_unload() → only 1 call total.
-        """
+    def test_idle_tick_unloads_but_finally_does_not(self, monkeypatch):
+        """Only the idle-accept tick calls maybe_unload(); the finally adds no 2nd call."""
         from tldr.model_server.server import ModelServer
 
         maybe_unload_calls: list[bool] = []
@@ -519,20 +515,17 @@ class TestMaybeUnloadInFinally:
 
         server.run()
 
-        # idle-tick calls maybe_unload() (1 call already on current code)
-        # finally block must also call it (2nd call — the new behavior)
-        assert len(maybe_unload_calls) >= 2, (
-            f"maybe_unload() must be called from BOTH the idle tick AND the "
-            f"finally block. Got {len(maybe_unload_calls)} call(s). "
-            "RED: current finally block has no maybe_unload() call."
+        # Exactly ONE call — the idle tick. The finally block must not add another.
+        assert len(maybe_unload_calls) == 1, (
+            f"maybe_unload() must be called ONLY from the idle-accept tick, not "
+            f"from run()'s finally. Got {len(maybe_unload_calls)} call(s)."
         )
 
-    def test_run_source_has_maybe_unload_in_finally_block(self):
-        """ModelServer.run() source must contain maybe_unload() inside the finally block.
+    def test_run_source_has_no_unload_in_finally_block(self):
+        """ModelServer.run()'s finally block must NOT contain maybe_unload()/unloader.
 
-        Structural fast-fail: gives an immediate RED signal.
-
-        RED: current server.py finally block has only srv.close() + os.unlink().
+        Structural guard against re-introducing the Metal-wedging GPU teardown
+        on the exit path.
         """
         import inspect
         from tldr.model_server.server import ModelServer
@@ -541,19 +534,28 @@ class TestMaybeUnloadInFinally:
         lines = src.split("\n")
 
         in_finally = False
-        maybe_unload_in_finally = False
+        finally_indent = None
+        offending: list[str] = []
         for line in lines:
             stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            indent = len(line) - len(line.lstrip())
             if stripped == "finally:":
                 in_finally = True
-            if in_finally and "maybe_unload" in stripped:
-                maybe_unload_in_finally = True
-                break
+                finally_indent = indent
+                continue
+            if in_finally:
+                # Leaving the finally block when indentation returns to/under it.
+                if finally_indent is not None and indent <= finally_indent:
+                    in_finally = False
+                elif "maybe_unload" in stripped or "_model_unloader" in stripped:
+                    offending.append(stripped)
 
-        assert maybe_unload_in_finally, (
-            "ModelServer.run() must call self._lifecycle.maybe_unload() "
-            "inside the finally block. "
-            "RED: current finally block has no maybe_unload() call."
+        assert not offending, (
+            "ModelServer.run()'s finally block must NOT call maybe_unload() or the "
+            "model unloader — in-process GPU teardown on the exit path deadlocks "
+            f"the Metal driver. Offending line(s): {offending}"
         )
 
 
@@ -1007,28 +1009,22 @@ class TestSingletonInvariant:
 
 
 # ===========================================================================
-# B5 — MPS footprint: empty_cache called on maybe_unload via the FINALLY path
+# B5 — MPS footprint: the exit path must NOT clear the cache in-process
 # ===========================================================================
 
 class TestMpsFootprint:
-    """B5: the finally block of run() must trigger empty_cache via maybe_unload().
+    """B5: run()'s exit path must NOT invoke the model unloader / empty_cache.
 
-    B5 = B4 (maybe_unload in finally) + empty_cache invocation.
-    Both halves must be wired together in the NEW code.
-
-    The ModelServerLifecycle.model_unloader hook already works in isolation
-    (existing code). What is NEW is that run()'s finally block calls
-    maybe_unload() at all — that is the missing link.
+    Pair to TestNoGpuTeardownOnExit: the GPU teardown on death is both useless
+    (the OS reclaims the GPU context on process exit) and dangerous (it can
+    deadlock the Metal driver mid-work). Memory is freed only on the idle tick.
     """
 
-    def test_run_finally_triggers_unloader_which_clears_cache(self, monkeypatch):
-        """run()'s finally block must call maybe_unload() → unloader → cache clear.
+    def test_run_finally_does_not_trigger_unloader(self, monkeypatch):
+        """run()'s finally must NOT call maybe_unload()/the unloader on OSError exit.
 
-        Strategy: inject a lifecycle whose maybe_unload() records calls and
-        returns True; assert it is called from the finally block (not just the
-        idle-tick branch) by triggering an OSError exit so no idle tick fires.
-
-        RED: current finally block has no maybe_unload() call.
+        OSError exits the accept loop immediately with no idle tick, so any
+        maybe_unload() call could only come from the (removed) finally teardown.
         """
         from tldr.model_server.server import ModelServer
 
@@ -1037,7 +1033,7 @@ class TestMpsFootprint:
         class FakeLifecycle:
             def maybe_unload(self) -> bool:
                 unloader_calls.append(True)
-                return True  # simulates cache cleared
+                return True
 
             def touch(self) -> None:
                 pass
@@ -1065,34 +1061,24 @@ class TestMpsFootprint:
 
         server.run()
 
-        # OSError exits the accept loop immediately with no idle tick,
-        # so any maybe_unload() call must come from the finally block.
-        assert len(unloader_calls) >= 1, (
-            "run()'s finally block must call maybe_unload() (→ empty_cache) "
-            "on every exit path, including OSError. Got 0 calls. "
-            "RED: current finally has no maybe_unload() — cache never cleared "
-            "on OSError/orphan exit paths."
+        assert unloader_calls == [], (
+            "run()'s exit path must NOT call maybe_unload() (→ empty_cache): "
+            "in-process GPU teardown on death wedges Metal and frees nothing the "
+            f"OS won't reclaim. Got {len(unloader_calls)} call(s)."
         )
 
-    def test_run_oserror_exit_triggers_semantic_unload_via_default_lifecycle(
-        self, monkeypatch
-    ):
-        """run() exit via OSError must invoke semantic.unload_model() through the
-        DEFAULT (non-injected) lifecycle unloader, clearing sem._model.
+    def test_run_oserror_exit_does_not_clear_semantic_model(self, monkeypatch):
+        """run() exit via OSError must NOT clear semantic's module-level model cache.
 
-        This is the full chain: run() finally → maybe_unload() →
-        _default_model_unloader() → semantic.unload_model() → sem._model = None.
-
-        The test uses the DEFAULT lifecycle (no fake unloader injected) so it
-        exercises the real production wiring that must exist after B4 is fixed.
-
-        RED: current run() finally block has no maybe_unload() call → the chain
-        is never triggered on OSError exit → sem._model is NOT cleared.
+        The previous design ran semantic.unload_model() from run()'s finally on
+        every exit; that path is removed (it deadlocked Metal mid-work). A dying
+        process drops its own memory anyway, so the in-process cache need not be
+        cleared — and the exit path must not touch the GPU. sem._model therefore
+        survives a run() exit.
         """
         import tldr.semantic as sem
         from tldr.model_server.server import ModelServer
 
-        # Pre-load a sentinel into semantic's module-level cache
         sentinel = object()
         sem._model = sentinel  # type: ignore[assignment]
         sem._model_name = "fake/model"  # type: ignore[assignment]
@@ -1115,7 +1101,6 @@ class TestMpsFootprint:
                 pass
 
         try:
-            # Use DEFAULT lifecycle — real _default_model_unloader wired in
             server = ModelServer(
                 socket_path="/tmp/b5-chain-test.sock",
                 idle_seconds=0,  # deadline immediately elapsed
@@ -1125,15 +1110,10 @@ class TestMpsFootprint:
 
             server.run()
 
-            # If run()'s finally called maybe_unload() → _default_model_unloader()
-            # → semantic.unload_model(), sem._model is now None.
-            assert sem._model is None, (  # type: ignore[comparison-overlap]
-                "run() exit via OSError must trigger maybe_unload() from the finally "
-                "block → _default_model_unloader() → semantic.unload_model() → "
-                "sem._model = None. "
-                f"sem._model is still {sem._model!r}. "
-                "RED: current finally has no maybe_unload() call → semantic cache "
-                "never cleared on OSError/SIGTERM exit paths."
+            assert sem._model is sentinel, (  # type: ignore[comparison-overlap]
+                "run()'s exit path must NOT run semantic.unload_model(): the GPU "
+                "teardown on death is removed (it wedged Metal). sem._model should "
+                f"survive the run() exit. Got {sem._model!r}."
             )
         finally:
             sem._model = None  # type: ignore[assignment]

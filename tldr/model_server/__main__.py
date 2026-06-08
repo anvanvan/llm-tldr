@@ -79,4 +79,11 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main(sys.argv[1:]))
+    # os._exit (not SystemExit): skip interpreter shutdown so torch / Metal
+    # destructors and atexit handlers never run. In-process GPU teardown can
+    # wedge in the Apple GPU driver (observed: terminated servers stuck in
+    # AGXMetalG16X buffer dealloc, each pinning ~9 GB of MPS memory and not
+    # dying promptly even on SIGKILL). The OS reclaims the entire GPU/unified
+    # context on process death, so a hard exit is both safe and strictly
+    # faster — and it guarantees a reaped orphan actually goes away.
+    os._exit(main(sys.argv[1:]))

@@ -147,10 +147,10 @@ def test_run_calls_maybe_unload_on_idle_tick(monkeypatch):
 
     server.run()
 
-    # maybe_unload fires on the idle accept tick AND once more in run()'s finally
-    # block (idle-unload on every exit path), so an idle tick + shutdown records
-    # exactly two calls.
-    assert calls == [True, True], (
-        "run() must call maybe_unload() on an idle accept timeout and again in "
-        f"its finally block on exit; recorded: {calls}"
+    # maybe_unload fires ONLY on the idle accept tick. run()'s finally block must
+    # NOT call it: in-process GPU teardown on the exit path deadlocks the Metal
+    # driver and frees nothing the OS won't reclaim on process death.
+    assert calls == [True], (
+        "run() must call maybe_unload() on an idle accept timeout and NOT again "
+        f"in its finally block on exit; recorded: {calls}"
     )

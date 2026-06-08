@@ -124,21 +124,18 @@ class ModelServer:
             except FileNotFoundError:
                 pass
             self._remove_pid_sidecar()
-            # Free the model + device memory on EVERY exit path (clean
-            # shutdown, SIGTERM, OSError/orphan), not only the idle-tick
-            # branch. maybe_unload() honors the rolling deadline; the explicit
-            # unloader call below guarantees torch.mps.empty_cache() runs even
-            # when no idle window elapsed so a dying server never strands ~1 GB.
-            try:
-                self._lifecycle.maybe_unload()
-            except Exception:  # noqa: BLE001
-                pass
-            unloader = getattr(self._lifecycle, "_model_unloader", None)
-            if callable(unloader):
-                try:
-                    unloader()
-                except Exception:  # noqa: BLE001
-                    pass
+            # Deliberately DO NOT run torch.mps.empty_cache() / model unload on
+            # the exit path. A dying process has all of its GPU/unified memory
+            # reclaimed by the OS, so an in-process teardown frees nothing extra
+            # — but it can WEDGE: when a server is terminated (e.g. by the orphan
+            # reap) while Metal command buffers are in flight, the unload's GPU
+            # buffer dealloc deadlocks inside the Apple GPU driver
+            # (AGXMetalG16X / IOGPU). Observed in production: reaped servers stuck
+            # in that dealloc, unkillable-promptly, each pinning ~9 GB of MPS
+            # memory — the opposite of the intended cleanup. Idle-time unload
+            # still happens on the accept-timeout tick above (server stays alive,
+            # no in-flight GPU work). On real termination we just exit fast and
+            # let the kernel reclaim the GPU context (see __main__: os._exit).
 
     def _reap_orphan(self) -> None:
         """Reap the live server currently holding ``self.socket_path``.
