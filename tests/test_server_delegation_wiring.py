@@ -90,7 +90,7 @@ def test_silent_fallback_when_server_unstartable(monkeypatch):
 
 @pytest.fixture
 def daemon(tmp_path):
-    (tmp_path / ".git").mkdir()  # make it a project root
+    (tmp_path / ".git").mkdir(exist_ok=True)  # make it a project root
     from tldr.daemon.core import TLDRDaemon
     return TLDRDaemon(tmp_path)
 

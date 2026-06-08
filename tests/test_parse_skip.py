@@ -78,7 +78,7 @@ def baz():
 
 def _build_two_file_repo(tmp_path: Path) -> Path:
     """Two-file Python project with .git anchor."""
-    (tmp_path / ".git").mkdir()
+    (tmp_path / ".git").mkdir(exist_ok=True)
     (tmp_path / "file_a.py").write_text(_PY_FILE_A)
     (tmp_path / "file_b.py").write_text(_PY_FILE_B)
     return tmp_path
@@ -86,7 +86,7 @@ def _build_two_file_repo(tmp_path: Path) -> Path:
 
 def _build_three_file_repo(tmp_path: Path) -> Path:
     """Three-file Python project with .git anchor."""
-    (tmp_path / ".git").mkdir()
+    (tmp_path / ".git").mkdir(exist_ok=True)
     (tmp_path / "file_a.py").write_text(_PY_FILE_A)
     (tmp_path / "file_b.py").write_text(_PY_FILE_B)
     (tmp_path / "file_c.py").write_text(_PY_FILE_C)
@@ -635,7 +635,7 @@ class TestParseSkipEquivalenceWithFullRebuild:
         project_full.mkdir()
 
         for proj in (project_incr, project_full):
-            (proj / ".git").mkdir()
+            (proj / ".git").mkdir(exist_ok=True)
             (proj / "file_a.py").write_text(_PY_FILE_A)
             (proj / "file_b.py").write_text(_PY_FILE_B)
 

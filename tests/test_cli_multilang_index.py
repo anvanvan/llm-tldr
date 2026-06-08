@@ -90,7 +90,7 @@ def _caller_file(names: List[str]) -> str:
 
 def _build_py_js_repo(tmp_path: Path) -> Path:
     """Project with one .py file and one .js file (+ .git anchor)."""
-    (tmp_path / ".git").mkdir()
+    (tmp_path / ".git").mkdir(exist_ok=True)
     (tmp_path / "module_a.py").write_text(_PY_CONTENT)
     (tmp_path / "module_b.js").write_text(_JS_CONTENT)
     return tmp_path
@@ -98,7 +98,7 @@ def _build_py_js_repo(tmp_path: Path) -> Path:
 
 def _build_fanin_repo(tmp_path: Path) -> Path:
     """Multi-file Python project: many callers of one shared callee."""
-    (tmp_path / ".git").mkdir()
+    (tmp_path / ".git").mkdir(exist_ok=True)
     (tmp_path / "shared.py").write_text(_PY_SHARED)
     (tmp_path / "a.py").write_text(_caller_file(["alpha", "beta", "gamma"]))
     (tmp_path / "b.py").write_text(_caller_file(["delta", "epsilon", "zeta"]))

@@ -31,7 +31,7 @@ import pytest
 # ---------------------------------------------------------------------------
 
 def _tiny_project(tmp_path: Path) -> Path:
-    (tmp_path / ".git").mkdir()
+    (tmp_path / ".git").mkdir(exist_ok=True)
     return tmp_path
 
 

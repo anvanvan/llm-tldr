@@ -76,7 +76,7 @@ def mixed_fixture(tmp_path: Path) -> Path:
     """Fixture directory with one .py (code) and .sh + .md + .toml (non-code)."""
     # C-10: anchor _find_project_root to tmp_path so it cannot walk up to the
     # real project root on unusual CI configs (hermeticity).
-    (tmp_path / ".git").mkdir()
+    (tmp_path / ".git").mkdir(exist_ok=True)
     (tmp_path / "main.py").write_text(_PY_CONTENT)
     (tmp_path / "build.sh").write_text(_SH_CONTENT)
     (tmp_path / "README.md").write_text(_MD_CONTENT)

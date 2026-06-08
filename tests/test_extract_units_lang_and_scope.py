@@ -76,7 +76,7 @@ No source code here — only markdown.
 
 def _build_multilang_repo(tmp_path: Path) -> Path:
     """Create a minimal project with one .py file and one .js file."""
-    (tmp_path / ".git").mkdir()
+    (tmp_path / ".git").mkdir(exist_ok=True)
     (tmp_path / "module_a.py").write_text(_PY_CONTENT)
     (tmp_path / "module_b.js").write_text(_JS_CONTENT)
     return tmp_path
@@ -84,14 +84,14 @@ def _build_multilang_repo(tmp_path: Path) -> Path:
 
 def _build_noncode_repo(tmp_path: Path) -> Path:
     """Create a project with only a .md file — no code files."""
-    (tmp_path / ".git").mkdir()
+    (tmp_path / ".git").mkdir(exist_ok=True)
     (tmp_path / "README.md").write_text(_MD_CONTENT)
     return tmp_path
 
 
 def _build_py_only_repo(tmp_path: Path, *, n_extra: int = 3) -> Path:
     """Create a project with multiple .py files."""
-    (tmp_path / ".git").mkdir()
+    (tmp_path / ".git").mkdir(exist_ok=True)
     (tmp_path / "main.py").write_text(_PY_CONTENT)
     for i in range(n_extra):
         (tmp_path / f"extra_{i}.py").write_text(

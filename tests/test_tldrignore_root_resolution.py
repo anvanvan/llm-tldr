@@ -53,7 +53,7 @@ def test_find_project_root_strong_marker_beats_closer_tldr(tmp_path):
     repo = tmp_path / "repo"
     sub = repo / "a" / "b"
     sub.mkdir(parents=True)
-    (repo / ".git").mkdir()
+    (repo / ".git").mkdir(exist_ok=True)
     (sub / ".tldr").mkdir()  # closest marker is the stray cache
 
     assert _find_project_root(sub) == repo.resolve()

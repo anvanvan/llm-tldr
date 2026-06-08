@@ -76,7 +76,7 @@ def baz():
 
 def _build_two_file_repo(tmp_path: Path) -> Path:
     """Two-file Python project with .git anchor."""
-    (tmp_path / ".git").mkdir()
+    (tmp_path / ".git").mkdir(exist_ok=True)
     (tmp_path / "file_a.py").write_text(_PY_FILE_A)
     (tmp_path / "file_b.py").write_text(_PY_FILE_B)
     return tmp_path
@@ -84,7 +84,7 @@ def _build_two_file_repo(tmp_path: Path) -> Path:
 
 def _build_three_file_repo(tmp_path: Path) -> Path:
     """Three-file Python project with .git anchor."""
-    (tmp_path / ".git").mkdir()
+    (tmp_path / ".git").mkdir(exist_ok=True)
     (tmp_path / "file_a.py").write_text(_PY_FILE_A)
     (tmp_path / "file_b.py").write_text(_PY_FILE_B)
     (tmp_path / "file_c.py").write_text(_PY_FILE_C)
@@ -914,7 +914,7 @@ class TestEnumerateLiveFilesParity:
         from tldr.semantic import _enumerate_live_files  # type: ignore[attr-defined]  # noqa
 
         # Create a project with a Python file and a non-code file (README.md)
-        (tmp_path / ".git").mkdir()
+        (tmp_path / ".git").mkdir(exist_ok=True)
         (tmp_path / "file_a.py").write_text(_PY_FILE_A)
         (tmp_path / "README.md").write_text("# Project\n\nThis is a project.\n")
 

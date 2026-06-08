@@ -70,7 +70,7 @@ def bar(y):
 
 def _build_two_file_repo(tmp_path: Path) -> Path:
     """Two-file Python project with .git anchor."""
-    (tmp_path / ".git").mkdir()
+    (tmp_path / ".git").mkdir(exist_ok=True)
     (tmp_path / "file_a.py").write_text(_PY_FILE_A)
     (tmp_path / "file_b.py").write_text(_PY_FILE_B)
     return tmp_path
@@ -138,7 +138,7 @@ class TestPathUnificationEquivalence:
         project_full.mkdir()
 
         for proj in (project_incr, project_full):
-            (proj / ".git").mkdir()
+            (proj / ".git").mkdir(exist_ok=True)
             (proj / "file_a.py").write_text(_PY_FILE_A)
             (proj / "file_b.py").write_text(_PY_FILE_B)
 
@@ -401,7 +401,7 @@ class TestCrossFileCalledByReembedEquivalence:
         project_full.mkdir()
 
         for proj in (project_incr, project_full):
-            (proj / ".git").mkdir()
+            (proj / ".git").mkdir(exist_ok=True)
             (proj / "file_a.py").write_text(_PY_FILE_A)
             (proj / "file_b.py").write_text(_PY_FILE_B)
 

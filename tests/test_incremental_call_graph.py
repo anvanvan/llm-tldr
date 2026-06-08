@@ -139,7 +139,7 @@ class TestCrossFileCalledByIncrementalDefaultPath:
 
         # Identical initial state in both
         for proj in (project_incr, project_full):
-            (proj / ".git").mkdir()
+            (proj / ".git").mkdir(exist_ok=True)
             (proj / "core.py").write_text(_CORE_PY_NO_CALL)
             (proj / "app.py").write_text(_APP_PY_NO_CALL)
 
@@ -282,7 +282,7 @@ class TestCarriedUnitReembeddedWhenCalledByChanges:
         project_full.mkdir()
 
         for proj in (project_incr, project_full):
-            (proj / ".git").mkdir()
+            (proj / ".git").mkdir(exist_ok=True)
             (proj / "core.py").write_text(_CORE_PY_NO_CALL)
             (proj / "app.py").write_text(_APP_PY_NO_CALL)
 
@@ -500,7 +500,7 @@ def main():
 """
         project = tmp_path / "project"
         project.mkdir()
-        (project / ".git").mkdir()
+        (project / ".git").mkdir(exist_ok=True)
         (project / "core.py").write_text(_core_with_class)
         (project / "app.py").write_text(_app_no_call)
 

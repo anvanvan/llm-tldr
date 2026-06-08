@@ -468,7 +468,7 @@ class TestG10SubdirSnapshotKeyConsistency:
         # _find_project_root will anchor at root (has .git), but scan_path = root/src.
         project_root = tmp_path / "project"
         project_root.mkdir()
-        (project_root / ".git").mkdir()
+        (project_root / ".git").mkdir(exist_ok=True)
         src_dir = project_root / "src"
         src_dir.mkdir()
         (src_dir / "main.py").write_text(
@@ -544,7 +544,7 @@ class TestG10SubdirSnapshotKeyConsistency:
 
         project_root = tmp_path / "project"
         project_root.mkdir()
-        (project_root / ".git").mkdir()
+        (project_root / ".git").mkdir(exist_ok=True)
         src_dir = project_root / "src"
         src_dir.mkdir()
         (src_dir / "alpha.py").write_text(

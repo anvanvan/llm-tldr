@@ -70,7 +70,7 @@ Run `pip install -r requirements.txt` to install dependencies.
 @pytest.fixture
 def mixed_fixture(tmp_path: Path) -> Path:
     """Repo with one .py code file and well-known non-code manifests/docs."""
-    (tmp_path / ".git").mkdir()
+    (tmp_path / ".git").mkdir(exist_ok=True)
     (tmp_path / "main.py").write_text(_PY_CONTENT)
     (tmp_path / "pyproject.toml").write_text(_PYPROJECT_CONTENT)
     (tmp_path / "requirements.txt").write_text(_REQUIREMENTS_CONTENT)
