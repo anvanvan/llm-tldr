@@ -210,13 +210,30 @@ def ensure_daemon(project: str, timeout: float = 10.0) -> None:
 
 
 def _model_server_socket_path() -> str:
-    """Per-user socket path for the shared model server."""
+    """Per-user socket path for the shared model server.
+
+    Respects ``TLDR_MODEL_SERVER_SOCKET``: when set, that value is the canonical
+    socket path so that callers (``ensure_server``) and the spawned server agree
+    on a single location. This is what lets tests route to an isolated socket and
+    keeps the real per-user socket untouched (arch-review G-4).
+    """
+    env_override = os.environ.get("TLDR_MODEL_SERVER_SOCKET")
+    if env_override:
+        return env_override
     uid = os.getuid() if hasattr(os, "getuid") else os.getpid()
     return os.path.join(tempfile.gettempdir(), f"tldr-model-server-{uid}.sock")
 
 
 def _model_server_lock_path() -> str:
-    """Per-user lock path for the shared model server startup."""
+    """Per-user lock path for the shared model server startup.
+
+    Mirrors ``_model_server_socket_path``: when ``TLDR_MODEL_SERVER_SOCKET`` is
+    set, derive the lock path from it (``<sock>.lock``) so isolated tests do not
+    serialize on the production canonical lock (arch-review A-2).
+    """
+    env_override = os.environ.get("TLDR_MODEL_SERVER_SOCKET")
+    if env_override:
+        return env_override + ".lock"
     uid = os.getuid() if hasattr(os, "getuid") else os.getpid()
     return os.path.join(tempfile.gettempdir(), f"tldr-model-server-{uid}.lock")
 
@@ -272,11 +289,16 @@ def ensure_server(timeout: float = 10.0) -> str:
             if ping_server(socket_path):
                 return socket_path
 
+            # Propagate the resolved socket path so the spawned server binds to
+            # exactly the path this caller polls (honours TLDR_MODEL_SERVER_SOCKET).
+            spawn_env = os.environ.copy()
+            spawn_env["TLDR_MODEL_SERVER_SOCKET"] = socket_path
             subprocess.Popen(
                 [sys.executable, "-m", "tldr.model_server"],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 start_new_session=True,
+                env=spawn_env,
             )
 
             start = time.time()

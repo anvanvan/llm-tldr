@@ -69,6 +69,11 @@ def main(argv: list[str] | None = None) -> int:
         with_sigint = False
     _ = with_sigint
 
+    # PID sidecar ownership lives inside ModelServer.run(): it writes
+    # {socket_path}.pid with OUR pid only AFTER reaping any orphan and rebinding
+    # the socket, and removes it on every exit path. Writing it here (before
+    # run()) was the EDGE-1 self-suicide bug — a second server would overwrite
+    # the sidecar with its own pid, then _reap_orphan() would SIGTERM itself.
     server.run()
     return 0
 

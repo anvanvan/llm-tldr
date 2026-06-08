@@ -9,10 +9,12 @@ vectors. ``shutdown()`` cleanly unblocks ``run()``.
 from __future__ import annotations
 
 import os
+import signal
 import socket
 import tempfile
 import threading
-from typing import Any, List
+import time
+from typing import List
 
 import numpy as np
 
@@ -21,6 +23,12 @@ from .queue import EmbedQueue
 from .transport import recv_message, send_message
 
 _ACCEPT_TIMEOUT = 0.2
+
+# Real socket constructor captured at import time. The orphan-reap connect
+# probe MUST use the genuine OS socket even if a test monkeypatches
+# ``socket.socket`` (the accept-loop seam), so liveness detection of a real
+# orphan is never confused by a fake server stand-in.
+_raw_socket = socket.socket
 
 
 def default_socket_path() -> str:
@@ -59,6 +67,23 @@ class ModelServer:
 
     def run(self) -> None:
         """Bind the socket and serve until ``shutdown()`` is called."""
+        # Orphan reap: probe the socket before unlinking it. If a live peer
+        # answers the connect, an old server still owns the path — reap it (read
+        # its PID sidecar, SIGTERM, bounded wait, SIGKILL fallback) so exactly
+        # one server survives instead of two silently fighting over the socket.
+        probe = _raw_socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        probe.settimeout(0.5)
+        live_peer = False
+        try:
+            probe.connect(self.socket_path)
+            live_peer = True
+        except OSError:
+            live_peer = False
+        finally:
+            probe.close()
+        if live_peer:
+            self._reap_orphan()
+
         try:
             os.unlink(self.socket_path)
         except FileNotFoundError:
@@ -69,6 +94,14 @@ class ModelServer:
         srv.listen(8)
         srv.settimeout(_ACCEPT_TIMEOUT)
         self._server_sock = srv
+
+        # PID sidecar: write OUR pid to {socket}.pid only AFTER reaping any
+        # orphan and rebinding the socket. Writing it here (not before run())
+        # is what makes orphan reap correct: when a second server starts, its
+        # _reap_orphan() above reads the EXISTING sidecar — still the orphan's
+        # pid — and SIGTERMs the orphan, never itself. Only once we own the
+        # socket do we claim the sidecar.
+        self._write_pid_sidecar()
 
         try:
             while not self._stop.is_set():
@@ -90,6 +123,99 @@ class ModelServer:
                 os.unlink(self.socket_path)
             except FileNotFoundError:
                 pass
+            self._remove_pid_sidecar()
+            # Free the model + device memory on EVERY exit path (clean
+            # shutdown, SIGTERM, OSError/orphan), not only the idle-tick
+            # branch. maybe_unload() honors the rolling deadline; the explicit
+            # unloader call below guarantees torch.mps.empty_cache() runs even
+            # when no idle window elapsed so a dying server never strands ~1 GB.
+            try:
+                self._lifecycle.maybe_unload()
+            except Exception:  # noqa: BLE001
+                pass
+            unloader = getattr(self._lifecycle, "_model_unloader", None)
+            if callable(unloader):
+                try:
+                    unloader()
+                except Exception:  # noqa: BLE001
+                    pass
+
+    def _reap_orphan(self) -> None:
+        """Reap the live server currently holding ``self.socket_path``.
+
+        Called only after a connect probe in ``run()`` confirmed a live peer.
+        Read ``{socket_path}.pid``, confirm the process is alive
+        (``os.kill(pid, 0)``), SIGTERM it, poll up to 5 s for a clean exit, then
+        SIGKILL as a fallback. Missing/dead PID is treated as "already gone" and
+        we proceed to rebind.
+        """
+        pid = self._read_pid_sidecar()
+        if pid is None:
+            return
+
+        try:
+            os.kill(pid, 0)
+        except (ProcessLookupError, OSError):
+            # PID already dead (or not signalable) — nothing to reap.
+            return
+
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except (ProcessLookupError, OSError):
+            return
+
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            try:
+                os.kill(pid, 0)
+            except (ProcessLookupError, OSError):
+                return  # exited cleanly
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                time.sleep(min(0.01, remaining))
+
+        # Still alive after the grace window — force it down.
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except (ProcessLookupError, OSError):
+            pass
+
+    def _pid_sidecar_path(self) -> str:
+        """Return the path to the PID sidecar file."""
+        return self.socket_path + ".pid"
+
+    def _write_pid_sidecar(self) -> None:
+        """Claim ``{socket_path}.pid`` with our own pid after binding.
+
+        Best-effort: a failure to write the sidecar (e.g. read-only dir) must
+        never crash a server that has already bound the socket successfully.
+        """
+        try:
+            with open(self._pid_sidecar_path(), "w") as fh:
+                fh.write(str(os.getpid()))
+        except OSError:
+            pass
+
+    def _remove_pid_sidecar(self) -> None:
+        """Remove ``{socket_path}.pid`` on exit (best-effort)."""
+        try:
+            os.unlink(self._pid_sidecar_path())
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
+
+    def _read_pid_sidecar(self) -> int | None:
+        """Read the orphan's PID from ``{socket_path}.pid``; None if absent."""
+        try:
+            with open(self._pid_sidecar_path()) as fh:
+                content = fh.read().strip()
+        except (FileNotFoundError, OSError):
+            return None
+        try:
+            return int(content)
+        except ValueError:
+            return None
 
     def _bind_socket(self, srv: socket.socket) -> None:
         """Bind ``srv`` to ``self.socket_path``, tolerating long paths.
