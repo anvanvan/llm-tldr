@@ -14,6 +14,7 @@ import socket
 import tempfile
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import List
 
 import numpy as np
@@ -23,6 +24,27 @@ from .queue import EmbedQueue
 from .transport import recv_message, send_message
 
 _ACCEPT_TIMEOUT = 0.2
+
+# Backlog for the listen socket. Must be comfortably larger than the number of
+# connections that can pile up while one embed is in flight; an undersized
+# backlog (the old listen(8)) gets connect()s REFUSED under load, which callers
+# misread as "server dead" and respond to by spawning a redundant server.
+_LISTEN_BACKLOG = 128
+
+# Max concurrent connection-handler threads. The GPU itself stays serial (every
+# embed funnels through the single-worker EmbedQueue); these threads only keep
+# the accept loop draining and answer cheap requests (ping) immediately so the
+# server never goes deaf during a slow embed.
+_MAX_CONN_WORKERS = 16
+
+
+def _pid_alive(pid: int) -> bool:
+    """True if ``pid`` is a live, signalable process. Never raises."""
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
 
 # Real socket constructor captured at import time. The orphan-reap connect
 # probe MUST use the genuine OS socket even if a test monkeypatches
@@ -67,10 +89,18 @@ class ModelServer:
 
     def run(self) -> None:
         """Bind the socket and serve until ``shutdown()`` is called."""
-        # Orphan reap: probe the socket before unlinking it. If a live peer
-        # answers the connect, an old server still owns the path — reap it (read
-        # its PID sidecar, SIGTERM, bounded wait, SIGKILL fallback) so exactly
-        # one server survives instead of two silently fighting over the socket.
+        # Orphan reap: an old server still holding this path must be killed
+        # before we steal it, otherwise it lingers forever pinning ~GBs.
+        #
+        # We decide to reap on EITHER signal:
+        #   (a) the connect probe succeeds — a server is accepting on the path; OR
+        #   (b) the PID sidecar names a live process other than us.
+        #
+        # (b) is essential: a *busy* server (single embed in flight, backlog
+        # full) REFUSES the connect probe, so (a) alone is False and the old code
+        # skipped the reap — it then unlinked the busy server's socket and
+        # rebound WITHOUT killing it, manufacturing an un-signalled orphan. The
+        # sidecar PID is the reliable liveness signal a full backlog can't mask.
         probe = _raw_socket(socket.AF_UNIX, socket.SOCK_STREAM)
         probe.settimeout(0.5)
         live_peer = False
@@ -81,7 +111,14 @@ class ModelServer:
             live_peer = False
         finally:
             probe.close()
-        if live_peer:
+
+        sidecar_pid = self._read_pid_sidecar()
+        live_sidecar_owner = (
+            sidecar_pid is not None
+            and sidecar_pid != os.getpid()
+            and _pid_alive(sidecar_pid)
+        )
+        if live_peer or live_sidecar_owner:
             self._reap_orphan()
 
         try:
@@ -91,7 +128,7 @@ class ModelServer:
 
         srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self._bind_socket(srv)
-        srv.listen(8)
+        srv.listen(_LISTEN_BACKLOG)
         srv.settimeout(_ACCEPT_TIMEOUT)
         self._server_sock = srv
 
@@ -103,8 +140,24 @@ class ModelServer:
         # socket do we claim the sidecar.
         self._write_pid_sidecar()
 
+        # Each accepted connection is handled on a pool thread so the accept
+        # loop NEVER blocks on a slow embed. The GPU stays serial (every embed
+        # funnels through the single-worker EmbedQueue); the threads only keep
+        # accept() draining and answer cheap requests (ping) immediately. A deaf
+        # accept loop was the upstream cause of orphan storms: backlog fills →
+        # connect refused → callers think the server died → spawn a duplicate.
+        executor = ThreadPoolExecutor(
+            max_workers=_MAX_CONN_WORKERS, thread_name_prefix="tldr-ms-conn"
+        )
         try:
             while not self._stop.is_set():
+                # Self-eviction: if the sidecar now names another live process,
+                # a newer server has taken over the socket — we are an orphan.
+                # Exit immediately instead of lingering forever holding the
+                # model. This is the backstop that makes orphans structurally
+                # impossible to persist, even if our reap signal never landed.
+                if self._superseded():
+                    break
                 try:
                     conn, _ = srv.accept()
                 except socket.timeout:
@@ -116,14 +169,20 @@ class ModelServer:
                     continue
                 except OSError:
                     break
-                self._handle_connection(conn)
+                executor.submit(self._handle_connection, conn)
         finally:
+            executor.shutdown(wait=False)
             srv.close()
-            try:
-                os.unlink(self.socket_path)
-            except FileNotFoundError:
-                pass
-            self._remove_pid_sidecar()
+            # Clean up the socket + sidecar ONLY if we still own them. A
+            # superseded orphan must NOT unlink the path (now the new owner's
+            # socket) nor delete the new owner's sidecar — doing so would make
+            # the live server unreachable and trigger yet another respawn.
+            if self._read_pid_sidecar() == os.getpid():
+                try:
+                    os.unlink(self.socket_path)
+                except FileNotFoundError:
+                    pass
+                self._remove_pid_sidecar()
             # Deliberately DO NOT run torch.mps.empty_cache() / model unload on
             # the exit path. A dying process has all of its GPU/unified memory
             # reclaimed by the OS, so an in-process teardown frees nothing extra
@@ -213,6 +272,18 @@ class ModelServer:
             return int(content)
         except ValueError:
             return None
+
+    def _superseded(self) -> bool:
+        """True if another live process now owns the socket per the sidecar.
+
+        After we bind we write the sidecar with our own PID. If a newer server
+        later rebinds the socket it overwrites the sidecar with ITS pid; reading
+        a different, live PID here means we have been superseded and are now an
+        orphan — we should exit. A missing or stale (dead) sidecar PID is NOT
+        treated as superseded (we keep serving until a real replacement exists).
+        """
+        pid = self._read_pid_sidecar()
+        return pid is not None and pid != os.getpid() and _pid_alive(pid)
 
     def _bind_socket(self, srv: socket.socket) -> None:
         """Bind ``srv`` to ``self.socket_path``, tolerating long paths.
