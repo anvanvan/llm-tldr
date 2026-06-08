@@ -1857,10 +1857,14 @@ def extract_file_with_code(
     Extract code structure and inject a 'code' (source span) field on
     symbols matched by ``function`` / ``method`` / ``class_`` filters.
 
-    Same return shape as :func:`extract_file`, plus a ``code`` key on
-    each matched function / method / class dict whose extractor populated
-    ``end_line``. Bare extraction (no filter) is left unchanged — callers
-    that want metadata only should keep using :func:`extract_file`.
+    When a filter is applied the result is a compact, code-first dict:
+    ``file_path``, ``language``, and the matched ``classes`` / ``functions``
+    (each matched function / method / class dict carries a ``code`` key when
+    its extractor populated ``end_line``). The module-wide ``imports`` and
+    ``call_graph`` are intentionally omitted so the requested symbol's body
+    is not buried under a long import list — they remain available via
+    :func:`get_imports` / bare :func:`extract_file`. With no filter the full
+    :func:`extract_file` shape is returned unchanged.
 
     Args:
         file_path: Path to the file to analyze
@@ -1870,9 +1874,11 @@ def extract_file_with_code(
         base_path: Optional base directory for path containment validation
 
     Returns:
-        Dict with the same shape as :func:`extract_file` (including the
-        ``end_line`` key on every function / method / class dict), plus a
-        ``code`` field on matches whose ``end_line`` is known.
+        With a filter: a compact dict ``{file_path, language, classes?,
+        functions?}`` where each matched function / method / class dict
+        always carries ``end_line`` and conditionally carries a ``code``
+        field (when ``end_line`` is known and the code span can be extracted).
+        With no filter: the full :func:`extract_file` shape.
     """
     path, module_info = _load_module_info(file_path, base_path)
     result = module_info.to_dict()
@@ -1881,7 +1887,7 @@ def extract_file_with_code(
         return result
 
     # Build {(name, line_number): end_line} maps from the dataclasses
-    # so we can look up end_line without exposing it in to_dict().
+    # to look up end_line for code span injection.
     func_end = {(f.name, f.line_number): f.end_line for f in module_info.functions}
     class_end = {(c.name, c.line_number): c.end_line for c in module_info.classes}
     method_end = {
@@ -1949,8 +1955,6 @@ def extract_file_with_code(
                     c_copy["methods"] = matching_methods
                     filtered.append(c_copy)
             result["classes"] = filtered
-    else:
-        result["classes"] = []
 
     # Apply function filter
     if function:
@@ -1983,7 +1987,25 @@ def extract_file_with_code(
     elif method:
         _inject_method_code_spans(result.get("classes", []), method_end, _span)
 
-    return result
+    # A filtered extract is a single-symbol request: the caller wants that
+    # symbol's body, not the module's full import list or call graph. Emitting
+    # them (Java files routinely carry 30+ imports, ~6 JSON lines each) buries
+    # the injected `code` hundreds of lines down, defeating the point of the
+    # command and forcing a grep+Read fallback. Return a compact, code-first
+    # dict: identity keys, then the matched classes/functions (which carry
+    # `code`). Module-wide `imports` / `call_graph` are dropped — they remain
+    # available via `tldr imports` and bare `tldr extract`.
+    compact = {
+        "file_path": result.get("file_path"),
+        "language": result.get("language"),
+    }
+    classes = result.get("classes")
+    if classes:
+        compact["classes"] = classes
+    functions = result.get("functions")
+    if functions:
+        compact["functions"] = functions
+    return compact
 
 
 # =============================================================================
