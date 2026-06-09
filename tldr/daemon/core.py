@@ -15,10 +15,12 @@ import sys
 import tempfile
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Optional
 
 from tldr.dedup import ContentHashedIndex
+from tldr.model_server.server import _pid_alive, _raw_socket
 from tldr.salsa import SalsaDB
 from tldr.stats import (
     HookStats,
@@ -46,6 +48,27 @@ from .cached_queries import (
 
 # Idle timeout: 1 hour (rolling — reset on every handled command)
 IDLE_TIMEOUT = 60 * 60
+
+# Listen backlog for the daemon command socket. A small backlog (the old
+# listen(5)) gets connect()s REFUSED once a handful of clients pile up while the
+# accept loop is briefly busy; ensure_daemon misreads the refusal as "daemon
+# dead" and answers by spawning a redundant daemon — the daemon-layer orphan
+# storm (9 daemons observed on one project). Mirrors the model server's fix.
+_DAEMON_LISTEN_BACKLOG = 128
+
+# Max concurrent connection-handler threads. Keeps the accept loop draining so a
+# slow command never makes the daemon go deaf (a deaf daemon → ping timeout →
+# false-dead → duplicate spawn). Stateful commands still serialize on
+# self._command_lock; only cheap liveness pings answer lock-free.
+_DAEMON_MAX_CONN_WORKERS = 16
+
+# Cap on connection handlers parked waiting for the command lock. Strictly less
+# than the worker count so several workers are ALWAYS free to answer lock-free
+# pings even while a slow command holds the lock — that reserve is what keeps the
+# daemon from going deaf (and thus from being false-dead-respawned). Excess
+# commands beyond the cap are shed fast with a retryable "busy" instead of piling
+# up open fds + queued futures unbounded behind the slow command.
+_DAEMON_MAX_INFLIGHT_COMMANDS = 12
 
 # Wire protocol keys for the notify command
 _WIRE_KEY_FILES = "files"      # Batch wire key (new)
@@ -85,6 +108,14 @@ class TLDRDaemon:
         self._shutdown_requested = False
         self._socket: Optional[socket.socket] = None
         self._pidfile: Optional[Any] = None  # Locked PID file handle from startup.py
+        # Serializes stateful commands across connection-handler threads so the
+        # threaded accept loop preserves today's one-command-at-a-time semantics.
+        # Cheap liveness pings bypass it so the daemon never goes deaf.
+        self._command_lock = threading.Lock()
+        # Bounds how many handlers may be parked on the command lock at once,
+        # reserving worker threads for lock-free pings (see the constant). Excess
+        # commands are shed with a retryable "busy" rather than leaking fds.
+        self._command_slots = threading.BoundedSemaphore(_DAEMON_MAX_INFLIGHT_COMMANDS)
 
         # P5 Features: Content-hash deduplication and query memoization
         self.dedup_index: Optional[ContentHashedIndex] = None
@@ -403,8 +434,13 @@ class TLDRDaemon:
             return
         self._stats_persisted = True
 
-        # Persist session stats
-        for session_id, stats in self._session_stats.items():
+        # Persist session stats. Iterate a SNAPSHOT (list(...)): on shutdown the
+        # accept loop's executor is stopped with wait=False, so an in-flight
+        # connection handler may still be inserting into self._session_stats
+        # while we persist. Iterating the live dict would raise
+        # "dictionary changed size during iteration" and abort the persist
+        # partway; the snapshot decouples us from concurrent mutation.
+        for session_id, stats in list(self._session_stats.items()):
             if stats.requests > 0:  # Only persist if there were actual requests
                 try:
                     self._stats_store.append(stats)
@@ -1345,6 +1381,110 @@ class TLDRDaemon:
             return status_file.read_text().strip()
         return "unknown"
 
+    # ------------------------------------------------------------------
+    # Orphan-storm defenses (ported from tldr.model_server.server, 423841c):
+    # a socket-owner PID sidecar drives reap-on-startup and self-eviction so a
+    # busy/superseded daemon can never persist as a ~GB orphan on the socket.
+    # ------------------------------------------------------------------
+
+    def _socket_owner_path(self) -> str:
+        """Path of the socket-owner PID sidecar (distinct from the flock pidfile)."""
+        return str(self.socket_path) + ".owner"
+
+    def _write_socket_owner(self) -> None:
+        """Claim the socket-owner sidecar with our PID after binding (best-effort).
+
+        Atomic publish (write temp + os.replace): a plain truncate-then-write
+        leaves a window where a concurrently-starting daemon's _read_socket_owner
+        sees an empty file → None → "no live owner" → it steals the socket and we
+        get a duplicate (the exact storm this guards against). os.replace makes the
+        sidecar flip from old content to full new content with no empty window.
+        """
+        path = self._socket_owner_path()
+        tmp = f"{path}.{os.getpid()}.tmp"
+        try:
+            with open(tmp, "w") as fh:
+                fh.write(str(os.getpid()))
+            os.replace(tmp, path)
+        except OSError:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
+    def _read_socket_owner(self) -> Optional[int]:
+        """Read the socket-owner PID sidecar; None if absent/corrupt."""
+        try:
+            with open(self._socket_owner_path()) as fh:
+                content = fh.read().strip()
+        except (FileNotFoundError, OSError):
+            return None
+        try:
+            return int(content)
+        except ValueError:
+            return None
+
+    def _remove_socket_owner(self) -> None:
+        """Remove the socket-owner sidecar on exit (best-effort)."""
+        try:
+            os.unlink(self._socket_owner_path())
+        except (FileNotFoundError, OSError):
+            pass
+
+    def _reap_orphan_holder(self) -> None:
+        """Kill an older daemon still holding our socket path before we rebind.
+
+        Reap on EITHER signal: a live connect probe, OR a live PID sidecar. The
+        sidecar is essential — a *busy* daemon with a full backlog REFUSES the
+        probe (looks dead) yet is alive; without the sidecar signal the old code
+        unlinked its socket and rebound WITHOUT killing it, manufacturing an
+        un-signalled orphan. Missing/dead PID → nothing to reap.
+        """
+        probe = _raw_socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        probe.settimeout(0.5)
+        live_peer = False
+        try:
+            probe.connect(str(self.socket_path))
+            live_peer = True
+        except OSError:
+            live_peer = False
+        finally:
+            probe.close()
+
+        pid = self._read_socket_owner()
+        live_sidecar_owner = pid is not None and pid != os.getpid() and _pid_alive(pid)
+        if not (live_peer or live_sidecar_owner):
+            return
+        # If we reach here: either the socket is live OR the sidecar names a live foreign PID.
+        # Reap only if the sidecar names a live PID (live_peer alone does not require kill).
+        if not live_sidecar_owner:
+            return
+
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            return
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            if not _pid_alive(pid):
+                return  # exited cleanly
+            time.sleep(0.02)
+        try:
+            os.kill(pid, signal.SIGKILL)  # force it down after the grace window
+        except OSError:
+            pass
+
+    def _superseded(self) -> bool:
+        """True if the socket-owner sidecar now names another live process.
+
+        A newer daemon that rebinds the socket overwrites the sidecar with its
+        PID; reading a different, live PID means we have been superseded and are
+        now an orphan — we must self-evict. A missing or dead PID is NOT treated
+        as superseded (we keep serving until a real replacement exists).
+        """
+        pid = self._read_socket_owner()
+        return pid is not None and pid != os.getpid() and _pid_alive(pid)
+
     def _create_socket(self):
         """Create and bind the socket (legacy method, calls _create_server_socket)."""
         self._socket = self._create_server_socket()
@@ -1366,11 +1506,19 @@ class TLDRDaemon:
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             addr, port = self._get_connection_info()
             sock.bind((addr, port))
-            sock.listen(5)
+            sock.listen(_DAEMON_LISTEN_BACKLOG)
             sock.settimeout(1.0)
             logger.info(f"Listening on {addr}:{port}")
         else:
-            # Unix socket for Linux/macOS
+            # Unix socket for Linux/macOS.
+            #
+            # Orphan reap FIRST: an older daemon that is alive but UNRESPONSIVE
+            # (busy, backlog full) refuses the connect probe, so ensure_daemon
+            # misreads it as dead and spawns us. Before we steal the path we kill
+            # that orphan via its PID sidecar — otherwise it lingers forever
+            # pinning the index in RAM (the storm we are fixing).
+            self._reap_orphan_holder()
+
             # Try to bind without deleting existing socket - if bind fails,
             # another daemon is running. This prevents race conditions.
             sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -1399,8 +1547,13 @@ class TLDRDaemon:
                             sock.bind(str(self.socket_path))
                 else:
                     raise
-            sock.listen(5)
+            sock.listen(_DAEMON_LISTEN_BACKLOG)
             sock.settimeout(1.0)
+            # Claim the socket-owner sidecar with our PID ONLY after binding: a
+            # newer daemon's reap reads the EXISTING sidecar (the orphan's pid)
+            # and signals the orphan, never itself; the same sidecar drives
+            # self-eviction of any daemon whose socket we later steal.
+            self._write_socket_owner()
             logger.info(f"Listening on {self.socket_path}")
 
         return sock
@@ -1416,6 +1569,19 @@ class TLDRDaemon:
             logger.info("Socket cleaned up (TCP)")
             return
 
+        # Ownership guard: a superseded orphan must NOT delete the socket or
+        # sidecar now owned by the newer daemon — doing so would make the live
+        # daemon unreachable and trigger yet another respawn. Skip cleanup ONLY
+        # when the sidecar names ANOTHER LIVE process. A missing sidecar (None —
+        # e.g. our own _write_socket_owner failed) means no one else claims the
+        # path, so we must still unlink our socket rather than leak it (the
+        # daemon, unlike the model server, has no unconditional startup unlink to
+        # recover a leaked socket).
+        owner = self._read_socket_owner()
+        if owner is not None and owner != os.getpid():
+            logger.info("Superseded — leaving new owner's socket/sidecar intact")
+            return
+
         if self.socket_path.exists():
             import stat
             try:
@@ -1424,6 +1590,7 @@ class TLDRDaemon:
                     self.socket_path.unlink()
             except OSError:
                 pass
+        self._remove_socket_owner()
         logger.info("Socket cleaned up")
 
     def _handle_one_connection(self):
@@ -1465,6 +1632,70 @@ class TLDRDaemon:
         finally:
             conn.close()
 
+    def _send_response(self, conn: socket.socket, response: dict) -> None:
+        """Best-effort write a JSON-newline response; tolerate a hung-up peer."""
+        try:
+            conn.sendall(json.dumps(response).encode() + b"\n")
+        except (BrokenPipeError, OSError):
+            logger.debug("Client disconnected before receiving response")
+
+    def _serve_connection(self, conn: socket.socket) -> None:
+        """Handle one client connection on a pool thread.
+
+        Cheap liveness ``ping`` is answered WITHOUT the command lock so the
+        daemon stays responsive even while a heavy command holds it — that
+        responsiveness is what stops ensure_daemon from misreading a busy daemon
+        as dead and spawning a duplicate. Every other command serializes on
+        ``self._command_lock`` to preserve the previous one-at-a-time semantics.
+        """
+        try:
+            conn.settimeout(5.0)
+            data = b""
+            while True:
+                chunk = conn.recv(4096)
+                if not chunk:
+                    break
+                data += chunk
+                if b"\n" in data:
+                    break
+            if not data:
+                return
+            try:
+                command = json.loads(data.decode().strip())
+            except json.JSONDecodeError as e:
+                self._send_response(conn, {"status": "error", "message": f"Invalid JSON: {e}"})
+                return
+
+            if command.get("cmd", "") == "ping":
+                # Lock-free fast path. Still bump last_query so a stream of pings
+                # keeps the daemon alive exactly as before (idle is rolling).
+                self.last_query = time.time()
+                self._send_response(conn, {"status": "ok"})
+                return
+
+            # Backpressure: bound the handlers parked on the command lock so a
+            # slow command can't pile up unbounded open fds/queued futures behind
+            # it, and so worker threads stay free for lock-free pings. Over the
+            # cap, shed fast with a retryable status (the client would otherwise
+            # just time out waiting behind the slow command).
+            if not self._command_slots.acquire(blocking=False):
+                self._send_response(
+                    conn, {"status": "busy", "message": "daemon busy, retry shortly"}
+                )
+                return
+            try:
+                with self._command_lock:
+                    response = self.handle_command(command)
+            finally:
+                self._command_slots.release()
+            self._send_response(conn, response)
+        except BrokenPipeError:
+            logger.debug("Client disconnected before receiving response")
+        except Exception:
+            logger.exception("Error handling connection")
+        finally:
+            conn.close()
+
     def run(self):
         """Run the daemon main loop."""
         self.write_pid_file()
@@ -1496,13 +1727,37 @@ class TLDRDaemon:
 
             logger.info(f"TLDR daemon started for {self.project}")
 
-            while not self._shutdown_requested:
-                self._handle_one_connection()
-
-                # Check for idle timeout
-                if self.is_idle():
-                    logger.info("Idle timeout reached, shutting down")
-                    break
+            # Each accepted connection is handled on a pool thread so a slow
+            # command never blocks accept(): a deaf accept loop was the daemon
+            # orphan storm's root cause (backlog fills → connect refused →
+            # ensure_daemon thinks the daemon died → spawns a duplicate).
+            executor = ThreadPoolExecutor(
+                max_workers=_DAEMON_MAX_CONN_WORKERS,
+                thread_name_prefix="tldr-daemon-conn",
+            )
+            try:
+                while not self._shutdown_requested:
+                    # Self-eviction: if a newer daemon rebound our socket and
+                    # overwrote the owner sidecar with its PID, we are an orphan
+                    # — exit instead of lingering forever holding the index.
+                    if self._superseded():
+                        logger.info("Superseded by a newer daemon, self-evicting")
+                        break
+                    if not self._socket:
+                        break
+                    try:
+                        conn, _ = self._socket.accept()
+                    except socket.timeout:
+                        # Idle heartbeat: only when nothing is connecting.
+                        if self.is_idle():
+                            logger.info("Idle timeout reached, shutting down")
+                            break
+                        continue
+                    except OSError:
+                        break
+                    executor.submit(self._serve_connection, conn)
+            finally:
+                executor.shutdown(wait=False)
 
         except KeyboardInterrupt:
             logger.info("Received interrupt, shutting down")

@@ -363,7 +363,16 @@ def start_daemon(project_path: str | Path, foreground: bool = False):
                 _write_pid_to_locked_file(pidfile, os.getpid())
                 daemon._pidfile = pidfile  # Keep reference to hold lock
                 daemon.run()
-                sys.exit(0)  # Should not reach here
+                # run() returns on idle-timeout, self-eviction, or a shutdown
+                # command — its finally has already persisted stats and cleaned
+                # up the socket. Use os._exit (not sys.exit) so we skip the
+                # interpreter's atexit handlers: concurrent.futures registers one
+                # that JOINS the (non-daemon) connection-pool worker threads, and
+                # a slow command still in flight would block that join — keeping
+                # this process (and its multi-GB index) alive long after it was
+                # superseded. os._exit frees the RAM immediately. Mirrors
+                # tldr.model_server.__main__.
+                os._exit(0)
             else:
                 # Parent process - release lock and wait for daemon
                 try:

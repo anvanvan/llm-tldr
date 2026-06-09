@@ -160,7 +160,6 @@ def ensure_daemon(project: str, timeout: float = 10.0) -> None:
     if _ping_daemon(project):
         return
 
-    socket_path = _get_socket_path(project)
     lock_path = _get_lock_path(project)
 
     lock_path.touch(exist_ok=True)
@@ -172,15 +171,13 @@ def ensure_daemon(project: str, timeout: float = 10.0) -> None:
             if _ping_daemon(project):
                 return
 
-            # Clean up a stale socket if the daemon is dead.
-            if socket_path.exists():
-                if os.name != "nt":
-                    import stat
-                    # Stale-socket cleanup is best-effort; a race where the file
-                    # vanished first is harmless — keep starting up.
-                    with contextlib.suppress(OSError):
-                        if stat.S_ISSOCK(socket_path.stat().st_mode):
-                            socket_path.unlink(missing_ok=True)
+            # NOTE: deliberately do NOT unlink the socket here. A live-but-busy
+            # daemon (accept loop briefly saturated, backlog full) fails the ping
+            # above yet is alive; unlinking its socket and spawning would orphan
+            # it. The spawned daemon's _create_server_socket reaps a live holder
+            # via its PID sidecar, and handles a genuinely stale socket itself
+            # (connect-refused → unlink → rebind). Mirrors ensure_server, which
+            # never unlinks.
 
             subprocess.Popen(
                 [
