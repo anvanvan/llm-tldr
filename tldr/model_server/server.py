@@ -37,12 +37,43 @@ _LISTEN_BACKLOG = 128
 # server never goes deaf during a slow embed.
 _MAX_CONN_WORKERS = 16
 
+# Env var naming the PID of the process that spawned this server. Set ONLY for
+# test model servers (by tests/conftest.py pytest_configure). When present, the
+# server runs a parent-death watchdog that self-exits when that specific PID dies
+# — so a test server orphaned by an abnormal pytest exit cannot persist between
+# runs holding the GPU. The legit shared PRODUCTION server (commits 0dcc6d2 /
+# 219b29c8) is detached to PPID 1 BY DESIGN and does NOT set this env, so it never
+# starts the watchdog and never self-exits. The watchdog keys on this SPECIFIC
+# pid, NEVER on PPID==1, precisely to avoid killing the production server.
+_PARENT_PID_ENV = "TLDR_MODEL_SERVER_PARENT_PID"
+
+# How often the parent-death watchdog polls os.kill(parent_pid, 0). Kept short so
+# self-exit lands well inside the test's 5s window once the parent dies.
+_WATCHDOG_POLL_SECS = 1.0
+
+# Bound on the graceful-shutdown queue drain. Must be strictly LESS than the
+# conftest SIGTERM→SIGKILL window (5s) so a wedged in-flight Metal op can never
+# stall shutdown past that window and provoke a mid-op SIGKILL (which wedges the
+# GPU). A healthy embed drains in well under a second; this only bounds the
+# pathological wedged case, after which __main__'s os._exit reclaims the context.
+#
+# COUPLING: _DRAIN_TIMEOUT (3.0s) < conftest _reap_model_server SIGTERM→SIGKILL
+# window (5.0s, tests/conftest.py:_reap_model_server deadline = time.time()+5.0).
+# If that window is ever reduced below _DRAIN_TIMEOUT the safety margin vanishes —
+# keep _DRAIN_TIMEOUT strictly below whatever grace period conftest gives before
+# escalating to SIGKILL.
+_DRAIN_TIMEOUT = 3.0
+
 
 def _pid_alive(pid: int) -> bool:
     """True if ``pid`` is a live, signalable process. Never raises."""
     try:
         os.kill(pid, 0)
     except OSError:
+        # Intentionally treat EPERM as dead: on macOS, os.kill(1, 0) raises
+        # EPERM (not ESRCH) for init/launchd — a non-signalable process is
+        # "dead enough" for the sweep and watchdog intent (we cannot reap it
+        # or rely on it as a parent), so False is the correct answer here.
         return False
     return True
 
@@ -140,6 +171,13 @@ class ModelServer:
         # socket do we claim the sidecar.
         self._write_pid_sidecar()
 
+        # Parent-death watchdog: a TEST server (told its spawning pytest's PID via
+        # TLDR_MODEL_SERVER_PARENT_PID) must self-exit promptly when that parent
+        # dies, so no orphan persists between runs holding the GPU. Started only
+        # when the env names a parent — the production shared server (PPID 1 by
+        # design, env unset) never starts it and never self-exits.
+        self._start_parent_death_watchdog()
+
         # Each accepted connection is handled on a pool thread so the accept
         # loop NEVER blocks on a slow embed. The GPU stays serial (every embed
         # funnels through the single-worker EmbedQueue); the threads only keep
@@ -235,6 +273,69 @@ class ModelServer:
             os.kill(pid, signal.SIGKILL)
         except (ProcessLookupError, OSError):
             pass
+
+    def _start_parent_death_watchdog(self) -> None:
+        """Start a daemon thread that self-exits when the spawning parent dies.
+
+        Reads the spawning process's PID from ``TLDR_MODEL_SERVER_PARENT_PID``.
+        When that env is UNSET — the production shared server, which is detached
+        to PPID 1 by design — this is a no-op: no watchdog, no self-exit. When it
+        names a PID, a daemon thread polls ``os.kill(parent_pid, 0)`` every
+        ``_WATCHDOG_POLL_SECS``; the first ``ProcessLookupError`` (ESRCH) means the
+        parent is gone, so we unlink our own socket trio and ``os._exit(0)``
+        WITHOUT any MPS teardown — preserving the commit-60bce6d invariant (an
+        in-process GPU teardown can wedge Metal; the kernel reclaims the context
+        on process death).
+
+        The watchdog keys on this SPECIFIC parent PID, NEVER on ``PPID == 1`` — a
+        "exit when PPID==1" check would instantly kill the legit production server.
+        """
+        raw = os.environ.get(_PARENT_PID_ENV)
+        if not raw:
+            return
+        try:
+            parent_pid = int(raw)
+        except ValueError:
+            return
+        # A zero/negative or self PID is meaningless as a parent — never watch it.
+        if parent_pid <= 0 or parent_pid == os.getpid():
+            return
+
+        thread = threading.Thread(
+            target=self._watch_parent,
+            args=(parent_pid,),
+            name="tldr-ms-parent-watchdog",
+            daemon=True,
+        )
+        thread.start()
+
+    def _watch_parent(self, parent_pid: int) -> None:
+        """Poll the spawning parent and self-exit on its death. Never returns."""
+        while not self._stop.is_set():
+            try:
+                os.kill(parent_pid, 0)
+            except ProcessLookupError:
+                # Parent is gone — reap ourselves so no orphan persists.
+                self._self_evict_on_parent_death()
+                return  # os._exit is called above; return prevents infinite spin
+                        # if os._exit is ever mocked in tests.
+            except OSError:
+                # Permission error or similar: parent still exists (a dead PID
+                # raises ESRCH, not EPERM), so keep watching.
+                pass
+            time.sleep(_WATCHDOG_POLL_SECS)
+
+    def _self_evict_on_parent_death(self) -> None:
+        """Unlink our socket trio and hard-exit — NO MPS teardown (60bce6d)."""
+        for suffix in ("", ".pid", ".lock"):
+            try:
+                os.unlink(self.socket_path + suffix)
+            except OSError:
+                pass
+        # os._exit: skip interpreter shutdown so torch/Metal destructors and
+        # atexit handlers never run — an in-process GPU teardown can wedge the
+        # Apple GPU driver. The OS reclaims the GPU/unified context on death.
+        os._exit(0)
 
     def _pid_sidecar_path(self) -> str:
         """Return the path to the PID sidecar file."""
@@ -337,9 +438,31 @@ class ModelServer:
         return {"status": "error", "error": f"unknown cmd: {cmd!r}"}
 
     def shutdown(self) -> None:
-        """Signal the accept loop to stop and tear down the queue."""
+        """Signal the accept loop to stop and tear down the queue — bounded.
+
+        Sets ``_stop`` so the accept loop exits, then drains the embed queue
+        with a BOUNDED wait. The bound is the Bug B (Metal-wedge) fix: a normal
+        in-flight embed drains in well under a second, but a wedged Metal command
+        buffer can make the embed worker's ``join()`` block forever. Without a
+        bound, the SIGTERM handler that calls ``shutdown()`` would itself hang,
+        the conftest 5s SIGTERM→SIGKILL window would elapse, and the server would
+        be SIGKILLed mid-Metal-op — the exact condition that wedges the GPU.
+
+        We cap the drain strictly inside that window (``_DRAIN_TIMEOUT`` ≈ 3s).
+        If the queue does not drain in time we stop waiting and return, letting
+        the caller (``__main__``: ``os._exit``) terminate the process WITHOUT any
+        in-process MPS teardown — preserving the 60bce6d invariant. The kernel
+        reclaims the GPU/unified-memory context on process death.
+        """
         self._stop.set()
-        try:
-            self._embed_queue.shutdown()
-        except Exception:  # noqa: BLE001
-            pass
+
+        drainer = threading.Thread(
+            target=self._embed_queue.shutdown,
+            name="tldr-ms-drain",
+            daemon=True,
+        )
+        drainer.start()
+        drainer.join(_DRAIN_TIMEOUT)
+        # If `drainer` is still alive here, the in-flight embed is wedged; we do
+        # NOT block on it. The daemon thread is abandoned and the process exits
+        # via os._exit in __main__, which the OS-level GPU teardown follows.
