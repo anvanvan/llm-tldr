@@ -106,7 +106,14 @@ class ModelServer:
     """
 
     def __init__(self, socket_path: str, idle_seconds: int = 1800) -> None:
+        # Lazy import: tldr.daemon.__init__ eagerly imports core.py, which in
+        # turn imports _pid_alive from THIS module — importing SocketSidecarOwner
+        # at module top would form a partially-initialised circular import. By
+        # the time a ModelServer is instantiated both modules are fully loaded.
+        from tldr.daemon.socket_sidecar import SocketSidecarOwner
+
         self.socket_path = socket_path
+        self._sidecar = SocketSidecarOwner(socket_path, suffix=".pid")
         self._idle_seconds = idle_seconds
         self._lifecycle = ModelServerLifecycle(idle_seconds=idle_seconds)
         self._embed_queue = EmbedQueue(embed_fn=self._embed)
@@ -338,41 +345,28 @@ class ModelServer:
         os._exit(0)
 
     def _pid_sidecar_path(self) -> str:
-        """Return the path to the PID sidecar file."""
-        return self.socket_path + ".pid"
+        """Return the path to the PID sidecar file (``{socket_path}.pid``)."""
+        return self._sidecar.path()
 
     def _write_pid_sidecar(self) -> None:
         """Claim ``{socket_path}.pid`` with our own pid after binding.
 
-        Best-effort: a failure to write the sidecar (e.g. read-only dir) must
+        Delegates to :class:`SocketSidecarOwner`, whose atomic ``os.replace``
+        write closes the empty-file race a plain truncate-then-write leaves
+        open (a concurrent reader seeing an empty sidecar reads None → "no live
+        owner" → steals the socket → duplicate server, the exact storm this
+        guards against). Best-effort: a write failure (e.g. read-only dir) must
         never crash a server that has already bound the socket successfully.
         """
-        try:
-            with open(self._pid_sidecar_path(), "w") as fh:
-                fh.write(str(os.getpid()))
-        except OSError:
-            pass
+        self._sidecar.write_pid()
 
     def _remove_pid_sidecar(self) -> None:
         """Remove ``{socket_path}.pid`` on exit (best-effort)."""
-        try:
-            os.unlink(self._pid_sidecar_path())
-        except FileNotFoundError:
-            pass
-        except OSError:
-            pass
+        self._sidecar.remove_pid()
 
     def _read_pid_sidecar(self) -> int | None:
         """Read the orphan's PID from ``{socket_path}.pid``; None if absent."""
-        try:
-            with open(self._pid_sidecar_path()) as fh:
-                content = fh.read().strip()
-        except (FileNotFoundError, OSError):
-            return None
-        try:
-            return int(content)
-        except ValueError:
-            return None
+        return self._sidecar.read_pid()
 
     def _superseded(self) -> bool:
         """True if another live process now owns the socket per the sidecar.
@@ -382,9 +376,10 @@ class ModelServer:
         a different, live PID here means we have been superseded and are now an
         orphan — we should exit. A missing or stale (dead) sidecar PID is NOT
         treated as superseded (we keep serving until a real replacement exists).
+
+        Delegates to :meth:`SocketSidecarOwner.is_superseded`.
         """
-        pid = self._read_pid_sidecar()
-        return pid is not None and pid != os.getpid() and _pid_alive(pid)
+        return self._sidecar.is_superseded()
 
     def _bind_socket(self, srv: socket.socket) -> None:
         """Bind ``srv`` to ``self.socket_path``, tolerating long paths.

@@ -22,6 +22,8 @@ from typing import Any, Optional
 from tldr.dedup import ContentHashedIndex
 from tldr.model_server.server import _pid_alive, _raw_socket
 from tldr.salsa import SalsaDB
+
+from .socket_sidecar import SocketSidecarOwner
 from tldr.stats import (
     HookStats,
     HookStatsStore,
@@ -98,6 +100,7 @@ class TLDRDaemon:
         self.project = project_path
         self.tldr_dir = project_path / ".tldr"
         self.socket_path = self._compute_socket_path()
+        self._sidecar = SocketSidecarOwner(self.socket_path, suffix=".owner")
         self.idle_timeout = IDLE_TIMEOUT if idle_timeout is None else idle_timeout
         self.last_query = time.time()
         self.indexes: dict[str, Any] = {}
@@ -1389,47 +1392,23 @@ class TLDRDaemon:
 
     def _socket_owner_path(self) -> str:
         """Path of the socket-owner PID sidecar (distinct from the flock pidfile)."""
-        return str(self.socket_path) + ".owner"
+        return self._sidecar.path()
 
     def _write_socket_owner(self) -> None:
         """Claim the socket-owner sidecar with our PID after binding (best-effort).
 
-        Atomic publish (write temp + os.replace): a plain truncate-then-write
-        leaves a window where a concurrently-starting daemon's _read_socket_owner
-        sees an empty file → None → "no live owner" → it steals the socket and we
-        get a duplicate (the exact storm this guards against). os.replace makes the
-        sidecar flip from old content to full new content with no empty window.
+        Delegates to :class:`SocketSidecarOwner` which uses an atomic
+        os.replace write to avoid the empty-file race window.
         """
-        path = self._socket_owner_path()
-        tmp = f"{path}.{os.getpid()}.tmp"
-        try:
-            with open(tmp, "w") as fh:
-                fh.write(str(os.getpid()))
-            os.replace(tmp, path)
-        except OSError:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
+        self._sidecar.write_pid()
 
     def _read_socket_owner(self) -> Optional[int]:
         """Read the socket-owner PID sidecar; None if absent/corrupt."""
-        try:
-            with open(self._socket_owner_path()) as fh:
-                content = fh.read().strip()
-        except (FileNotFoundError, OSError):
-            return None
-        try:
-            return int(content)
-        except ValueError:
-            return None
+        return self._sidecar.read_pid()
 
     def _remove_socket_owner(self) -> None:
         """Remove the socket-owner sidecar on exit (best-effort)."""
-        try:
-            os.unlink(self._socket_owner_path())
-        except (FileNotFoundError, OSError):
-            pass
+        self._sidecar.remove_pid()
 
     def _reap_orphan_holder(self) -> None:
         """Kill an older daemon still holding our socket path before we rebind.
@@ -1481,9 +1460,10 @@ class TLDRDaemon:
         PID; reading a different, live PID means we have been superseded and are
         now an orphan — we must self-evict. A missing or dead PID is NOT treated
         as superseded (we keep serving until a real replacement exists).
+
+        Delegates to :meth:`SocketSidecarOwner.is_superseded`.
         """
-        pid = self._read_socket_owner()
-        return pid is not None and pid != os.getpid() and _pid_alive(pid)
+        return self._sidecar.is_superseded()
 
     def _create_socket(self):
         """Create and bind the socket (legacy method, calls _create_server_socket)."""
