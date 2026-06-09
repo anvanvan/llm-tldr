@@ -1150,8 +1150,47 @@ class HybridExtractor:
         # Collect all defined function/method names for call graph filtering
         defined_names = self._collect_rust_definitions(tree.root_node, source)
 
-        self._extract_rust_nodes(tree.root_node, source, module_info, defined_names)
+        # impl_link maps an implementing-type name -> list of method FunctionInfo
+        # collected from impl blocks during the walk.  Because impl blocks may
+        # appear textually BEFORE the owning struct/enum (forward refs), the
+        # association is resolved in a single post-walk pass below rather than
+        # inline at impl-visit time.
+        impl_link: dict[str, list[FunctionInfo]] = {}
+        self._extract_rust_nodes(tree.root_node, source, module_info, defined_names, impl_link)
+        self._link_rust_impl_methods(module_info, impl_link)
         return module_info
+
+    def _link_rust_impl_methods(
+        self,
+        module_info: ModuleInfo,
+        impl_link: dict[str, list[FunctionInfo]],
+    ) -> None:
+        """Post-walk linker: attach impl-block methods to the owning ClassInfo.
+
+        Keyed by the implementing type's bare name (the type after ``impl`` /
+        after ``for`` in ``impl Trait for Type``).  Handles forward references
+        (impl block before its struct/enum) because the full set of ClassInfo
+        objects is available by the time this runs.  ``module_info.functions``
+        is intentionally left untouched so the existing functions[]-oriented
+        tests stay green.
+        """
+        if not impl_link:
+            return
+        class_by_name: dict[str, ClassInfo] = {c.name: c for c in module_info.classes}
+        for impl_type, methods in impl_link.items():
+            cls = class_by_name.get(impl_type)
+            if cls is None:
+                # Tolerate generic params / path prefixes on the impl type,
+                # e.g. ``impl Foo<T>`` or ``impl crate::Foo`` -> bare ``Foo``.
+                bare = impl_type.split("<", 1)[0].split("::")[-1].strip()
+                cls = class_by_name.get(bare)
+            if cls is None:
+                continue
+            existing = {m.name for m in cls.methods}
+            for method in methods:
+                if method.name not in existing:
+                    cls.methods.append(method)
+                    existing.add(method.name)
 
     def _collect_rust_definitions(self, node, source: bytes) -> set[str]:
         """Collect all defined function/method names in Rust code."""
@@ -1186,10 +1225,24 @@ class HybridExtractor:
             self._ts_parsers["rust"] = parser
         return self._ts_parsers["rust"]
 
-    def _extract_rust_nodes(self, node, source: bytes, module_info: ModuleInfo, defined_names: set[str] | None = None):
-        """Recursively extract from Rust tree-sitter nodes."""
+    def _extract_rust_nodes(self, node, source: bytes, module_info: ModuleInfo, defined_names: set[str] | None = None, impl_link: dict[str, list[FunctionInfo]] | None = None):
+        """Recursively extract from Rust tree-sitter nodes.
+
+        Args:
+            node: The current tree-sitter node to extract from.
+            source: The source code bytes.
+            module_info: ModuleInfo accumulator where classes/functions are appended.
+            defined_names: Set of all defined function/method names (for call-graph filtering).
+            impl_link: Dict mapping implementing-type name -> list of FunctionInfo methods
+                collected during the walk from impl blocks. Passed through recursion and
+                threaded to _extract_rust_impl so methods are registered for post-walk
+                linking to ClassInfo.methods[] in _link_rust_impl_methods. Handles
+                forward-ref cases where impl blocks appear before struct/enum definitions.
+        """
         if defined_names is None:
             defined_names = set()
+        if impl_link is None:
+            impl_link = {}
 
         for child in node.children:
             node_type = child.type
@@ -1220,6 +1273,12 @@ class HybridExtractor:
                 if cls:
                     module_info.classes.append(cls)
 
+            # Enum definitions (produce a ClassInfo so impl methods can link)
+            elif node_type == "enum_item":
+                cls = self._extract_rust_enum(child, source)
+                if cls:
+                    module_info.classes.append(cls)
+
             # Trait definitions
             elif node_type == "trait_item":
                 cls = self._extract_rust_trait(child, source)
@@ -1228,11 +1287,11 @@ class HybridExtractor:
 
             # Impl blocks
             elif node_type == "impl_item":
-                self._extract_rust_impl(child, source, module_info, defined_names)
+                self._extract_rust_impl(child, source, module_info, defined_names, impl_link)
 
             # Recurse into module items
             if node_type in ("source_file", "mod_item", "declaration_list"):
-                self._extract_rust_nodes(child, source, module_info, defined_names)
+                self._extract_rust_nodes(child, source, module_info, defined_names, impl_link)
 
     def _extract_rust_function(self, node, source: bytes) -> FunctionInfo | None:
         """Extract Rust function item."""
@@ -1304,6 +1363,32 @@ class HybridExtractor:
             end_line=node.end_point[0] + 1,
         )
 
+    def _extract_rust_enum(self, node, source: bytes) -> ClassInfo | None:
+        """Extract Rust enum definition as a ClassInfo.
+
+        Enums are modelled as classes (like structs) so that their ``impl``
+        block methods can be linked into ``ClassInfo.methods[]`` by the
+        post-walk linker.  The enum name is the ``type_identifier`` child.
+        """
+        name = ""
+
+        for child in node.children:
+            if child.type == "type_identifier":
+                name = self._safe_decode(source[child.start_byte:child.end_byte])
+                break
+
+        if not name:
+            return None
+
+        return ClassInfo(
+            name=name,
+            bases=[],
+            docstring=None,
+            methods=[],
+            line_number=node.start_point[0] + 1,
+            end_line=node.end_point[0] + 1,
+        )
+
     def _extract_rust_trait(self, node, source: bytes) -> ClassInfo | None:
         """Extract Rust trait definition."""
         name = ""
@@ -1356,7 +1441,7 @@ class HybridExtractor:
 
         return impl_type
 
-    def _extract_rust_impl(self, node, source: bytes, module_info: ModuleInfo, defined_names: set[str] | None = None):
+    def _extract_rust_impl(self, node, source: bytes, module_info: ModuleInfo, defined_names: set[str] | None = None, impl_link: dict[str, list[FunctionInfo]] | None = None):
         """Extract Rust impl block methods and associate with struct/trait.
 
         For each ``function_item`` inside the impl's ``declaration_list``:
@@ -1369,9 +1454,14 @@ class HybridExtractor:
           4. Call-graph caller key uses ``.`` separator: ``Type.method``
              (matches the qualified FunctionInfo key and TS class-method
              convention).
+          5. Register each method in ``impl_link`` (keyed by implementing type) for
+             post-walk linking to the owning type's ClassInfo in ``_link_rust_impl_methods``.
+             This enables forward-ref resolution (impl blocks before struct/enum definitions).
         """
         if defined_names is None:
             defined_names = set()
+        if impl_link is None:
+            impl_link = {}
 
         impl_type = self._parse_rust_impl_type(node, source)
 
@@ -1385,7 +1475,10 @@ class HybridExtractor:
                             bare_name = func.name
                             module_info.functions.append(func)
                             defined_names.add(bare_name)
+                            # Register this method for post-walk linking to the
+                            # owning type's ClassInfo (handles forward refs).
                             if impl_type:
+                                impl_link.setdefault(impl_type, []).append(func)
                                 qualified = dataclasses.replace(
                                     func,
                                     name=f"{impl_type}.{bare_name}",
@@ -2450,7 +2543,29 @@ class HybridExtractor:
         call_graph = module_info.call_graph or CallGraphInfo()
         module_info.call_graph = call_graph
 
-        for child in node.children:
+        children = list(node.children)
+
+        # tree-sitter-swift sometimes wraps an unterminated top-level type
+        # declaration (e.g. a `@MainActor @Observable final class` whose body
+        # the parser fails to close) in an ERROR node. The class is otherwise
+        # silently dropped and its member function_declarations leak as
+        # top-level siblings AFTER the ERROR node. Recover such classes first,
+        # collecting the indices of the leaked method siblings so the normal
+        # loop below does not also emit them as free functions.
+        claimed_indices: set[int] = set()
+        if node.type == "source_file":
+            for idx, child in enumerate(children):
+                if child.type == "ERROR":
+                    recovered = self._recover_swift_error_class(
+                        child, children, idx, source,
+                        defined_names or set(), call_graph, claimed_indices,
+                    )
+                    if recovered:
+                        module_info.classes.append(recovered)
+
+        for idx, child in enumerate(children):
+            if idx in claimed_indices:
+                continue
             if child.type == "function_declaration":
                 func_info = self._extract_swift_function(child, source)
                 if func_info:
@@ -2489,6 +2604,105 @@ class HybridExtractor:
             # module_info.functions.
             if child.type == "source_file":
                 self._extract_swift_nodes(child, source, module_info, defined_names)
+
+    def _recover_swift_error_class(
+        self,
+        error_node,
+        siblings: list,
+        error_idx: int,
+        source: bytes,
+        defined_names: set[str],
+        call_graph: CallGraphInfo,
+        claimed_indices: set[int],
+    ) -> ClassInfo | None:
+        """Recover a type declaration that tree-sitter wrapped in an ERROR node.
+
+        The ERROR node typically contains a type keyword (``class`` / ``struct``
+        / ``enum`` / ``actor`` / ``protocol``), the type's ``simple_identifier``
+        name, an opening brace and some leading members. The remaining members
+        (notably ``function_declaration`` nodes) leak as top-level siblings AFTER
+        the ERROR node because the body brace was never closed. This method:
+
+          1. Reads the type name from the ERROR node's keyword + identifier.
+          2. Collects ``function_declaration`` members found inside the ERROR
+             node itself.
+          3. Re-attaches the leaked ``function_declaration`` siblings that follow
+             the ERROR node, recording their indices in ``claimed_indices`` so the
+             caller does not also emit them as free functions.
+
+        Returns ``None`` when the ERROR node does not look like a recoverable
+        type declaration (no type keyword + name), leaving normal handling intact.
+        """
+        type_keywords = {"class", "struct", "enum", "actor", "protocol", "extension"}
+
+        name = None
+        kids = list(error_node.children)
+        for i, c in enumerate(kids):
+            if c.type in type_keywords:
+                # The simple_identifier name follows the keyword.
+                for nxt in kids[i + 1:]:
+                    if nxt.type == "simple_identifier":
+                        name = self._safe_decode(
+                            source[nxt.start_byte:nxt.end_byte]
+                        ).strip()
+                        break
+                if name:
+                    break
+
+        if not name:
+            return None
+
+        methods: list[FunctionInfo] = []
+        seen: set[str] = set()
+
+        def _add_method(member) -> None:
+            method = self._extract_swift_function(member, source)
+            if method and method.name not in seen:
+                methods.append(method)
+                seen.add(method.name)
+                qualified_caller = f"{name}.{method.name}"
+                self._extract_swift_calls(
+                    member, qualified_caller, source, call_graph, defined_names
+                )
+
+        # Members that the parser kept inside the ERROR node.
+        for member in kids:
+            if member.type == "function_declaration":
+                _add_method(member)
+
+        # Leaked members: top-level function_declaration siblings following the
+        # ERROR node belong to this unterminated type. Re-attach them and mark
+        # their indices so they are not re-emitted as free functions.
+        end_line = error_node.end_point[0] + 1
+        for sib_idx in range(error_idx + 1, len(siblings)):
+            sib = siblings[sib_idx]
+            # Stop at the next type-declaration or ERROR boundary so the sweep
+            # does not cross into a following type and over-claim its trailing
+            # free functions, nor double-attach siblings across multiple
+            # ERROR-wrapped classes in the same file.
+            if sib.type in (
+                "class_declaration",
+                "struct_declaration",
+                "enum_declaration",
+                "protocol_declaration",
+                "extension_declaration",
+                "actor_declaration",
+                "ERROR",
+            ):
+                break
+            if sib.type == "function_declaration":
+                claimed_indices.add(sib_idx)
+                _add_method(sib)
+                end_line = max(end_line, sib.end_point[0] + 1)
+
+        return ClassInfo(
+            name=name,
+            methods=methods,
+            bases=[],
+            docstring=None,
+            line_number=error_node.start_point[0] + 1,
+            end_line=end_line,
+        )
 
     def _extract_swift_function(self, node, source: bytes) -> FunctionInfo | None:
         """Extract function info from Swift function_declaration."""
