@@ -10,12 +10,35 @@ from __future__ import annotations
 
 import queue as _queue
 import threading
-from concurrent.futures import Future
-from typing import Callable, List
+from concurrent.futures import CancelledError, Future
+from typing import Callable, List, Optional, Protocol, runtime_checkable
 
 import numpy as np
 
 _SHUTDOWN = object()
+
+
+@runtime_checkable
+class EmbedQueueProtocol(Protocol):
+    """Structural protocol for an embed queue seam.
+
+    Both the real :class:`EmbedQueue` and test doubles satisfy this
+    protocol, allowing ``ModelServer._embed_queue`` to be typed as
+    ``EmbedQueueProtocol`` so test fakes are assignable without a
+    ``type: ignore``.
+    """
+
+    def submit(
+        self,
+        texts: List[str],
+        cancelled: Optional[threading.Event] = None,
+    ) -> Future:
+        """Enqueue texts; return a Future resolving to the embed result."""
+        ...
+
+    def shutdown(self) -> None:
+        """Drain queued jobs and stop the worker."""
+        ...
 
 
 class EmbedQueue:
@@ -32,10 +55,24 @@ class EmbedQueue:
         self._worker = threading.Thread(target=self._run_loop, daemon=True)
         self._worker.start()
 
-    def submit(self, texts: List[str]) -> "Future":
-        """Enqueue an embed job; return a Future resolving to its ndarray result."""
+    def submit(
+        self,
+        texts: List[str],
+        cancelled: "Optional[threading.Event]" = None,
+    ) -> "Future":
+        """Enqueue an embed job; return a Future resolving to its ndarray result.
+
+        Args:
+            texts: The strings to embed.
+            cancelled: Optional per-job liveness token. When set *before* the
+                worker dequeues this job, the job is skipped (its Future is
+                resolved with ``CancelledError``) and ``embed_fn`` is never
+                called — tying the job's GPU work to its originating client's
+                liveness. ``None`` (the default) means "never cancel", i.e. the
+                pre-existing fire-and-forget behavior.
+        """
         future: "Future" = Future()
-        self._queue.put((texts, future))
+        self._queue.put((texts, future, cancelled))
         return future
 
     def _run_loop(self) -> None:
@@ -44,8 +81,17 @@ class EmbedQueue:
             if item is _SHUTDOWN:
                 self._queue.task_done()
                 return
-            texts, future = item
+            texts, future, cancelled = item
             try:
+                # Liveness guard: skip orphaned jobs whose originating client
+                # died before dequeue. Checked AFTER dequeue, BEFORE embed_fn —
+                # the in-flight job is uncancellable, but not-yet-started jobs
+                # never touch the GPU. No MPS teardown here (60bce6d invariant).
+                if cancelled is not None and cancelled.is_set():
+                    future.set_exception(
+                        CancelledError("embed job cancelled before dequeue")
+                    )
+                    continue
                 result = self._embed_fn(texts)
                 future.set_result(result)
             except BaseException as exc:  # noqa: BLE001

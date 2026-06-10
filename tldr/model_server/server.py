@@ -9,19 +9,24 @@ vectors. ``shutdown()`` cleanly unblocks ``run()``.
 from __future__ import annotations
 
 import os
+import select
 import signal
 import socket
 import tempfile
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
-from typing import List
+from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeout
+from typing import TYPE_CHECKING, List
 
 import numpy as np
 
 from .lifecycle import ModelServerLifecycle
 from .queue import EmbedQueue
 from .transport import recv_message, send_message
+
+if TYPE_CHECKING:
+    from .queue import EmbedQueueProtocol
 
 _ACCEPT_TIMEOUT = 0.2
 
@@ -116,7 +121,7 @@ class ModelServer:
         self._sidecar = SocketSidecarOwner(socket_path, suffix=".pid")
         self._idle_seconds = idle_seconds
         self._lifecycle = ModelServerLifecycle(idle_seconds=idle_seconds)
-        self._embed_queue = EmbedQueue(embed_fn=self._embed)
+        self._embed_queue: EmbedQueueProtocol = EmbedQueue(embed_fn=self._embed)
         self._stop = threading.Event()
         self._server_sock: socket.socket | None = None
 
@@ -406,8 +411,9 @@ class ModelServer:
     def _handle_connection(self, conn: socket.socket) -> None:
         try:
             req = recv_message(conn)
-            response = self._dispatch(req)
-            send_message(conn, response)
+            response = self._dispatch(req, conn)
+            if response is not None:
+                send_message(conn, response)
         except Exception as exc:  # noqa: BLE001
             try:
                 send_message(conn, {"status": "error", "error": str(exc)})
@@ -416,12 +422,21 @@ class ModelServer:
         finally:
             conn.close()
 
-    def _dispatch(self, req: dict) -> dict:
+    def _dispatch(self, req: dict, conn: "socket.socket | None" = None) -> "dict | None":
         cmd = req.get("cmd")
         if cmd == "embed":
             texts = req.get("texts", [])
-            future = self._embed_queue.submit(texts)
-            vecs = future.result()
+            # Per-request liveness token: tie this embed job's GPU work to its
+            # originating connection. If the client dies while the job is still
+            # queued, ``cancelled`` is set out-of-band (below) and the worker
+            # skips it at dequeue without ever touching the GPU.
+            cancelled = threading.Event()
+            future = self._embed_queue.submit(texts, cancelled=cancelled)
+            vecs = self._await_embed(future, conn, cancelled)
+            if vecs is None:
+                # Client disconnected before the job ran; it was cancelled and
+                # nothing should be sent back over the (now-dead) socket.
+                return None
             arr = np.asarray(vecs)
             return {
                 "status": "ok",
@@ -431,6 +446,59 @@ class ModelServer:
         if cmd == "ping":
             return {"status": "ok"}
         return {"status": "error", "error": f"unknown cmd: {cmd!r}"}
+
+    def _await_embed(
+        self,
+        future: "Future[np.ndarray]",
+        conn: "socket.socket | None",
+        cancelled: "threading.Event | None",
+    ) -> "np.ndarray | None":
+        """Wait for ``future`` while watching ``conn`` for client disconnect.
+
+        Blocking on ``future.result()`` directly is too late to cancel queued
+        work: the connection only closes in ``_handle_connection``'s ``finally``
+        AFTER ``result()`` returns. Instead we poll the originating socket for
+        readable-EOF (a closed peer becomes readable and ``recv`` yields ``b""``)
+        in a short timeout loop. On detected disconnect we set ``cancelled`` so
+        the queue worker skips the still-queued job at dequeue — never running
+        an orphaned job on the GPU. The in-flight job is allowed to finish.
+
+        Returns the embed result, or ``None`` when the client disconnected and
+        the job was cancelled (no response should be sent).
+        """
+        if conn is None or cancelled is None:
+            # No connection to watch (e.g. direct/test dispatch) or no cancel
+            # seam available — behave like the original fire-and-forget wait.
+            return future.result()
+
+        while True:
+            try:
+                return future.result(timeout=_ACCEPT_TIMEOUT)
+            except FutureTimeout:
+                pass
+            except CancelledError:
+                # Worker skipped the job (the client already disconnected).
+                return None
+
+            # Future still pending: check whether the client is still alive.
+            # A live client is idle (no half-message after its request), so the
+            # socket is NOT readable; a dead client's half becomes readable and
+            # recv returns b"" (EOF).
+            try:
+                readable, _, _ = select.select([conn], [], [], 0)
+            except (OSError, ValueError):
+                # Socket already closed/invalid — treat as a disconnect.
+                cancelled.set()
+                continue
+            if readable:
+                try:
+                    peek = conn.recv(1, socket.MSG_PEEK)
+                except OSError:
+                    peek = b""
+                if not peek:
+                    # EOF: client is gone. Cancel the queued job and stop
+                    # waiting once the worker honors it (or finishes in flight).
+                    cancelled.set()
 
     def shutdown(self) -> None:
         """Signal the accept loop to stop and tear down the queue — bounded.

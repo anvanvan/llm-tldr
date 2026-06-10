@@ -218,6 +218,100 @@ class TestEmbedQueueSingleJobInvariant:
         assert result is not None, "shutdown() must not discard already-submitted jobs"
 
 
+class TestEmbedQueueDropsCancelledJobs:
+    """EmbedQueue must skip queued jobs whose per-job cancel Event is set.
+
+    Regression for the embed orphan-drain bug: when all clients mass-die, the
+    single worker drains the entire queued backlog on the GPU for dead readers.
+    The fix threads a ``cancelled: threading.Event | None`` token through
+    ``submit()`` and guards it at dequeue, *before* ``embed_fn``: a job whose
+    Event is set before it is dequeued is resolved with an exception and NEVER
+    embedded.
+
+    RED on current code: ``submit()`` accepts only ``texts`` (no ``cancelled``
+    arg) and ``_run_loop`` runs every job unconditionally — so this either
+    raises TypeError on the extra arg or the worker ignores the token and runs
+    all N jobs (counter == N, not 1).
+    """
+
+    def test_cancelled_queued_jobs_are_skipped_not_embedded(self):
+        """A backlog whose jobs are cancelled before dequeue runs only the in-flight job.
+
+        Arrange: an EmbedQueue with a slow stub embed_fn that signals when the
+        in-flight job has started, then blocks until released, counting every
+        real call. Submit N jobs, each with its own threading.Event cancel token.
+        Act: let only job 1 enter embed_fn, set the Events of jobs 2..N
+        out-of-band (before the worker dequeues them), then release job 1.
+        Assert: embed_fn ran exactly once (in-flight only); the N-1 cancelled
+        futures raise (CancelledError-equivalent), NOT a successful ndarray.
+
+        RED reason: current submit() has no `cancelled` param and _run_loop
+        honors no liveness token — orphaned jobs all run (counter == N).
+        """
+        from tldr.model_server.queue import EmbedQueue  # noqa: F401
+
+        n_jobs = 10
+
+        embed_calls = [0]
+        call_lock = threading.Lock()
+        in_flight_started = threading.Event()  # signalled once job 1 is inside embed_fn
+        release = threading.Event()            # holds job 1 in flight until set
+
+        def slow_embed(texts: list[str]) -> np.ndarray:
+            with call_lock:
+                embed_calls[0] += 1
+            in_flight_started.set()
+            # Keep the first (in-flight) job inside embed_fn long enough for us
+            # to cancel the rest of the backlog out-of-band before dequeue.
+            release.wait(timeout=5.0)
+            return np.ones((len(texts), _DIM), dtype=np.float32)
+
+        q = EmbedQueue(embed_fn=slow_embed)
+
+        cancel_events = [threading.Event() for _ in range(n_jobs)]
+        futures: list[Future] = []
+        for i in range(n_jobs):
+            f = q.submit([f"text-{i}"], cancelled=cancel_events[i])
+            futures.append(f)
+
+        # Wait until job 1 is actually inside embed_fn (deterministic latch).
+        assert in_flight_started.wait(timeout=5.0), (
+            "in-flight job never entered embed_fn — worker did not start"
+        )
+
+        # Originating clients die: cancel every still-queued job (2..N) BEFORE
+        # the worker dequeues them. Job 1 is already in flight and uncancellable.
+        for ev in cancel_events[1:]:
+            ev.set()
+
+        # Release the in-flight job so the worker can drain the rest of the queue.
+        release.set()
+
+        # The in-flight job (job 1) resolves to a real ndarray.
+        head = futures[0].result(timeout=5.0)
+        assert isinstance(head, np.ndarray), (
+            f"In-flight job must resolve to an ndarray, got {type(head)}"
+        )
+
+        # Every cancelled job (2..N) must raise — NOT return a successful result.
+        for i, f in enumerate(futures[1:], start=1):
+            with pytest.raises(BaseException) as excinfo:
+                f.result(timeout=5.0)
+            assert "Cancel" in type(excinfo.value).__name__, (
+                f"Cancelled job {i} must raise a CancelledError-equivalent, "
+                f"got {type(excinfo.value).__name__}: {excinfo.value!r}"
+            )
+
+        # The decisive assertion: embed_fn ran ONLY for the in-flight job.
+        assert embed_calls[0] == 1, (
+            f"EmbedQueue must skip cancelled queued jobs at dequeue: embed_fn "
+            f"should run exactly once (the in-flight job), but ran "
+            f"{embed_calls[0]} times — orphaned jobs were drained on the GPU."
+        )
+
+        q.shutdown()
+
+
 # ===========================================================================
 # SECTION 3 — ModelServerLifecycle (tldr/model_server/lifecycle.py)
 # ===========================================================================
@@ -573,7 +667,7 @@ class TestModelServerAcceptLoop:
 
         # Fake embed queue that returns immediately
         class FakeEmbedQueue:
-            def submit(self, texts):
+            def submit(self, texts, cancelled=None):
                 f: Future = Future()
                 f.set_result(fake_vecs[:len(texts)])
                 return f
@@ -634,4 +728,141 @@ class TestModelServerAcceptLoop:
 
         assert not server_thread.is_alive(), (
             "server.shutdown() must cause run() to exit; thread still alive after 5s"
+        )
+
+
+# ===========================================================================
+# SECTION 5 — Server socket-EOF cancellation wiring (A-4)
+# ===========================================================================
+
+
+class TestServerSocketEOFCancels:
+    """Full end-to-end wiring: socket EOF → cancelled.set() → queue-skip.
+
+    Uses a REAL ModelServer bound to a temp Unix socket with its embed leaf
+    stubbed to a slow function so queued jobs accumulate. Forcibly closing
+    client sockets before responses are read must cause the worker to STOP
+    running queued jobs — the stub counter freezes at ~1 (in-flight only),
+    not at the full backlog count.
+    """
+
+    def test_socket_eof_cancels_queued_embed_jobs(self, tmp_path: Path):
+        """Closing client sockets halts orphaned queued jobs via the cancel wiring.
+
+        Arrange: a real ModelServer whose ``_embed`` leaf is stubbed to a slow
+        function (0.15 s/job) that increments a shared counter and gates the
+        first job on a latch so we can guarantee the backlog is queued before
+        any client dies.
+
+        Act: submit N_JOBS embed requests from N_JOBS real socket clients (one
+        per connection), wait until the first job is in flight, then forcibly
+        close ALL client sockets without reading responses.
+
+        Assert: within a generous bound the counter stops at ~1 (in-flight job
+        only). The decisive assertion is counter <= 2 after disconnect: even if
+        one extra job slips through the race window, the rest of the backlog must
+        be skipped, not drained.
+        """
+        from tldr.model_server.server import ModelServer
+        from tldr.model_server.transport import send_message, connect_unix
+
+        N_JOBS = 12
+        JOB_SLEEP = 0.15
+
+        sock_path = str(tmp_path / "eof_cancel_test.sock")
+
+        # --- Shared state for the stub ---
+        embed_calls = [0]
+        call_lock = threading.Lock()
+        in_flight_started = threading.Event()  # set once job 1 is inside stub
+        release_in_flight = threading.Event()  # released after clients are killed
+
+        def slow_embed(texts):
+            with call_lock:
+                embed_calls[0] += 1
+            in_flight_started.set()
+            # Block the first (in-flight) job until we've closed all clients.
+            release_in_flight.wait(timeout=10.0)
+            time.sleep(JOB_SLEEP)
+            return np.zeros((len(texts), _DIM), dtype=np.float32)
+
+        # Patch the _embed class method BEFORE instantiation so the EmbedQueue
+        # (created in __init__ with embed_fn=self._embed) captures the stub.
+        # Mirror the reproduce_orphan_drain.py approach exactly.
+        original_embed = ModelServer._embed  # type: ignore[attr-defined]
+        ModelServer._embed = lambda self, texts: slow_embed(texts)  # type: ignore[method-assign]
+        try:
+            server = ModelServer(socket_path=sock_path, idle_seconds=3600)
+        finally:
+            ModelServer._embed = original_embed  # type: ignore[method-assign]
+
+        client_sockets: list = []
+        server_thread = threading.Thread(target=server.run, daemon=True,
+                                         name="eof-cancel-test-server")
+        server_thread.start()
+
+        try:
+            # Wait for socket to appear.
+            deadline = time.time() + 5.0
+            while time.time() < deadline:
+                if Path(sock_path).exists():
+                    break
+                time.sleep(0.02)
+            assert Path(sock_path).exists(), (
+                f"Server socket {sock_path} did not appear within 5 s"
+            )
+
+            # Submit N_JOBS embed requests — one socket per request, none read.
+            for i in range(N_JOBS):
+                s = connect_unix(sock_path, timeout=5.0)
+                req = {"cmd": "embed", "texts": [f"text-{i}"], "request_id": i}
+                send_message(s, req)
+                client_sockets.append(s)
+
+            # Wait until the first job is inside the stub (queue is backlogged).
+            assert in_flight_started.wait(timeout=10.0), (
+                "In-flight job never entered stub — worker did not start"
+            )
+
+            # Snapshot the counter right before we kill clients.
+            with call_lock:
+                calls_before_kill = embed_calls[0]
+
+            # Kill all client sockets — this is the EOF event that should
+            # trigger cancelled.set() in _await_embed for every queued job.
+            for s in client_sockets:
+                try:
+                    s.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+                s.close()
+            client_sockets.clear()
+
+            # Release the in-flight job so the worker can drain the queue.
+            release_in_flight.set()
+
+            # Wait for the worker to drain whatever remains (bounded).
+            # A correct implementation stops after ~1-2 jobs; a broken one
+            # runs all N_JOBS. Give it 3× a full-backlog run to be safe.
+            time.sleep(N_JOBS * JOB_SLEEP * 0.4)
+
+            with call_lock:
+                final_calls = embed_calls[0]
+
+        finally:
+            server.shutdown()
+            for s in client_sockets:
+                try:
+                    s.close()
+                except OSError:
+                    pass
+
+        # The decisive assertion: most queued jobs were skipped.
+        # Allow up to 2 to account for timing races (1 in-flight + 1 that may
+        # have dequeued before the EOF was observed by _await_embed).
+        assert final_calls <= 2, (
+            f"Socket-EOF cancellation must halt queued jobs: expected at most 2 "
+            f"embed calls (in-flight + possible race), got {final_calls}. "
+            f"Before kill: {calls_before_kill}. "
+            f"The socket-EOF → cancelled.set() → queue-skip wiring is broken."
         )
