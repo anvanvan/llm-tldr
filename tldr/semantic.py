@@ -180,7 +180,10 @@ DEFAULT_MODEL = "bge-large-en-v1.5"
 
 # Project root markers - files that indicate a project root
 # Strong VCS/build markers that authoritatively identify a project root.
-PROJECT_ROOT_MARKERS = [".git", "pyproject.toml", "package.json", "Cargo.toml", "go.mod"]
+# ``.svn`` assumes modern svn (1.7+, 2009+): a single ``.svn`` at the
+# working-copy root. We deliberately do NOT handle legacy per-directory ``.svn``
+# (svn <=1.6) — for those, Pass-1's closest-ancestor walk would re-fragment.
+PROJECT_ROOT_MARKERS = [".git", ".svn", "pyproject.toml", "package.json", "Cargo.toml", "go.mod"]
 # Weak fallback marker: an existing .tldr cache dir identifies a previously
 # indexed root, but ONLY when no strong marker exists anywhere up the tree. It
 # must never shadow a real project root above it — otherwise a stray .tldr cache

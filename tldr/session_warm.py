@@ -193,7 +193,7 @@ def maybe_warm_background(
     project_path: Path,
     max_age_hours: float = DEFAULT_MAX_AGE_HOURS,
     max_files: int = DEFAULT_MAX_FILES,
-    language: str = "python",
+    language: str = "all",
 ) -> bool:
     """
     Spawn background warming if cache is stale and project is small enough.
@@ -202,7 +202,9 @@ def maybe_warm_background(
         project_path: Path to project root
         max_age_hours: Maximum cache age before warming (default: 24)
         max_files: Maximum project size for auto-warming (default: 500)
-        language: Language for call graph (default: "python")
+        language: Language for call graph (default: "all" — auto-detect every
+            language present, mirroring the ``tldr warm --lang`` default; a Java
+            project no longer warms an empty ``languages:["python"]`` call graph)
 
     Returns:
         True if background warming was spawned, False otherwise

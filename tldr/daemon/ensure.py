@@ -80,6 +80,23 @@ def _release_exclusive_lock(lock_file) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _anchor_project(project: str) -> str:
+    """Resolve a project path to the smart project root.
+
+    Routes the raw ``--path``/``--project`` arg through
+    :func:`tldr.semantic._find_project_root` so a daemon started for a deep
+    subdir of a marker-bearing project (``.git``, ``.svn``, ``.tldr`` cache, …)
+    anchors at the project root — exactly where the in-process indexer anchors —
+    instead of fragmenting into a fresh per-subdir ``.tldr`` cache.
+
+    Imported lazily to avoid pulling the heavy :mod:`tldr.semantic` module (and
+    its transitive ML deps) into the ensure-up fast path / import graph.
+    """
+    from ..semantic import _find_project_root
+
+    return str(_find_project_root(Path(project)))
+
+
 def _get_socket_path(project: str) -> Path:
     """Compute the daemon socket path for a project."""
     hash_val = hashlib.md5(str(Path(project).resolve()).encode()).hexdigest()[:8]
@@ -156,6 +173,12 @@ def ensure_daemon(project: str, timeout: float = 10.0) -> None:
     when the daemon is absent. The lock prevents concurrent callers from
     double-spawning.
     """
+    # Anchor the raw path at the smart project root BEFORE deriving any
+    # socket/lock identity or the spawn argv, so every daemon entry point
+    # (ensure/start/stop/status/query/notify) agrees on a single root and the
+    # daemon never fragments into a per-subdir index. See _anchor_project.
+    project = _anchor_project(project)
+
     # Fast path: daemon already running (no lock needed).
     if _ping_daemon(project):
         return

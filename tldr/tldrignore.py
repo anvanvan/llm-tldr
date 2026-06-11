@@ -22,8 +22,8 @@ if TYPE_CHECKING:
 # Strong VCS/build markers identifying a real project root. Used to BOUND the
 # ancestor walk in ensure_tldrignore so it never looks above the project root
 # (kept local to avoid importing the heavy tldr.semantic module). Mirrors
-# tldr.semantic.PROJECT_ROOT_MARKERS.
-_STRONG_ROOT_MARKERS = (".git", "pyproject.toml", "package.json", "Cargo.toml", "go.mod")
+# tldr.semantic.PROJECT_ROOT_MARKERS (``.svn`` assumes modern single-root svn 1.7+).
+_STRONG_ROOT_MARKERS = (".git", ".svn", "pyproject.toml", "package.json", "Cargo.toml", "go.mod")
 
 # Default .tldrignore template
 DEFAULT_TEMPLATE = """\

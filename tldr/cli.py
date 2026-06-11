@@ -678,7 +678,23 @@ Semantic Search:
         args.path = args.path_pos
 
     def _routed_project(parsed) -> str | None:
-        """Resolve the project root for a daemon-routed subcommand."""
+        """Resolve the project path for a daemon-routed subcommand.
+
+        Returns the ANCHORED project root (via ``_find_project_root``) so that
+        every daemon consumer — ``ensure_daemon``, ``query_daemon``, daemon
+        start/stop/status — all derive their socket hash from the same path.
+        Without anchoring here, ``ensure_daemon`` would anchor internally (via
+        ``_anchor_project``) and compute socket = md5(anchored root), while
+        ``query_daemon`` would use the raw resolved subdir and compute a
+        different socket hash → silent mismatch for deep ``--path`` args under
+        SVN/non-.git roots.  ``_find_project_root`` is idempotent, so passing
+        an already-anchored root is a safe no-op.
+
+        Imported lazily (function-local) to mirror ``ensure.py``'s deferred
+        import pattern and avoid pulling heavy ML deps at CLI startup.
+        """
+        from .semantic import _find_project_root
+
         for attr in ("project", "path"):
             val = getattr(parsed, attr, None)
             # Multi-path commands warm the daemon for the first path only
@@ -687,11 +703,12 @@ Semantic Search:
                 val = val[0] if val else None
             if val:
                 p = Path(val)
-                return str((p.parent if p.is_file() else p).resolve())
+                raw = p.parent if p.is_file() else p
+                return str(_find_project_root(raw.resolve()))
         file_val = getattr(parsed, "file", None)
         if file_val:
-            return str(Path(file_val).resolve().parent)
-        return str(Path(".").resolve())
+            return str(_find_project_root(Path(file_val).resolve().parent))
+        return str(_find_project_root(Path(".").resolve()))
 
     # Daemon ensure-up: for daemon-backed subcommands, make sure the per-project
     # daemon is running before dispatch. Failures here are non-fatal — dispatch
@@ -1590,8 +1607,13 @@ Semantic Search:
 
         elif args.command == "daemon":
             from .daemon import start_daemon, stop_daemon, query_daemon
+            from .semantic import _find_project_root
 
-            project_path = Path(args.project).resolve()
+            # Anchor at the smart project root so start/stop/status/query/notify
+            # (each defaulting --project to '.') all target the SAME socket as
+            # ensure_daemon — otherwise `daemon stop` misses and orphans the
+            # daemon that ensure_daemon started at the anchored root.
+            project_path = _find_project_root(Path(args.project))
 
             if args.action == "start":
                 # Ensure .tldr directory exists
