@@ -260,6 +260,20 @@ def _serialize_call_graph_to_cache(
 
 
 # =============================================================================
+# Shared constants
+# =============================================================================
+
+# Directories to skip when walking source trees (union of api + session_warm
+# sets so both modules stay consistent).
+SKIP_DIRS: frozenset[str] = frozenset({
+    "node_modules", "__pycache__", ".git", ".svn", ".hg",
+    "dist", "build", ".next", ".nuxt", "coverage", ".tox",
+    "venv", ".venv", "env", ".env", "vendor", ".cache",
+    ".pytest_cache", ".mypy_cache", "egg-info", ".eggs",
+})
+
+
+# =============================================================================
 # Security: Path Containment Validation
 # =============================================================================
 
@@ -2018,6 +2032,7 @@ def get_file_tree(
     extensions: set[str] | None = None,
     exclude_hidden: bool = True,
     ignore_spec=None,
+    max_depth: int | None = None,
 ) -> dict:
     """
     Get file tree structure for a project.
@@ -2027,6 +2042,10 @@ def get_file_tree(
         extensions: Optional set of extensions to include (e.g., {".py", ".ts"})
         exclude_hidden: If True, exclude hidden files/directories (default True)
         ignore_spec: Optional pathspec.PathSpec for gitignore-style patterns
+        max_depth: Optional depth cutoff. ``max_depth=N`` lists entries down to
+            N levels below root; directories at the cutoff appear with
+            ``children: []``. ``max_depth=0`` returns the root node only.
+            ``None`` (default) means unlimited (today's behavior).
 
     Returns:
         Dict with tree structure:
@@ -2047,8 +2066,12 @@ def get_file_tree(
 
     root = Path(root)
 
-    def scan_dir(path: Path) -> dict:
+    def scan_dir(path: Path, depth: int = 0) -> dict:
         result = {"name": path.name, "type": "dir", "children": []}
+
+        # Depth cutoff: dirs at the cutoff appear with empty children.
+        if max_depth is not None and depth >= max_depth:
+            return result
 
         try:
             items = sorted(path.iterdir(), key=lambda x: (x.is_file(), x.name.lower()))
@@ -2070,7 +2093,7 @@ def get_file_tree(
                 # Check if directory should be ignored
                 if ignore_spec and ignore_spec.match_file(rel_path + "/"):
                     continue
-                child = scan_dir(item)
+                child = scan_dir(item, depth + 1)
                 # Only include non-empty directories
                 if child["children"] or extensions is None:
                     result["children"].append(child)
@@ -2092,6 +2115,76 @@ def get_file_tree(
     return scan_dir(root)
 
 
+def normalize_grep_pattern(pattern: str) -> str:
+    r"""Rewrite grep/BRE-habit escapes into the ERE/Python-re the user meant.
+
+    Pure function, no I/O. Left-to-right scan with a bracket-class state
+    machine:
+
+    - Outside a ``[...]`` class: ``\|`` -> ``|``, ``\(`` -> ``(``,
+      ``\)`` -> ``)``, ``\d`` -> ``[0-9]``. An escaped backslash ``\\`` is
+      consumed as a pair and emitted verbatim — this is how intentional
+      literal escapes stay reachable (``\\d`` matches the literal text
+      ``\d``; ``\\|`` is a literal backslash followed by alternation). Every
+      other escape pair (``\.``, ``\b``, ``\w``, ``\s``, ``\+``, ...) is
+      emitted verbatim (same meaning in ERE and Python re). A trailing lone
+      ``\`` is emitted verbatim.
+    - Inside a class (entered on an unescaped ``[``, honoring a leading ``^``
+      and a literal first ``]``, exited on ``]``): everything, including
+      escape pairs, passes through untouched — prevents ``[\d]`` ->
+      ``[[0-9]]`` corruption. Literal metas thus stay reachable via classes:
+      ``[|]``, ``[(]``, ``[)]``.
+    """
+    out: list[str] = []
+    i = 0
+    n = len(pattern)
+    in_class = False
+    class_content_start = -1  # index of the first class-content char
+    _REWRITES = {"|": "|", "(": "(", ")": ")", "d": "[0-9]"}
+
+    while i < n:
+        ch = pattern[i]
+        if in_class:
+            if ch == "\\" and i + 1 < n:
+                # Escape pair inside a class: pass through untouched.
+                out.append(pattern[i : i + 2])
+                i += 2
+                continue
+            out.append(ch)
+            if ch == "]" and i > class_content_start:
+                in_class = False
+            i += 1
+            continue
+        if ch == "\\":
+            if i + 1 >= n:
+                out.append(ch)  # trailing lone backslash: verbatim
+                i += 1
+                continue
+            nxt = pattern[i + 1]
+            if nxt == "\\":
+                out.append("\\\\")  # literal-escape escape hatch
+            elif nxt in _REWRITES:
+                out.append(_REWRITES[nxt])
+            else:
+                out.append(ch + nxt)  # same-meaning escape: verbatim
+            i += 2
+            continue
+        if ch == "[":
+            in_class = True
+            out.append(ch)
+            i += 1
+            if i < n and pattern[i] == "^":
+                out.append("^")
+                i += 1
+            # A ']' at the content start is a literal, not the terminator.
+            class_content_start = i
+            continue
+        out.append(ch)
+        i += 1
+
+    return "".join(out)
+
+
 def search(
     pattern: str,
     root: str | Path,
@@ -2100,9 +2193,16 @@ def search(
     max_results: int = 100,
     max_files: int = 10000,
     ignore_spec=None,
+    ignore_case: bool = False,
+    exclude_dirs: list[str] | None = None,
 ) -> list[dict]:
     """
     Search files for a regex pattern.
+
+    The pattern is normalized via :func:`normalize_grep_pattern` (grep/BRE
+    escapes like ``\\|`` become their ERE meaning); if the normalized form
+    fails to compile, the original pattern is compiled instead (fallback for
+    intentionally-escaped patterns).
 
     Args:
         pattern: Regex pattern to search for
@@ -2116,6 +2216,11 @@ def search(
         max_results: Maximum matches to return (default 100, 0 = unlimited)
         max_files: Maximum files to scan (default 10000, 0 = unlimited)
         ignore_spec: Optional pathspec.PathSpec for gitignore-style patterns
+        ignore_case: If True, match case-insensitively (re.IGNORECASE)
+        exclude_dirs: Optional list of globs (grep --exclude-dir semantics):
+            a file is skipped when any **directory** component of its relative
+            path fnmatch-es any glob. Independent of ignore_spec; ignored in
+            single-file mode (explicit file beats filter).
 
     Returns:
         List of matches:
@@ -2130,18 +2235,20 @@ def search(
     # Security: Validate path containment
     _validate_path_containment(str(root))
 
+    import fnmatch
     import re
-
-    # Fallback directories to skip if no ignore_spec provided
-    SKIP_DIRS = {
-        "node_modules", "__pycache__", ".git", ".svn", ".hg",
-        "dist", "build", ".next", ".nuxt", "coverage", ".tox",
-        "venv", ".venv", "env", ".env", "vendor", ".cache",
-    }
 
     results = []
     root = Path(root)
-    compiled = re.compile(pattern)
+    normalized = normalize_grep_pattern(pattern)
+    flags = re.IGNORECASE if ignore_case else 0
+    try:
+        compiled = re.compile(normalized, flags)
+    except re.error:
+        # Fallback: the original escaping was intentional (e.g. a normalized
+        # form that no longer compiles). If this also fails, re.error
+        # propagates as before.
+        compiled = re.compile(pattern, flags)
     files_scanned = 0
 
     # Single-file mode: user named an explicit file path. Skip rglob, ignore
@@ -2194,6 +2301,16 @@ def search(
                 continue
             if any(part in SKIP_DIRS for part in parts):
                 continue
+
+        # grep --exclude-dir semantics: skip files under any directory
+        # component matching any glob (independent of ignore_spec, so it
+        # composes with --no-ignore).
+        if exclude_dirs and any(
+            fnmatch.fnmatch(part, pat)
+            for part in parts[:-1]
+            for pat in exclude_dirs
+        ):
+            continue
 
         # Filter by extension
         if extensions and file_path.suffix not in extensions:

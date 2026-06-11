@@ -5,9 +5,9 @@ TLDR-Code CLI - Token-efficient code analysis for LLMs.
 Usage:
     tldr tree [path]                    Show file tree
     tldr structure [path]               Show code structure (codemaps)
-    tldr search <pattern> [path]        Search files for pattern
+    tldr search <pattern> [paths...]    Search files for pattern (grep-shaped: -i, --include, -m)
     tldr extract <file>                 Extract full file info
-    tldr context <entry> [--project]    Get relevant context for LLM
+    tldr context <entry> [<entry> ...]  Get relevant context for LLM
     tldr cfg <file> <function>          Control flow graph
     tldr dfg <file> <function>          Data flow graph
     tldr slice <file> <func> <line>     Program slice
@@ -73,6 +73,37 @@ LANG_CHOICES_WITH_ALL = [*LANG_CHOICES, "all"]
 # supported language. Lifted to module scope so the argparse subparser stays
 # readable and the choices list is reusable for tests/tooling.
 CONTEXT_LANG_CHOICES = ["auto", "all", *sorted(SUPPORTED_CONTEXT_LANGUAGES)]
+
+
+def _includes_to_extensions(includes: list[str] | None) -> set[str] | None:
+    """Map ``--include`` glob values onto the extension-filter set.
+
+    Supported shapes (case preserved; suffix matching stays exact):
+    ``"*.py"`` -> ``".py"``; ``".py"`` -> ``".py"``; ``"py"`` -> ``".py"``.
+    ``None``/empty -> ``None`` (no filter).
+
+    Raises:
+        ValueError: for any other glob shape (wildcard not in leading ``*.``
+            position, path separators, multiple dots before ``*``).
+    """
+    if not includes:
+        return None
+    extensions: set[str] = set()
+    for glob in includes:
+        suffix = None
+        if "/" not in glob and "\\" not in glob:
+            if glob.startswith("*."):
+                suffix = glob[2:]
+            elif glob.startswith("."):
+                suffix = glob[1:]
+            else:
+                suffix = glob
+        if not suffix or any(c in suffix for c in "*?[]./\\"):
+            raise ValueError(
+                f"unsupported --include glob {glob!r}; use '*.EXT' or '.EXT'"
+            )
+        extensions.add("." + suffix)
+    return extensions
 
 
 def detect_language_from_extension(file_path: str) -> str:
@@ -287,6 +318,10 @@ Semantic Search:
     tree_p.add_argument(
         "--show-hidden", action="store_true", help="Include hidden files"
     )
+    tree_p.add_argument(
+        "--depth", "--max-depth", dest="max_depth", type=int, default=None,
+        help="Max directory depth (default: unlimited)",
+    )
 
     # tldr structure [path]
     struct_p = subparsers.add_parser("structure", help="Show code structure (codemaps)")
@@ -301,20 +336,38 @@ Semantic Search:
         "--max", type=int, default=50, help="Max files to analyze (default: 50)"
     )
 
-    # tldr search <pattern> [path]
+    # tldr search <pattern> [paths...]
     search_p = subparsers.add_parser(
         "search",
         help="Search files for pattern",
-        description="Search files for a regex pattern. Use the global --ignore PATTERN flag to exclude directories from search.",
+        description=(
+            "Search files for a regex pattern (grep-shaped: -i, multiple "
+            "paths, --include, --exclude-dir, -m). Grep/BRE escapes like "
+            r"'\|' are auto-normalized to their ERE meaning."
+        ),
     )
     search_p.add_argument("pattern", help="Regex pattern to search")
-    search_p.add_argument("path", nargs="?", default=".", help="Directory to search")
-    search_p.add_argument("--ext", nargs="+", help="Filter by extensions")
+    search_p.add_argument(
+        "path", nargs="*", default=["."], help="Directories/files to search"
+    )
+    search_p.add_argument(
+        "-i", "--ignore-case", action="store_true",
+        help="Match case-insensitively",
+    )
+    search_p.add_argument(
+        "--include", action="append", metavar="GLOB",
+        help='File filter: "*.py" or ".py" (repeatable)',
+    )
+    search_p.add_argument(
+        "--exclude-dir", action="append", metavar="GLOB",
+        help="Skip directories whose name matches GLOB (repeatable)",
+    )
     search_p.add_argument(
         "-C", "--context", type=int, default=0, help="Context lines around match"
     )
     search_p.add_argument(
-        "--max", type=int, default=100, help="Max results (default: 100, 0=unlimited)"
+        "-m", "--max-count", type=int, default=100, dest="max_count",
+        help="Max total results (default: 100, 0=unlimited)",
     )
     search_p.add_argument(
         "--max-files", type=int, default=10000, help="Max files to scan (default: 10000)"
@@ -328,9 +381,11 @@ Semantic Search:
     extract_p.add_argument("--method", dest="filter_method", help="Filter to specific method (Class.method)")
     extract_p.add_argument("--lang", default=None, help="Language (auto-detected from extension if not specified)")
 
-    # tldr context <entry>
+    # tldr context <entry> [<entry> ...]
     ctx_p = subparsers.add_parser("context", help="Get relevant context for LLM")
-    ctx_p.add_argument("entry", help="Entry point (function_name or Class.method)")
+    ctx_p.add_argument(
+        "entry", nargs="+", help="Entry point(s): function_name or Class.method"
+    )
     ctx_p.add_argument("--project", default=".", help="Project root directory")
     ctx_p.add_argument("--depth", type=int, default=2, help="Call depth (default: 2)")
     ctx_p.add_argument(
@@ -626,6 +681,10 @@ Semantic Search:
         """Resolve the project root for a daemon-routed subcommand."""
         for attr in ("project", "path"):
             val = getattr(parsed, attr, None)
+            # Multi-path commands warm the daemon for the first path only
+            # (warm-up is advisory; search/tree run in-process).
+            if isinstance(val, (list, tuple)):
+                val = val[0] if val else None
             if val:
                 p = Path(val)
                 return str((p.parent if p.is_file() else p).resolve())
@@ -818,7 +877,7 @@ Semantic Search:
             ignore_spec = get_ignore_spec(args.path)
             result = get_file_tree(
                 args.path, extensions=ext, exclude_hidden=not args.show_hidden,
-                ignore_spec=ignore_spec
+                ignore_spec=ignore_spec, max_depth=args.max_depth
             )
             print(json.dumps(result, indent=2))
 
@@ -870,31 +929,54 @@ Semantic Search:
             print(json.dumps(combined_result, indent=2))
 
         elif args.command == "search":
-            search_path = Path(args.path)
-            if not search_path.exists():
-                print(f"Error: path '{args.path}' not found", file=sys.stderr)
-                sys.exit(1)
-            ext = set(args.ext) if args.ext else None
-            # When search_path is a single file, api_search ignores --ext
-            # (explicit file beats filter) and ignore_spec is rooted at parent.
-            ignore_root = search_path.parent if search_path.is_file() else search_path
-            ignore_spec = get_ignore_spec(str(ignore_root))
-            result = api_search(
-                args.pattern, args.path,
-                extensions=ext,
-                context_lines=args.context,
-                max_results=args.max,
-                max_files=args.max_files,
-                ignore_spec=ignore_spec,
-            )
-            if not result and r"\|" in args.pattern:
-                print(
-                    r"Hint: pattern contains '\|' which ERE treats as a literal "
-                    r"backslash-pipe, not alternation. Use a bare '|' for "
-                    r"alternation (e.g. 'foo|bar').",
-                    file=sys.stderr,
+            paths = args.path or ["."]
+            # Validate ALL paths before searching any.
+            for p in paths:
+                if not Path(p).exists():
+                    print(f"Error: path '{p}' not found", file=sys.stderr)
+                    sys.exit(1)
+            try:
+                ext = _includes_to_extensions(args.include)
+            except ValueError as e:
+                print(str(e), file=sys.stderr)
+                sys.exit(2)
+            results = []
+            for p in paths:
+                # -m budget spans paths: each path gets the remainder.
+                budget = (
+                    0 if args.max_count == 0 else args.max_count - len(results)
                 )
-            print(json.dumps(result, indent=2))
+                if args.max_count > 0 and budget <= 0:
+                    break
+                sp = Path(p)
+                # When sp is a single file, api_search ignores --include
+                # (explicit file beats filter) and ignore_spec is rooted at
+                # the parent.
+                ignore_spec = get_ignore_spec(
+                    str(sp.parent if sp.is_file() else sp)
+                )
+                hits = api_search(
+                    args.pattern, p,
+                    extensions=ext,
+                    context_lines=args.context,
+                    max_results=budget,
+                    max_files=args.max_files,
+                    ignore_spec=ignore_spec,
+                    ignore_case=args.ignore_case,
+                    exclude_dirs=args.exclude_dir,
+                )
+                if len(paths) > 1:
+                    # A-1: api.search single-file mode sets "file" to the
+                    # file's BASENAME — joining p onto it would yield
+                    # "dir/foo.py/foo.py". For a file-typed path argument,
+                    # the path argument itself IS the hit's identity; for a
+                    # dir-typed path, prefix the root-relative path.
+                    for h in hits:
+                        h["file"] = (
+                            p if sp.is_file() else os.path.join(p, h["file"])
+                        )
+                results.extend(hits)
+            print(json.dumps(results, indent=2))
 
         elif args.command == "extract":
             # Apply filters if specified
@@ -943,17 +1025,44 @@ Semantic Search:
             except NoSupportedContextLanguagesError as e:
                 print(f"Error: {e}", file=sys.stderr)
                 sys.exit(1)
-            ctx = get_relevant_context_multi(
-                project_path,
-                args.entry,
-                depth=args.depth,
-                languages=languages,
-            )
-            if ctx.error:
-                print(ctx.to_llm_string(), file=sys.stderr)
-                sys.exit(1)
-            # Output LLM-ready string directly
-            print(ctx.to_llm_string())
+            if len(args.entry) == 1:
+                # Single-symbol path: byte-identical to the historical
+                # contract (hit -> stdout, miss -> stderr + exit 1). Note the
+                # args.entry[0] — passing the list would leak its repr into
+                # the miss message.
+                ctx = get_relevant_context_multi(
+                    project_path,
+                    args.entry[0],
+                    depth=args.depth,
+                    languages=languages,
+                )
+                if ctx.error:
+                    print(ctx.to_llm_string(), file=sys.stderr)
+                    sys.exit(1)
+                # Output LLM-ready string directly
+                print(ctx.to_llm_string())
+            else:
+                # Batch mode: one block per resolved symbol on stdout (one
+                # blank line between blocks); per-symbol misses (with did-you-
+                # mean) on stderr. Exit 0 if at least one symbol resolved,
+                # 1 if all missed.
+                any_resolved = False
+                for entry in args.entry:
+                    ctx = get_relevant_context_multi(
+                        project_path,
+                        entry,
+                        depth=args.depth,
+                        languages=languages,
+                    )
+                    if ctx.error:
+                        print(ctx.to_llm_string(), file=sys.stderr)
+                    else:
+                        if any_resolved:
+                            print()
+                        print(ctx.to_llm_string())
+                        any_resolved = True
+                if not any_resolved:
+                    sys.exit(1)
 
         elif args.command == "cfg":
             lang = args.lang or detect_language_from_extension(args.file)

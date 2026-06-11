@@ -16,6 +16,8 @@ import time
 from pathlib import Path
 from typing import Optional
 
+from .api import SKIP_DIRS
+
 
 def _get_subprocess_detach_kwargs():
     """Get platform-specific kwargs for detaching subprocess."""
@@ -31,25 +33,6 @@ DEFAULT_MAX_AGE_HOURS = 24
 
 # Default max files threshold for auto-warming
 DEFAULT_MAX_FILES = 500
-
-# Directories to skip when counting files
-SKIP_DIRS = {
-    "venv",
-    ".venv",
-    "env",
-    ".env",
-    "node_modules",
-    "__pycache__",
-    ".git",
-    ".tox",
-    ".pytest_cache",
-    ".mypy_cache",
-    "dist",
-    "build",
-    "egg-info",
-    ".eggs",
-}
-
 
 def get_cache_path(project_path: Path) -> Path:
     """Get the path to the call graph cache file."""
