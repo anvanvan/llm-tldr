@@ -79,6 +79,24 @@ _WIRE_KEY_FILE = "file"        # Legacy single-file wire key
 logger = logging.getLogger(__name__)
 
 
+class _DaemonTimer(threading.Timer):
+    """Production reindex-scheduler timer (M3): a real daemon ``threading.Timer``.
+
+    Constructed as a daemon thread so an abrupt / SIGKILL'd exit can never leave
+    a zombie timer blocking interpreter shutdown. The cancel-on-shutdown in
+    ``run()``'s finally is the primary graceful guarantee; this is the
+    belt-and-suspenders backstop.
+
+    ``.start()`` spawns the timer thread that waits ``interval`` seconds then
+    fires the callback OFF the command-handler thread — the scheduler and
+    shutdown path can ``.cancel()`` it at any time before it fires.
+    """
+
+    def __init__(self, interval, function, args=None, kwargs=None):
+        super().__init__(interval, function, args=args, kwargs=kwargs)
+        self.daemon = True
+
+
 class TLDRDaemon:
     """
     TLDR daemon server holding indexes in memory.
@@ -87,7 +105,14 @@ class TLDRDaemon:
     Automatically shuts down after IDLE_TIMEOUT seconds of inactivity.
     """
 
-    def __init__(self, project_path: Path, idle_timeout: int | None = None):
+    def __init__(
+        self,
+        project_path: Path,
+        idle_timeout: int | None = None,
+        *,
+        timer_factory=None,
+        clock=time.monotonic,
+    ):
         """
         Initialize the daemon for a project.
 
@@ -96,6 +121,14 @@ class TLDRDaemon:
             idle_timeout: Optional per-instance idle timeout (seconds). Defaults
                 to the module-level IDLE_TIMEOUT. Injectable so tests can verify
                 idle behaviour without sleeping real time.
+            timer_factory: Injectable factory ``(delay, fn) -> _TimerHandle`` used
+                by the notify-storm scheduler to arm a debounced reindex. Defaults
+                to a production wrapper around ``threading.Timer`` whose timer is a
+                DAEMON thread (M3) so an abrupt exit never leaves a zombie timer.
+                Tests inject an immediate/deferred fake.
+            clock: Injectable monotonic clock ``() -> float`` driving the cooldown
+                spread arithmetic. Defaults to ``time.monotonic``; tests inject a
+                settable fake to advance virtual time without sleeping.
         """
         self.project = project_path
         self.tldr_dir = project_path / ".tldr"
@@ -129,6 +162,34 @@ class TLDRDaemon:
         self._dirty_files: set[str] = set()
         self._reindex_in_progress: bool = False
         self._semantic_config = self._load_semantic_config()
+
+        # Notify-storm robustness: debounced + cooldown-gated reindex scheduler.
+        # A burst of notify calls coalesces into one rate-limited, spread-out
+        # reindex via a single armed timer (see _schedule_reindex). The two knobs
+        # are read ONCE here (like auto_reindex_threshold) — a config change needs
+        # a daemon restart to take effect.
+        # Coerce null/missing to the default before float() — float(None) raises
+        # TypeError and would abort __init__ if the config has an explicit null.
+        _raw_debounce = self._semantic_config.get("notify_debounce_secs")
+        self._notify_debounce_secs: float = max(
+            0.0, float(_raw_debounce if _raw_debounce is not None else 2.0)
+        )
+        _raw_cooldown = self._semantic_config.get("reindex_cooldown_secs")
+        self._reindex_cooldown_secs: float = max(
+            0.0, float(_raw_cooldown if _raw_cooldown is not None else 30.0)
+        )
+        # Guards ONLY the pending-buffer/timer state — never the heavy reindex.
+        # Lock ordering is one-directional: _command_lock -> _reindex_sched_lock
+        # (_handle_notify holds _command_lock when scheduling); the timer callback
+        # _drain_pending_reindex acquires _reindex_sched_lock but NEVER
+        # _command_lock, so there is no cycle.
+        self._reindex_sched_lock = threading.Lock()
+        self._reindex_timer: Optional[Any] = None
+        self._last_reindex_fire_at: float = 0.0
+        self._clock = clock
+        self._timer_factory = (
+            timer_factory if timer_factory is not None else self._production_timer_factory
+        )
 
         # DAEMON-EPOCH: the index_epoch (int(time.time_ns())) read from
         # metadata.json at daemon startup. The dirty-files hint is trusted as
@@ -172,6 +233,10 @@ class TLDRDaemon:
             "enabled": True,
             "auto_reindex_threshold": 20,  # Files changed before auto re-index
             "model": "bge-large-en-v1.5",
+            # Notify-storm robustness knobs (sole arming gate stays
+            # auto_reindex_threshold; the large-batch fold is always-on, no knob).
+            "notify_debounce_secs": 2.0,  # Coalesce a burst within this window
+            "reindex_cooldown_secs": 30.0,  # Min spread between reindex fires
         }
 
         # Try Claude settings first
@@ -872,15 +937,16 @@ class TLDRDaemon:
     def _handle_notify(self, command: dict) -> dict:
         """Handle file change notification from hooks.
 
-        Tracks dirty files and triggers background semantic re-indexing
-        when threshold is reached.
+        Tracks dirty files and schedules deferred semantic re-indexing
+        when threshold is reached. Reindex is debounced and cooldown-gated.
 
         Args:
             command: Dict with 'files' (list of changed paths) or 'file'
                 (single changed path, legacy).
 
         Returns:
-            Response with dirty count, reindex status, and files_received.
+            Response with dirty count, reindex_triggered (indicates scheduler armed),
+            and files_received.
         """
         # Normalize the two accepted wire shapes into a single list of paths.
         files = command.get(_WIRE_KEY_FILES)
@@ -928,7 +994,10 @@ class TLDRDaemon:
         )
 
         if should_reindex:
-            self._trigger_background_reindex()
+            # O(1) ingress: arm the debounced/cooldown-gated scheduler instead of
+            # spawning the reindex inline. A burst coalesces into one armed timer;
+            # the heavy work runs later off the command lock when the timer fires.
+            self._schedule_reindex()
 
         return {
             "status": "ok",
@@ -954,6 +1023,81 @@ class TLDRDaemon:
         except (OSError, json.JSONDecodeError, KeyError, ValueError, TypeError):
             return 0
 
+    @staticmethod
+    def _production_timer_factory(delay, fn):
+        """Build the production timer: a DAEMON ``threading.Timer`` (M3).
+
+        Marking the timer a daemon thread guarantees an abrupt / SIGKILL'd exit
+        can never leave a zombie timer thread blocking interpreter shutdown. The
+        cancel-on-shutdown in ``run()``'s finally remains the primary graceful
+        guarantee; this is the belt-and-suspenders backstop. The caller
+        ``.start()``s the returned handle.
+
+        ``.start()`` spawns a real timer thread that waits ``delay`` seconds then
+        fires ``fn`` OFF the command-handler thread. The debounce/cooldown delay
+        computed in ``_schedule_reindex`` is enforced by this real wait —
+        ``_drain_pending_reindex`` runs asynchronously after the delay expires,
+        not inline. ``.cancel()`` stops the pending timer before it fires.
+        """
+        return _DaemonTimer(delay, fn)
+
+    def _cooldown_remaining(self) -> float:
+        """Seconds left before a new reindex may fire (0 once cooldown elapsed)."""
+        return max(0.0, (self._last_reindex_fire_at + self._reindex_cooldown_secs) - self._clock())
+
+    def _cancel_reindex_timer(self) -> None:
+        """Idempotently cancel any armed reindex timer and clear the field.
+
+        Assumes the caller holds ``_reindex_sched_lock`` when invoked from
+        ``_schedule_reindex``; the shutdown path acquires the lock itself.
+        """
+        if self._reindex_timer is not None:
+            try:
+                self._reindex_timer.cancel()
+            finally:
+                self._reindex_timer = None
+
+    def _schedule_reindex(self) -> None:
+        """Arm at most one debounced, cooldown-gated reindex timer (O(1)).
+
+        Called while ``_command_lock`` is held by ``_handle_notify`` but never
+        re-enters it and never blocks: one acquire of the *separate*
+        ``_reindex_sched_lock`` + arithmetic + a timer arm. Each notify within the
+        window cancels the prior pending timer (debounce/coalesce) so a burst arms
+        exactly one surviving timer. The delay is pushed out to the cooldown
+        boundary when a fresh burst lands inside the spread window.
+        """
+        with self._reindex_sched_lock:
+            delay = max(self._notify_debounce_secs, self._cooldown_remaining())
+            self._cancel_reindex_timer()
+            timer = self._timer_factory(delay, self._drain_pending_reindex)
+            self._reindex_timer = timer
+        # Start OUTSIDE the sched lock: an immediate/zero-delay timer fires the
+        # callback synchronously inside .start(), and _drain_pending_reindex
+        # re-acquires _reindex_sched_lock — starting under the lock would deadlock
+        # the non-reentrant lock. A real threading.Timer.start() returns at once,
+        # so the production path is unaffected.
+        timer.start()
+
+    def _drain_pending_reindex(self) -> None:
+        """Timer callback: fire the deferred reindex (runs OFF ``_command_lock``).
+
+        Invoked by the real ``threading.Timer`` thread after the debounce/cooldown
+        delay — NOT on the command-handler thread, NOT under ``_command_lock``.
+        Records the fire time for the cooldown spread, then fires the existing
+        single-flight, full-set-folding ``_trigger_background_reindex``. The
+        ``_dirty_count > 0 and not _reindex_in_progress`` check is a HEURISTIC
+        fast-path only (M1) — exactly-one-reindex single-flight is guaranteed
+        solely by ``_trigger_background_reindex``'s own inner guard. Because the
+        dirty set is never cleared here, a suppressed fire is retried by the next
+        notify's re-arm and no file is lost.
+        """
+        with self._reindex_sched_lock:
+            self._reindex_timer = None
+            self._last_reindex_fire_at = self._clock()
+        if self._dirty_count > 0 and not self._reindex_in_progress:
+            self._trigger_background_reindex()
+
     def _trigger_background_reindex(self):
         """Trigger background semantic re-indexing.
 
@@ -964,37 +1108,58 @@ class TLDRDaemon:
             logger.info("Re-index already in progress, skipping")
             return
 
+        # Claim the single-flight flag SYNCHRONOUSLY in the calling thread BEFORE
+        # spawning the worker, so a debounce-coalesced burst that fires the timer
+        # then continues accumulating notifies cannot spawn a second reindex while
+        # this one is staged. The dirty-set snapshot + hint-file write are taken
+        # at the START of the worker thread (below), so a fold delivered as several
+        # notify calls — each crossing the threshold and firing the immediate
+        # timer — collapses to ONE job carrying the WHOLE accumulated set: the
+        # later calls accumulate into _dirty_files (blocked from spawning by this
+        # flag) before the worker snapshots, and the snapshot then sees them all.
         self._reindex_in_progress = True
-        # GIL-safe snapshot of the dirty set BEFORE spawning the subprocess. Only
-        # these files are subtracted on success (transactional clear, G-6); any
-        # file added by _handle_notify DURING the reindex survives into the next
-        # run. set() copy + set.__isub__ are atomic under CPython — no Lock.
-        files_this_run = set(self._dirty_files)
-        dirty_files = list(files_this_run)
-        logger.info(f"Triggering background semantic re-index for {len(dirty_files)} files")
-
-        # Write the tracked dirty set to a temp file BEFORE spawning the reindex
-        # thread (I-6/I-12), then hand its path to the subprocess via
-        # --dirty-files. This list is an OPTIMIZATION HINT only: correctness is
-        # gated by the per-unit L1 text_hash check, and a missing/stale/empty hint
-        # falls through to a FULL file scan (not a carry-all no-op). On the
-        # parse-skip path only the hinted files are re-parsed, but the call graph
-        # is still re-applied to the full unit set. The temp file is removed in the
-        # do_reindex finally block.
-        dirty_files_path = None
-        try:
-            with tempfile.NamedTemporaryFile(
-                mode="w", suffix=".json", prefix="tldr-dirty-", delete=False
-            ) as df:
-                json.dump(dirty_files, df)
-                dirty_files_path = df.name
-        except OSError as e:
-            # If we cannot stage the hint, proceed without it (full scan).
-            logger.warning(f"Could not write dirty-files hint, falling back to full scan: {e}")
-            dirty_files_path = None
 
         def do_reindex():
             succeeded = False
+            # Open the hint temp file FIRST, then snapshot the dirty set, then dump.
+            # Opening the file is a real open(2) syscall that releases the GIL, so a
+            # burst delivered as several notify calls — call 1 fires the immediate
+            # timer and spawns THIS worker; the later calls then accumulate into
+            # _dirty_files (blocked from spawning by the single-flight flag claimed
+            # synchronously above) while this open() yields — has fully landed
+            # before the snapshot is taken. The snapshot therefore folds the WHOLE
+            # accumulated set into ONE bulk job, whether delivered in one call or
+            # split across many. set() copy + set.__isub__ are atomic under CPython
+            # (no Lock); only these files are subtracted on success (G-6), any file
+            # added DURING the reindex survives into the next run.
+            dirty_files_path = None
+            files_this_run: set[str] = set()
+            try:
+                with tempfile.NamedTemporaryFile(
+                    mode="w", suffix=".json", prefix="tldr-dirty-", delete=False
+                ) as df:
+                    # Snapshot AFTER the open() syscall releases the GIL, so any
+                    # notify calls that landed during the open are already in
+                    # _dirty_files and are folded into this run's set.
+                    files_this_run = set(self._dirty_files)
+                    logger.info(
+                        f"Triggering background semantic re-index for {len(files_this_run)} files"
+                    )
+                    # This list is an OPTIMIZATION HINT only: correctness is gated by
+                    # the per-unit L1 text_hash check, and a missing/stale/empty hint
+                    # falls through to a FULL file scan (not a carry-all no-op). On
+                    # the parse-skip path only the hinted files are re-parsed, but the
+                    # call graph is still re-applied to the full unit set.
+                    json.dump(list(files_this_run), df)
+                    dirty_files_path = df.name
+            except OSError as e:
+                # If we cannot stage the hint, proceed without it (full scan).
+                # files_this_run was already snapped inside the with-block above
+                # (or is empty if open() itself failed), so the transactional
+                # subtract remains correct either way.
+                logger.warning(f"Could not write dirty-files hint, falling back to full scan: {e}")
+                dirty_files_path = None
+
             try:
                 import subprocess
 
@@ -1042,12 +1207,15 @@ class TLDRDaemon:
             except Exception as e:
                 logger.exception(f"Background semantic re-index error: {e}")
             finally:
-                # Remove the dirty-files hint temp file.
+                # Clean up the temp hint file now that subprocess.run has returned
+                # (blocking call — the subprocess has fully consumed the file).
+                # Tolerate it already being gone (e.g. OS tmp sweep).
                 if dirty_files_path is not None:
                     try:
                         os.unlink(dirty_files_path)
                     except OSError:
                         pass
+
                 if succeeded:
                     # Transactional clear (G-6, replaces the blanket .clear()):
                     # remove ONLY the files folded into THIS reindex. Files added
@@ -1744,6 +1912,14 @@ class TLDRDaemon:
         except Exception:
             logger.exception("Daemon error")
         finally:
+            # Cancel any armed reindex timer so a graceful exit never leaks a
+            # live timer thread (M3's daemon=True is the abrupt-exit backstop).
+            try:
+                with self._reindex_sched_lock:
+                    self._cancel_reindex_timer()
+            except Exception as e:
+                logger.error(f"Failed to cancel reindex timer on shutdown: {e}")
+
             # Persist stats before cleanup (graceful shutdown)
             try:
                 self._persist_all_stats()

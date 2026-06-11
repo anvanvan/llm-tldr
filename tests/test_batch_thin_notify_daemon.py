@@ -37,6 +37,28 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 
+class _ImmediateTimerHandle:
+    """Test double: fires the callback synchronously on .start()."""
+
+    def __init__(self, delay, fn):
+        self.delay = delay
+        self._fn = fn
+        self.cancelled = False
+
+    def start(self):
+        self._fn()
+
+    def cancel(self):
+        self.cancelled = True
+
+
+def _immediate_timer_factory():
+    """Return a timer factory that fires the callback inline on .start()."""
+    def factory(delay, fn):
+        return _ImmediateTimerHandle(delay, fn)
+    return factory
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -48,10 +70,13 @@ def _build_tiny_repo(tmp_path: Path) -> Path:
     return tmp_path
 
 
-def _make_daemon(project: Path):
+def _make_daemon(project: Path, *, timer_factory=None):
     """Construct a TLDRDaemon pointing at *project* with no live socket."""
     from tldr.daemon.core import TLDRDaemon
-    return TLDRDaemon(project)
+    kwargs = {}
+    if timer_factory is not None:
+        kwargs["timer_factory"] = timer_factory
+    return TLDRDaemon(project, **kwargs)
 
 
 def _patch_reindex(daemon) -> MagicMock:
@@ -251,11 +276,14 @@ class TestBatchDedupAndThresholdD3:
         We set auto_reindex_threshold=3 and send a batch of 3 distinct files.
         Expected: _trigger_background_reindex called exactly 1 time.
 
-        RED: current code ignores 'files' → dirty_count=0 < threshold → reindex
-        is never triggered from a batch message.
+        Uses an injected immediate timer factory so the scheduler fires the
+        callback synchronously (no real timer thread), exercising the async
+        contract correctly in a unit test context.
         """
         project = _build_tiny_repo(tmp_path)
-        daemon = _make_daemon(project)
+        daemon = _make_daemon(project, timer_factory=_immediate_timer_factory())
+        daemon._notify_debounce_secs = 0.0
+        daemon._reindex_cooldown_secs = 0.0
         mock_reindex = _patch_reindex(daemon)
 
         # Override threshold to 3 so a 3-file batch triggers it
@@ -267,8 +295,7 @@ class TestBatchDedupAndThresholdD3:
         assert mock_reindex.call_count == 1, (
             f"Expected _trigger_background_reindex called exactly once, "
             f"got {mock_reindex.call_count}. "
-            f"RED: current code ignores 'files' → dirty_count stays 0 → "
-            f"reindex never triggered."
+            f"Scheduler must arm a timer that fires the reindex."
         )
 
     def test_batch_below_threshold_does_not_trigger_reindex(self, tmp_path):
@@ -308,11 +335,13 @@ class TestBatchDedupAndThresholdD3:
         threshold=2; batch1=[a,b] → triggers reindex → _reindex_in_progress=True;
         batch2=[c,d] → guard blocks; mock called only once total.
 
-        RED: current code ignores 'files' → dirty_count=0 → reindex never
-        triggered at all from either batch.
+        Uses an injected immediate timer factory so the scheduler fires the
+        callback synchronously in the unit-test context.
         """
         project = _build_tiny_repo(tmp_path)
-        daemon = _make_daemon(project)
+        daemon = _make_daemon(project, timer_factory=_immediate_timer_factory())
+        daemon._notify_debounce_secs = 0.0
+        daemon._reindex_cooldown_secs = 0.0
         mock_reindex = _patch_reindex(daemon)
 
         # When _trigger_background_reindex is called, it normally sets the flag;
@@ -332,7 +361,8 @@ class TestBatchDedupAndThresholdD3:
         assert mock_reindex.call_count == 1, (
             f"Expected single-flight: reindex triggered exactly once, "
             f"got call_count={mock_reindex.call_count}. "
-            f"RED: current code ignores 'files' → dirty_count=0 → never triggered."
+            f"Scheduler must arm timer → fires reindex; second burst suppressed by "
+            f"in-progress flag."
         )
 
     def test_empty_files_list_returns_error(self, tmp_path):
