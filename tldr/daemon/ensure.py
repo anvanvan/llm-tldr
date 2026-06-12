@@ -31,6 +31,11 @@ else:
     import fcntl
 
 
+# Pre-constructed module-level bases for the ephemeral-root guard so the hot
+# path (_is_ephemeral_root is called before every daemon-routed command) does
+# not re-allocate Path objects on each invocation.
+_EPHEMERAL_BASES = (Path("/private/tmp"), Path("/tmp"))
+
 # ---------------------------------------------------------------------------
 # Shared file-locking helpers
 # ---------------------------------------------------------------------------
@@ -166,6 +171,23 @@ def _ping_daemon(project: str) -> bool:
         return False
 
 
+def _is_ephemeral_root(path: str) -> bool:
+    """True when ``path`` resolves under (or equals) /tmp or /private/tmp.
+
+    Escape hatch: a truthy ``TLDR_INDEX_EPHEMERAL`` env var bypasses the guard
+    so tests (and intentional /tmp indexing) can still spawn. macOS /tmp is a
+    symlink to /private/tmp, so resolve before the self-or-ancestor membership
+    test.
+    """
+    if os.environ.get("TLDR_INDEX_EPHEMERAL", "").strip().lower() in ("1", "true", "yes", "on"):
+        return False
+    resolved = Path(path).resolve()
+    for base in _EPHEMERAL_BASES:
+        if resolved == base or base in resolved.parents:
+            return True
+    return False
+
+
 def ensure_daemon(project: str, timeout: float = 10.0) -> None:
     """Ensure the per-project daemon is running, starting it if needed.
 
@@ -178,6 +200,11 @@ def ensure_daemon(project: str, timeout: float = 10.0) -> None:
     # (ensure/start/stop/status/query/notify) agrees on a single root and the
     # daemon never fragments into a per-subdir index. See _anchor_project.
     project = _anchor_project(project)
+
+    # Ephemeral-root guard: throwaway /tmp roots must not pay a cold-index GPU
+    # burst. Runs AFTER _anchor_project so the resolved smart root is checked.
+    if _is_ephemeral_root(project):
+        return
 
     # Fast path: daemon already running (no lock needed).
     if _ping_daemon(project):

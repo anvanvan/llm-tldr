@@ -39,9 +39,9 @@ from .daemon.ensure import ensure_daemon
 # ensure_daemon(project) before dispatch so the in-memory index server handles
 # the request (no per-invocation cold start, no in-process model load).
 DAEMON_ROUTED_COMMANDS = {
-    "search", "context", "extract", "semantic", "warm", "impact", "dead",
-    "arch", "calls", "imports", "importers", "structure", "tree",
-    "diagnostics", "change_impact",
+    "context", "semantic", "warm", "impact", "dead",
+    "arch", "calls", "importers",
+    "diagnostics", "change-impact",
 }
 # Dual-gate idiom: api.py uses self.language=='rust' (RelevantContext owns language);
 # cli.py uses .endswith('.rs') (edge tuples have no language object).
@@ -521,6 +521,10 @@ Semantic Search:
     )
     impact_p.add_argument(
         "--run", action="store_true", help="Actually run the affected tests"
+    )
+    impact_p.add_argument(
+        "--project", default=None,
+        help="Project root to analyze (default: auto-detect from cwd)",
     )
 
     # tldr diagnostics <file|path>
@@ -1218,9 +1222,10 @@ Semantic Search:
         elif args.command == "change-impact":
             from .change_impact import analyze_change_impact
 
-            lang = resolve_language(args.lang, ".")
+            _ci_project = args.project if getattr(args, "project", None) else "."
+            lang = resolve_language(args.lang, _ci_project)
             result = analyze_change_impact(
-                project_path=".",
+                project_path=_ci_project,
                 files=args.files if args.files else None,
                 use_session=args.session,
                 use_git=args.git,

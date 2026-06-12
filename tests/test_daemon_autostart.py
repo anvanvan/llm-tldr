@@ -507,14 +507,15 @@ class TestCliAutoRoute:
             "RED: cli.py does not call ensure_daemon for context today."
         )
 
-    def test_search_subcommand_calls_ensure_daemon(self, tmp_path: Path):
-        """'tldr search <pattern>' must call ensure_daemon before dispatch.
+    def test_search_subcommand_does_not_call_ensure_daemon(self, tmp_path: Path):
+        """'tldr search <pattern>' must NOT call ensure_daemon.
 
-        RED (two layers):
-          1. tldr.daemon.ensure doesn't exist → ImportError
-          2. cli.py search dispatch does not call ensure_daemon today.
+        'search' is an index-free, grep-shaped command that runs purely
+        in-process; it was removed from DAEMON_ROUTED_COMMANDS so it never
+        cold-starts a daemon. The dispatch gate must record zero ensure_daemon
+        calls for search.
         """
-        from tldr.daemon.ensure import ensure_daemon as _  # RED: module absent
+        from tldr.daemon.ensure import ensure_daemon as _  # module present
 
         import sys
 
@@ -539,10 +540,10 @@ class TestCliAutoRoute:
         finally:
             sys.argv = argv_backup
 
-        assert len(ensure_calls) >= 1, (
-            f"CLI 'search' must call ensure_daemon before dispatching. "
+        assert ensure_calls == [], (
+            f"CLI 'search' is index-free and must NOT call ensure_daemon; "
             f"ensure_calls={ensure_calls!r}. "
-            "RED: cli.py does not call ensure_daemon for search today."
+            "search was removed from DAEMON_ROUTED_COMMANDS."
         )
 
     def test_daemon_backed_subcommands_do_not_load_model_in_process(self, tmp_path: Path):

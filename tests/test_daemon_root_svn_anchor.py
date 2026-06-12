@@ -36,6 +36,11 @@ import pytest
 def _isolate_root_resolution(monkeypatch, tmp_path):
     # _find_project_root short-circuits on CLAUDE_PROJECT_DIR — isolate from it.
     monkeypatch.delenv("CLAUDE_PROJECT_DIR", raising=False)
+    # This fork's pytest basetemp lives under /private/tmp, so tmp_path-rooted
+    # projects trip the ephemeral-index guard (ensure_daemon early-returns before
+    # the spawn these tests capture). Force the escape hatch so the spawn branch
+    # is reached — the anchoring contract under test is orthogonal to the guard.
+    monkeypatch.setenv("TLDR_INDEX_EPHEMERAL", "1")
     # Marker-pollution guard: a stray ``.tldr`` ABOVE the tmp project would let
     # _find_project_root's Pass-2 walk anchor there, masking the real defect.
     # tmp_path lives under /private/var/folders, but assert defensively.

@@ -141,6 +141,14 @@ class TestEnsureDaemonSlowPath:
     RED: ImportError — tldr.daemon.ensure does not exist.
     """
 
+    @pytest.fixture(autouse=True)
+    def _bypass_ephemeral_guard(self, monkeypatch):
+        # pytest's tmp_path resolves under /private/tmp on this fork, which trips
+        # Guard 2 (_is_ephemeral_root) in ensure_daemon causing an early-return
+        # before the spawn. Set the escape hatch so the slow-path spawn branch is
+        # reached — the spawn contract under test is orthogonal to the guard.
+        monkeypatch.setenv("TLDR_INDEX_EPHEMERAL", "1")
+
     def test_slow_path_calls_popen_when_daemon_absent(self, tmp_path: Path):
         """When ping fails, ensure_daemon must call subprocess.Popen to spawn the daemon.
 
